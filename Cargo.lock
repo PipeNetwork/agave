@@ -12259,7 +12259,7 @@ dependencies = [
 [[package]]
 name = "solanacdn-protocol"
 version = "0.1.6"
-source = "git+https://github.com/pipenetwork/solanacdn-protocol?tag=v0.1.6#d2fd73d1d2952fa7a4a19146821b7968c8934a69"
+source = "git+https://github.com/pipenetwork/solanacdn-protocol?tag=v0.1.6#153d5df3c15df5c4dfa3cc5649447a51c0e45cb5"
 dependencies = [
  "bs58",
  "ed25519-dalek 2.2.0",

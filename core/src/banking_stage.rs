@@ -415,7 +415,6 @@ impl BankingStage {
             context.non_vote_receiver.clone(),
             context.bank_forks.clone(),
             scheduler_config.fair_ordering,
-            scheduler_config.fair_batch_ms,
         );
         Self::spawn_scheduler_and_workers(
             &mut thread_hdls,
@@ -460,7 +459,6 @@ impl BankingStage {
                 context.non_vote_receiver.clone(),
                 context.bank_forks.clone(),
                 scheduler_config.fair_ordering,
-                scheduler_config.fair_batch_ms,
             );
             Self::spawn_scheduler_and_workers(
                 &mut self.thread_hdls,

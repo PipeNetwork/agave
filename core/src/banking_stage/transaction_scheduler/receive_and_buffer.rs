@@ -36,7 +36,6 @@ use {
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
     std::{
-        num::NonZeroU64,
         sync::{Arc, RwLock},
         time::Instant,
     },
@@ -107,8 +106,6 @@ pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub bank_forks: Arc<RwLock<BankForks>>,
     fair_ordering: bool,
-    fair_batch_ms: NonZeroU64,
-    fair_start: Instant,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -238,14 +235,11 @@ impl TransactionViewReceiveAndBuffer {
         receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
         fair_ordering: bool,
-        fair_batch_ms: NonZeroU64,
     ) -> Self {
         Self {
             receiver,
             bank_forks,
             fair_ordering,
-            fair_batch_ms,
-            fair_start: Instant::now(),
         }
     }
 
@@ -360,11 +354,12 @@ impl TransactionViewReceiveAndBuffer {
                 }
 
                 // Reserve free-space to copy packet into, run sanitization checks, and insert.
-                let fair_bucket_sort_key = self.fair_ordering.then(|| {
-                    let elapsed_ms = self.fair_start.elapsed().as_millis() as u64;
-                    let bucket = elapsed_ms / self.fair_batch_ms.get();
-                    u32::MAX.wrapping_sub(bucket as u32)
-                });
+                let priority_override = if self.fair_ordering {
+                    try_first_signature_bytes(packet_data)
+                        .and_then(|sig| crate::solanacdn::fair_priority_for_tx_signature(&sig))
+                } else {
+                    None
+                };
                 if let Some(transaction_id) =
                     container.try_insert_map_only_with_data(packet_data, |bytes| {
                         match Self::try_handle_packet(
@@ -373,7 +368,7 @@ impl TransactionViewReceiveAndBuffer {
                             working_bank,
                             enable_static_instruction_limit,
                             transaction_account_lock_limit,
-                            fair_bucket_sort_key,
+                            priority_override,
                         ) {
                             Ok(state) => Ok(state),
                             Err(
@@ -434,7 +429,7 @@ impl TransactionViewReceiveAndBuffer {
         working_bank: &Bank,
         enable_static_instruction_limit: bool,
         transaction_account_lock_limit: usize,
-        fair_bucket_sort_key: Option<u32>,
+        priority_override: Option<u64>,
     ) -> Result<TransactionViewState, PacketHandlingError> {
         let (view, deactivation_slot) = translate_to_runtime_view(
             bytes,
@@ -461,12 +456,10 @@ impl TransactionViewReceiveAndBuffer {
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
         let fee_budget_limits = FeeBudgetLimits::from(compute_budget_limits);
-        let (priority, cost) = match fair_bucket_sort_key {
-            Some(bucket_sort_key) => {
-                calculate_fair_priority_and_cost(&view, bucket_sort_key, working_bank)
-            }
-            None => calculate_priority_and_cost(&view, &fee_budget_limits, working_bank),
-        };
+        let (mut priority, cost) = calculate_priority_and_cost(&view, &fee_budget_limits, working_bank);
+        if let Some(override_priority) = priority_override {
+            priority = override_priority;
+        }
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }
@@ -576,17 +569,33 @@ pub(crate) fn calculate_priority_and_cost(
     )
 }
 
-pub(crate) fn calculate_fair_priority_and_cost(
-    transaction: &impl TransactionWithMeta,
-    bucket_sort_key: u32,
-    bank: &Bank,
-) -> (u64, u64) {
-    let cost = CostModel::calculate_cost(transaction, &bank.feature_set).sum();
-    let message_hash_bytes = transaction.message_hash().to_bytes();
-    let tie = u32::from_be_bytes(message_hash_bytes[0..4].try_into().unwrap());
-    let tie_sort_key = u32::MAX.wrapping_sub(tie);
-    let priority = ((bucket_sort_key as u64) << 32) | (tie_sort_key as u64);
-    (priority, cost)
+fn try_first_signature_bytes(payload: &[u8]) -> Option<[u8; 64]> {
+    let (sig_count, consumed) = parse_shortvec_len(payload)?;
+    if sig_count == 0 {
+        return None;
+    }
+    let start = consumed;
+    let end = start.saturating_add(64);
+    if payload.len() < end {
+        return None;
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&payload[start..end]);
+    Some(sig)
+}
+
+fn parse_shortvec_len(input: &[u8]) -> Option<(usize, usize)> {
+    // Solana shortvec: 7-bit groups, MSB is continuation.
+    let mut value: usize = 0;
+    let mut shift: u32 = 0;
+    for (idx, byte) in input.iter().copied().take(3).enumerate() {
+        value |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, idx + 1));
+        }
+        shift = shift.saturating_add(7);
+    }
+    None
 }
 
 /// Given the epoch, the minimum deactivation slot, and the current slot,
@@ -661,7 +670,6 @@ mod tests {
             receiver,
             bank_forks,
             false,
-            crate::banking_stage::transaction_scheduler::scheduler_controller::DEFAULT_FAIR_BATCH_MS,
         );
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)

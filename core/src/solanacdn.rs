@@ -5,13 +5,14 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
-use dashmap::DashSet;
-use ed25519_dalek_v2::SigningKey;
+use dashmap::{DashMap, DashSet};
+use ed25519_dalek_v2::{Signer as DalekSigner, SigningKey, VerifyingKey};
 use quinn::Endpoint;
 use serde::{Deserialize, Serialize};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -23,17 +24,24 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 
+use solana_instruction::Instruction;
 use solana_keypair::Keypair;
+use solana_ledger::blockstore::Blockstore;
 use solana_ledger::shred::ShredId as LedgerShredId;
 use solana_sha256_hasher as sha256_hasher;
+use solana_message::{Message, VersionedMessage};
+use solana_pubkey::Pubkey;
 use solana_signer::Signer;
+use solana_transaction::{Transaction, versioned::VersionedTransaction};
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 
-use solanacdn_protocol::crypto::{PubkeyBytes, random_nonce_16};
+use solanacdn_protocol::crypto::{PubkeyBytes, SignatureBytes, random_nonce_16};
 use solanacdn_protocol::frame::{DEFAULT_MAX_FRAME_BYTES, FrameError, decode_envelope, encode_envelope};
 use solanacdn_protocol::messages::{
-    AgentToPop, AuthRefresh, AuthRequest, AuthRequestPayload, AuthWithSessionToken, ControlRequest,
-    ControlResponse, Heartbeat, HeartbeatStats, PopToAgent, Shred, ShredBatch, ShredId, ShredKind,
-    StreamKind, VoteDatagram,
+    AgentCapabilities, AgentToPop, AuthRefresh, AuthRequest, AuthRequestPayload, AuthWithSessionToken,
+    ControlRequest, ControlResponse, FairBatchCommit, FairBatchCommitPayload, FairBatchReceiptCommit,
+    FairBatchReceiptCommitPayload, Heartbeat, HeartbeatStats, PopToAgent, Shred, ShredBatch, ShredId,
+    ShredKind, StreamKind, VoteDatagram,
 };
 
 static GLOBAL: ArcSwapOption<SolanaCdnHandle> = ArcSwapOption::const_empty();
@@ -41,6 +49,250 @@ static GLOBAL: ArcSwapOption<SolanaCdnHandle> = ArcSwapOption::const_empty();
 // FNV-1a 128-bit for stable, dependency-free IDs (helps dedupe mirrored packets).
 const FNV1A_128_OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
 const FNV1A_128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+const FAIR_PRIORITY_TTL_MS: u64 = 30_000;
+const FAIR_PRIORITY_MAX_ENTRIES: usize = 500_000;
+
+const FAIR_MERKLE_LEAF_DOMAIN: &[u8] = b"SCDNFAIRLEAFv1";
+const FAIR_MERKLE_NODE_DOMAIN: &[u8] = b"SCDNFAIRNODEv1";
+
+const FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID: Pubkey =
+    solana_pubkey::pubkey!("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo");
+
+const FAIR_LEDGER_COMMIT_MAGIC: [u8; 8] = *b"SCDNFAIR";
+const FAIR_LEDGER_COMMIT_VERSION: u8 = 1;
+const FAIR_LEDGER_COMMIT_MAX_SIGS_PER_CHUNK: usize = 12;
+
+const FAIR_SLASH_WITNESS_TTL_MS: u64 = 60_000;
+const FAIR_SLASH_WITNESS_MAX_ENTRIES: usize = 1_000_000;
+const FAIR_SLASHED_TTL_MS: u64 = 10 * 60_000;
+const FAIR_SLASHED_MAX_ENTRIES: usize = 20_000;
+
+#[derive(Clone, Copy, Debug)]
+struct FairPriorityEntry {
+    priority: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FairLedgerCommitChunkPayload {
+    magic: [u8; 8],
+    version: u8,
+    slot: u64,
+    batch_id: u128,
+    order_start: u64,
+    chunk_index: u16,
+    chunk_total: u16,
+    tx_sigs: Vec<SignatureBytes>,
+    leader_pubkey: PubkeyBytes,
+    leader_time_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FairLedgerCommitChunk {
+    payload: FairLedgerCommitChunkPayload,
+    signature: SignatureBytes,
+}
+
+impl FairLedgerCommitChunk {
+    fn sign(payload: FairLedgerCommitChunkPayload, signing_key: &SigningKey) -> Option<Self> {
+        let bytes = bincode::serialize(&payload).ok()?;
+        let signature = signing_key.sign(&bytes);
+        Some(Self {
+            payload,
+            signature: SignatureBytes(signature.to_bytes()),
+        })
+    }
+
+    fn verify(&self) -> bool {
+        if self.payload.magic != FAIR_LEDGER_COMMIT_MAGIC
+            || self.payload.version != FAIR_LEDGER_COMMIT_VERSION
+        {
+            return false;
+        }
+        let bytes = match bincode::serialize(&self.payload) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&self.payload.leader_pubkey.0) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        verifying_key
+            .verify_strict(
+                &bytes,
+                &ed25519_dalek_v2::Signature::from_bytes(&self.signature.0),
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FairOrderWitnessKey {
+    leader: PubkeyBytes,
+    slot: u64,
+    order_ix: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FairOrderWitnessEntry {
+    tx_sig: [u8; 64],
+    expires_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FairSlashedKey {
+    leader: PubkeyBytes,
+    slot: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FairSlashedEntry {
+    expires_at_ms: u64,
+}
+
+static FAIR_PRIORITIES: OnceLock<DashMap<[u8; 64], FairPriorityEntry>> = OnceLock::new();
+
+fn fair_priorities() -> &'static DashMap<[u8; 64], FairPriorityEntry> {
+    FAIR_PRIORITIES.get_or_init(DashMap::new)
+}
+
+pub fn fair_priority_for_tx_signature(sig: &[u8; 64]) -> Option<u64> {
+    let now = now_ms();
+    let map = fair_priorities();
+    let entry = map.get(sig)?;
+    if entry.expires_at_ms < now {
+        drop(entry);
+        map.remove(sig);
+        return None;
+    }
+    Some(entry.priority)
+}
+
+pub(crate) fn insert_fair_priority(sig: [u8; 64], priority: u64) {
+    let map = fair_priorities();
+    if map.len() > FAIR_PRIORITY_MAX_ENTRIES {
+        map.clear();
+    }
+    map.insert(
+        sig,
+        FairPriorityEntry {
+            priority,
+            expires_at_ms: now_ms().saturating_add(FAIR_PRIORITY_TTL_MS),
+        },
+    );
+}
+
+fn recent_blockhash_from_wire_tx(payload: &[u8]) -> Option<solana_hash::Hash> {
+    let tx: VersionedTransaction = bincode::deserialize(payload).ok()?;
+    Some(*tx.message.recent_blockhash())
+}
+
+fn build_fair_ledger_commit_memo_txs(
+    auth: &AuthContext,
+    recent_blockhash: solana_hash::Hash,
+    slot: u64,
+    batch_id: u128,
+    order_start: u64,
+    tx_sigs: &[[u8; 64]],
+) -> Vec<Vec<u8>> {
+    if slot == 0 || tx_sigs.is_empty() {
+        return Vec::new();
+    }
+
+    let chunk_size = FAIR_LEDGER_COMMIT_MAX_SIGS_PER_CHUNK.max(1);
+    let chunk_total = tx_sigs
+        .len()
+        .div_ceil(chunk_size)
+        .min(u16::MAX as usize) as u16;
+
+    let leader_time_ms = now_ms();
+    let leader_pubkey = auth.validator_pubkey;
+
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for (chunk_index, sigs_chunk) in tx_sigs.chunks(chunk_size).enumerate() {
+        let chunk_index: u16 = match chunk_index.try_into() {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        if chunk_index >= chunk_total {
+            break;
+        }
+
+        let payload = FairLedgerCommitChunkPayload {
+            magic: FAIR_LEDGER_COMMIT_MAGIC,
+            version: FAIR_LEDGER_COMMIT_VERSION,
+            slot,
+            batch_id,
+            order_start,
+            chunk_index,
+            chunk_total,
+            tx_sigs: sigs_chunk.iter().copied().map(SignatureBytes).collect(),
+            leader_pubkey,
+            leader_time_ms,
+        };
+        let Some(chunk) = FairLedgerCommitChunk::sign(payload, &auth.signing_key) else {
+            continue;
+        };
+        let Ok(memo_bytes) = bincode::serialize(&chunk) else {
+            continue;
+        };
+
+        // Prioritize commit metadata so it is likely to land before the committed TXs under load.
+        let cu_price = ComputeBudgetInstruction::set_compute_unit_price(10_000);
+        let memo_ix = Instruction {
+            program_id: FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID,
+            accounts: Vec::new(),
+            data: memo_bytes,
+        };
+        let message = Message::new(&[cu_price, memo_ix], Some(&auth.identity_keypair.pubkey()));
+        let signers = vec![auth.identity_keypair.as_ref()];
+        let tx = Transaction::new(&signers, message, recent_blockhash);
+        if let Ok(tx_bytes) = bincode::serialize(&tx) {
+            out.push(tx_bytes);
+        }
+    }
+    out
+}
+
+fn fair_merkle_leaf_hash(index: u32, sig: &[u8; 64]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(FAIR_MERKLE_LEAF_DOMAIN.len() + 4 + 64);
+    buf.extend_from_slice(FAIR_MERKLE_LEAF_DOMAIN);
+    buf.extend_from_slice(&index.to_le_bytes());
+    buf.extend_from_slice(sig);
+    sha256_bytes(&buf)
+}
+
+fn fair_merkle_node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(FAIR_MERKLE_NODE_DOMAIN.len() + 32 + 32);
+    buf.extend_from_slice(FAIR_MERKLE_NODE_DOMAIN);
+    buf.extend_from_slice(left);
+    buf.extend_from_slice(right);
+    sha256_bytes(&buf)
+}
+
+fn fair_merkle_root(sigs: &[[u8; 64]]) -> [u8; 32] {
+    if sigs.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> = sigs
+        .iter()
+        .enumerate()
+        .map(|(idx, sig)| fair_merkle_leaf_hash(idx as u32, sig))
+        .collect();
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0usize;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() { level[i + 1] } else { left };
+            next.push(fair_merkle_node_hash(&left, &right));
+            i = i.saturating_add(2);
+        }
+        level = next;
+    }
+    level[0]
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataPlaneMode {
@@ -113,6 +365,11 @@ pub struct SolanaCdnConfig {
     pub tvu_shred_hybrid_stale_ms: u64,
     pub direct_shreds_from_pop: bool,
     pub vote_tunnel: bool,
+    /// If enabled, accept POP fair micro-batches and enforce receipt-based ordering.
+    pub tx_fair_ordering: bool,
+    /// If enabled, subscribe to leader-signed fair ordering commits and apply vote-withholding
+    /// penalties on detected equivocation.
+    pub tx_fair_slashing: bool,
 
     pub shreds_queue_len: usize,
     pub votes_queue_len: usize,
@@ -148,6 +405,8 @@ impl SolanaCdnConfig {
             tvu_shred_hybrid_stale_ms: 2_000,
             direct_shreds_from_pop: true,
             vote_tunnel: true,
+            tx_fair_ordering: false,
+            tx_fair_slashing: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
         }
@@ -184,6 +443,8 @@ impl Default for SolanaCdnConfig {
             tvu_shred_hybrid_stale_ms: 2_000,
             direct_shreds_from_pop: true,
             vote_tunnel: true,
+            tx_fair_ordering: false,
+            tx_fair_slashing: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
         }
@@ -672,6 +933,17 @@ pub struct SolanaCdnHandle {
     tx_injected_packets: AtomicU64,
     tx_deduped_packets: AtomicU64,
     tx_inject_failed: AtomicU64,
+    tx_fair_order_next: AtomicU64,
+    fair_commits_rx: AtomicU64,
+    fair_commits_invalid: AtomicU64,
+    fair_equivocations: AtomicU64,
+    fair_ledger_audit_checked: AtomicU64,
+    fair_ledger_audit_failed: AtomicU64,
+    fair_ledger_commits_seen: AtomicU64,
+    fair_ledger_commits_invalid: AtomicU64,
+    fair_ledger_audited_slots: DashMap<u64, bool>,
+    fair_order_witnesses: DashMap<FairOrderWitnessKey, FairOrderWitnessEntry>,
+    fair_slashed_leaders: DashMap<FairSlashedKey, FairSlashedEntry>,
     dropped_shred_payloads: AtomicU64,
     dropped_vote_datagrams: AtomicU64,
     uplink_broadcast_lagged: AtomicU64,
@@ -703,6 +975,17 @@ impl SolanaCdnHandle {
             tx_injected_packets: AtomicU64::new(0),
             tx_deduped_packets: AtomicU64::new(0),
             tx_inject_failed: AtomicU64::new(0),
+            tx_fair_order_next: AtomicU64::new(0),
+            fair_commits_rx: AtomicU64::new(0),
+            fair_commits_invalid: AtomicU64::new(0),
+            fair_equivocations: AtomicU64::new(0),
+            fair_ledger_audit_checked: AtomicU64::new(0),
+            fair_ledger_audit_failed: AtomicU64::new(0),
+            fair_ledger_commits_seen: AtomicU64::new(0),
+            fair_ledger_commits_invalid: AtomicU64::new(0),
+            fair_ledger_audited_slots: DashMap::new(),
+            fair_order_witnesses: DashMap::new(),
+            fair_slashed_leaders: DashMap::new(),
             dropped_shred_payloads: AtomicU64::new(0),
             dropped_vote_datagrams: AtomicU64::new(0),
             uplink_broadcast_lagged: AtomicU64::new(0),
@@ -758,6 +1041,293 @@ impl SolanaCdnHandle {
 
     pub fn vote_tunnel_enabled(&self) -> bool {
         self.cfg.vote_tunnel
+    }
+
+    pub fn tx_fair_slashing_enabled(&self) -> bool {
+        self.cfg.tx_fair_slashing
+    }
+
+    pub fn fair_slashing_is_slashed_leader(&self, leader: &Pubkey, slot: u64) -> bool {
+        if !self.cfg.tx_fair_slashing {
+            return false;
+        }
+        let key = FairSlashedKey {
+            leader: PubkeyBytes(leader.to_bytes()),
+            slot,
+        };
+        self.fair_slashing_is_slashed_key(&key, now_ms())
+    }
+
+    fn fair_slashing_is_slashed_key(&self, key: &FairSlashedKey, now: u64) -> bool {
+        let Some(entry) = self.fair_slashed_leaders.get(key) else {
+            return false;
+        };
+        if entry.expires_at_ms < now {
+            drop(entry);
+            self.fair_slashed_leaders.remove(key);
+            return false;
+        }
+        true
+    }
+
+    fn mark_fair_slashed(
+        &self,
+        leader: PubkeyBytes,
+        slot: u64,
+        order_ix: u64,
+        now: u64,
+    ) {
+        let key = FairSlashedKey { leader, slot };
+        let already = self.fair_slashing_is_slashed_key(&key, now);
+        let entry = FairSlashedEntry {
+            expires_at_ms: now.saturating_add(FAIR_SLASHED_TTL_MS),
+        };
+        self.fair_slashed_leaders.insert(key, entry);
+        if !already {
+            self.fair_equivocations.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                "solanacdn: detected fair ordering equivocation; withholding votes for leader={} slot={} order_ix={}",
+                leader.to_base58(),
+                slot,
+                order_ix
+            );
+        }
+    }
+
+    fn note_fair_commit_for_slashing(&self, commit: &FairBatchCommit) {
+        if !self.cfg.tx_fair_slashing {
+            return;
+        }
+        let Some(slot) = commit.payload.target_slot else {
+            return;
+        };
+
+        if self.fair_order_witnesses.len() > FAIR_SLASH_WITNESS_MAX_ENTRIES {
+            self.fair_order_witnesses.clear();
+        }
+        if self.fair_slashed_leaders.len() > FAIR_SLASHED_MAX_ENTRIES {
+            self.fair_slashed_leaders.clear();
+        }
+
+        let now = now_ms();
+        let leader = commit.payload.leader_pubkey;
+        let order_start = commit.payload.order_start;
+
+        for (idx, tx_sig) in commit.payload.tx_sigs.iter().enumerate() {
+            let order_ix = order_start.wrapping_add(idx as u64);
+            let key = FairOrderWitnessKey {
+                leader,
+                slot,
+                order_ix,
+            };
+
+            if let Some(existing) = self.fair_order_witnesses.get(&key) {
+                let expired = existing.expires_at_ms < now;
+                let existing_tx_sig = existing.tx_sig;
+                drop(existing);
+
+                if expired {
+                    self.fair_order_witnesses.remove(&key);
+                } else if existing_tx_sig != tx_sig.0 {
+                    self.mark_fair_slashed(
+                        leader,
+                        slot,
+                        order_ix,
+                        now,
+                    );
+                    // Once a leader/slot is slashed, extra bookkeeping isn't required.
+                    break;
+                }
+            }
+
+            self.fair_order_witnesses.insert(
+                key,
+                FairOrderWitnessEntry {
+                    tx_sig: tx_sig.0,
+                    expires_at_ms: now.saturating_add(FAIR_SLASH_WITNESS_TTL_MS),
+                },
+            );
+        }
+    }
+
+    fn audit_fair_ledger_commits_for_slot(&self, blockstore: &Blockstore, leader: &Pubkey, slot: u64) {
+        if !self.cfg.tx_fair_slashing {
+            return;
+        }
+
+        if self.fair_ledger_audited_slots.contains_key(&slot) {
+            return;
+        }
+
+        self.fair_ledger_audit_checked
+            .fetch_add(1, Ordering::Relaxed);
+
+        let ok = match blockstore.get_slot_entries(slot, 0) {
+            Ok(entries) => self.audit_fair_ledger_commits_in_entries(entries.as_slice(), leader, slot),
+            Err(_) => true,
+        };
+
+        if self.fair_ledger_audited_slots.len() > 100_000 {
+            self.fair_ledger_audited_slots.clear();
+        }
+        self.fair_ledger_audited_slots.insert(slot, ok);
+
+        if !ok {
+            self.fair_ledger_audit_failed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn audit_fair_ledger_commits_in_entries(
+        &self,
+        entries: &[solana_entry::entry::Entry],
+        leader: &Pubkey,
+        slot: u64,
+    ) -> bool {
+        if entries.is_empty() {
+            return true;
+        }
+
+        let expected_leader = PubkeyBytes(leader.to_bytes());
+        let memo_program_id = FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID;
+
+        let mut slot_tx_sigs: Vec<[u8; 64]> = Vec::new();
+        let mut batch_first_pos: HashMap<u128, usize> = HashMap::new();
+        let mut batch_chunk_total: HashMap<u128, u16> = HashMap::new();
+        let mut chunk_sigs: HashMap<(u128, u16), Vec<[u8; 64]>> = HashMap::new();
+        let mut chunk_commit_sigs: HashMap<(u128, u16), [u8; 64]> = HashMap::new();
+
+        for entry in entries {
+            for tx in entry.transactions.iter() {
+                if let Some(sig0) = tx.signatures.get(0).and_then(|s| s.as_ref().try_into().ok())
+                {
+                    slot_tx_sigs.push(sig0);
+                }
+
+                let (account_keys, instructions) = match &tx.message {
+                    VersionedMessage::Legacy(msg) => (msg.account_keys.as_slice(), msg.instructions.as_slice()),
+                    VersionedMessage::V0(msg) => (msg.account_keys.as_slice(), msg.instructions.as_slice()),
+                };
+
+                for ix in instructions {
+                    let Some(program_id) = account_keys.get(ix.program_id_index as usize) else {
+                        continue;
+                    };
+                    if program_id != &memo_program_id {
+                        continue;
+                    }
+                    let data = ix.data.as_slice();
+                    if data.len() < FAIR_LEDGER_COMMIT_MAGIC.len()
+                        || &data[..FAIR_LEDGER_COMMIT_MAGIC.len()] != FAIR_LEDGER_COMMIT_MAGIC
+                    {
+                        continue;
+                    }
+
+                    let Ok(chunk) = bincode::deserialize::<FairLedgerCommitChunk>(data) else {
+                        continue;
+                    };
+
+                    self.fair_ledger_commits_seen
+                        .fetch_add(1, Ordering::Relaxed);
+
+                    if !chunk.verify() {
+                        self.fair_ledger_commits_invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if chunk.payload.slot != slot {
+                        continue;
+                    }
+                    if chunk.payload.leader_pubkey != expected_leader {
+                        continue;
+                    }
+
+                    let batch_id = chunk.payload.batch_id;
+                    batch_first_pos.entry(batch_id).or_insert(slot_tx_sigs.len());
+
+                    if let Some(prev_total) = batch_chunk_total.insert(batch_id, chunk.payload.chunk_total) {
+                        if prev_total != chunk.payload.chunk_total {
+                            self.mark_fair_slashed(expected_leader, slot, chunk.payload.order_start, now_ms());
+                            return false;
+                        }
+                    }
+
+                    let key = (batch_id, chunk.payload.chunk_index);
+                    if let Some(existing_sig) = chunk_commit_sigs.get(&key) {
+                        if existing_sig != &chunk.signature.0 {
+                            self.mark_fair_slashed(expected_leader, slot, chunk.payload.order_start, now_ms());
+                            return false;
+                        }
+                    } else {
+                        chunk_commit_sigs.insert(key, chunk.signature.0);
+                        let sigs: Vec<[u8; 64]> = chunk
+                            .payload
+                            .tx_sigs
+                            .into_iter()
+                            .map(|sig| sig.0)
+                            .collect();
+                        chunk_sigs.insert(key, sigs);
+                    }
+                }
+            }
+        }
+
+        if batch_first_pos.is_empty() {
+            return true;
+        }
+
+        let mut ordered_batches: Vec<(usize, u128)> = batch_first_pos
+            .into_iter()
+            .map(|(batch_id, pos)| (pos, batch_id))
+            .collect();
+        ordered_batches.sort_by_key(|(pos, _)| *pos);
+
+        let mut expected: Vec<[u8; 64]> = Vec::new();
+        for (_pos, batch_id) in ordered_batches {
+            let Some(chunk_total) = batch_chunk_total.get(&batch_id).copied() else {
+                continue;
+            };
+            for chunk_index in 0..chunk_total {
+                let key = (batch_id, chunk_index);
+                let Some(sigs) = chunk_sigs.get(&key) else {
+                    self.mark_fair_slashed(expected_leader, slot, 0, now_ms());
+                    return false;
+                };
+                expected.extend_from_slice(sigs);
+            }
+        }
+
+        if expected.is_empty() {
+            return true;
+        }
+
+        let mut expected_pos: HashMap<[u8; 64], usize> = HashMap::with_capacity(expected.len());
+        for (idx, sig) in expected.iter().enumerate() {
+            expected_pos.entry(*sig).or_insert(idx);
+        }
+
+        let mut cursor: usize = 0;
+        for sig in slot_tx_sigs {
+            let Some(&pos) = expected_pos.get(&sig) else {
+                continue;
+            };
+            if pos == cursor {
+                cursor = cursor.saturating_add(1);
+            } else if pos > cursor {
+                self.mark_fair_slashed(expected_leader, slot, cursor as u64, now_ms());
+                return false;
+            }
+            if cursor >= expected.len() {
+                break;
+            }
+        }
+
+        if cursor != expected.len() {
+            self.mark_fair_slashed(expected_leader, slot, cursor as u64, now_ms());
+            return false;
+        }
+
+        true
     }
 
     pub fn tvu_shred_ingest_mode(&self) -> TvuShredIngestMode {
@@ -1243,11 +1813,26 @@ pub fn global() -> Option<Arc<SolanaCdnHandle>> {
     GLOBAL.load_full()
 }
 
+pub fn fair_slashing_is_slashed_leader(leader: &Pubkey, slot: u64) -> bool {
+    let Some(handle) = global() else {
+        return false;
+    };
+    handle.fair_slashing_is_slashed_leader(leader, slot)
+}
+
+pub fn fair_slashing_audit_slot(blockstore: &Blockstore, leader: &Pubkey, slot: u64) {
+    let Some(handle) = global() else {
+        return;
+    };
+    handle.audit_fair_ledger_commits_for_slot(blockstore, leader, slot);
+}
+
 pub fn init(
     mut cfg: SolanaCdnConfig,
     identity_keypair: Arc<Keypair>,
     exit: Arc<AtomicBool>,
     vote_use_quic: bool,
+    inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
 ) {
@@ -1294,6 +1879,7 @@ pub fn init(
                     identity_keypair,
                     exit,
                     handle,
+                    inject_tpu,
                     inject_tvu,
                     inject_gossip,
                 )
@@ -2377,24 +2963,27 @@ async fn read_pop_msg<R: AsyncRead + Unpin>(reader: &mut R) -> Result<PopToAgent
     Ok(decode_envelope(&bytes)?)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct QuicConnectConfig {
     client_config: quinn::ClientConfig,
     server_name: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct AuthContext {
     validator_pubkey: PubkeyBytes,
     signing_key: SigningKey,
+    identity_keypair: Arc<Keypair>,
 }
 
 impl AuthContext {
-    fn new(identity_keypair: &Keypair) -> Result<Self, SolanaCdnError> {
-        let signing_key = signing_key_from_solana_keypair(identity_keypair)?;
+    fn new(identity_keypair: Arc<Keypair>) -> Result<Self, SolanaCdnError> {
+        let validator_pubkey = PubkeyBytes(identity_keypair.pubkey().to_bytes());
+        let signing_key = signing_key_from_solana_keypair(identity_keypair.as_ref())?;
         Ok(Self {
-            validator_pubkey: PubkeyBytes(identity_keypair.pubkey().to_bytes()),
+            validator_pubkey,
             signing_key,
+            identity_keypair,
         })
     }
 
@@ -3106,6 +3695,7 @@ async fn run(
     identity_keypair: Arc<Keypair>,
     exit: Arc<AtomicBool>,
     handle: Arc<SolanaCdnHandle>,
+    inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
 ) -> Result<(), SolanaCdnError> {
@@ -3172,7 +3762,7 @@ async fn run(
     handle.note_pop_endpoints(cfg.pop_endpoints.as_slice());
 
     let cfg = Arc::new(cfg);
-    let auth = Arc::new(AuthContext::new(&identity_keypair)?);
+    let auth = Arc::new(AuthContext::new(identity_keypair.clone())?);
     let quic_connect = Arc::new(QuicConnectConfig {
         client_config: make_quic_client_config(&cfg)?,
         server_name: cfg.server_name.clone(),
@@ -3216,6 +3806,7 @@ async fn run(
         quic_connect,
         control_tls,
         handle,
+        inject_tpu,
         inject_tvu,
         inject_gossip,
         shred_deduper,
@@ -3239,6 +3830,7 @@ async fn manage_pop_sessions(
     quic_connect: Arc<QuicConnectConfig>,
     control_tls: Option<ControlTlsClient>,
     handle: Arc<SolanaCdnHandle>,
+    inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
     shred_deduper: ShredBatchDeduper,
@@ -3285,6 +3877,7 @@ async fn manage_pop_sessions(
             auth.clone(),
             quic_connect.clone(),
             handle.clone(),
+            inject_tpu,
             inject_tvu,
             inject_gossip,
             shred_deduper.clone(),
@@ -3400,6 +3993,7 @@ async fn manage_pop_sessions(
                 auth.clone(),
                 quic_connect.clone(),
                 handle.clone(),
+                inject_tpu,
                 inject_tvu,
                 inject_gossip,
                 shred_deduper.clone(),
@@ -3489,6 +4083,7 @@ fn spawn_session(
     auth: Arc<AuthContext>,
     quic_connect: Arc<QuicConnectConfig>,
     handle: Arc<SolanaCdnHandle>,
+    inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
     shred_deduper: ShredBatchDeduper,
@@ -3507,6 +4102,7 @@ fn spawn_session(
         quic_connect,
         handle,
         uplink_rx,
+        inject_tpu,
         inject_tvu,
         inject_gossip,
         shred_deduper,
@@ -3532,6 +4128,7 @@ async fn run_pop_session_forever(
     quic_connect: Arc<QuicConnectConfig>,
     handle: Arc<SolanaCdnHandle>,
     mut uplink_rx: mpsc::Receiver<UplinkMsg>,
+    inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
     shred_deduper: ShredBatchDeduper,
@@ -3552,6 +4149,7 @@ async fn run_pop_session_forever(
             quic_connect.clone(),
             handle.clone(),
             &mut uplink_rx,
+            inject_tpu,
             inject_tvu,
             inject_gossip,
             shred_deduper.clone(),
@@ -3607,6 +4205,7 @@ async fn run_pop_session(
     quic_connect: Arc<QuicConnectConfig>,
     handle: Arc<SolanaCdnHandle>,
     uplink_rx: &mut mpsc::Receiver<UplinkMsg>,
+    inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
     shred_deduper: ShredBatchDeduper,
@@ -3673,6 +4272,19 @@ async fn run_pop_session(
             )))
         }
     };
+
+    // Advertise per-session capabilities so POPs can decide whether to use fair TX ordering.
+    write_agent_msg(
+        &mut ctrl_send,
+        &AgentToPop::Capabilities(AgentCapabilities {
+            tx_fair_ordering: cfg.tx_fair_ordering,
+        }),
+    )
+    .await?;
+
+    if cfg.tx_fair_slashing {
+        write_agent_msg(&mut ctrl_send, &AgentToPop::SubscribeFairCommits).await?;
+    }
 
     let udp_advertised = auth_ok.udp_shreds_port != 0 && auth_ok.udp_votes_port != 0;
     let udp_enabled = match cfg.udp_mode {
@@ -3885,7 +4497,9 @@ async fn run_pop_session(
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
+        let auth = auth.clone();
         let handle = handle.clone();
+        let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
                 let msg = match read_pop_msg(&mut ctrl_recv).await {
@@ -3895,10 +4509,13 @@ async fn run_pop_session(
                 handle_pop_msg(
                     endpoint,
                     &cfg,
+                    auth.as_ref(),
                     &handle,
+                    &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
                     &udp_inject,
+                    inject_tpu,
                     inject_tvu,
                     inject_gossip,
                     &session_events_tx,
@@ -3918,7 +4535,9 @@ async fn run_pop_session(
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
+        let auth = auth.clone();
         let handle = handle.clone();
+        let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
                 let msg = match read_pop_msg(&mut shreds_recv).await {
@@ -3928,10 +4547,13 @@ async fn run_pop_session(
                 handle_pop_msg(
                     endpoint,
                     &cfg,
+                    auth.as_ref(),
                     &handle,
+                    &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
                     &udp_inject,
+                    inject_tpu,
                     inject_tvu,
                     inject_gossip,
                     &session_events_tx,
@@ -3951,7 +4573,9 @@ async fn run_pop_session(
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
+        let auth = auth.clone();
         let handle = handle.clone();
+        let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
                 let msg = match read_pop_msg(&mut votes_recv).await {
@@ -3961,10 +4585,13 @@ async fn run_pop_session(
                 handle_pop_msg(
                     endpoint,
                     &cfg,
+                    auth.as_ref(),
                     &handle,
+                    &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
                     &udp_inject,
+                    inject_tpu,
                     inject_tvu,
                     inject_gossip,
                     &session_events_tx,
@@ -3984,7 +4611,9 @@ async fn run_pop_session(
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
+        let auth = auth.clone();
         let handle = handle.clone();
+        let ctrl_out_tx = ctrl_out_tx.clone();
         Some(tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             let mut fec: HashMap<u64, (solanacdn_protocol::fec::RaptorqDecoder, u64)> =
@@ -4057,10 +4686,13 @@ async fn run_pop_session(
                             handle_pop_msg(
                                 endpoint,
                                 &cfg,
+                                auth.as_ref(),
                                 &handle,
+                                &ctrl_out_tx,
                                 &mut publisher_rx,
                                 &shred_deduper,
                                 &udp_inject,
+                                inject_tpu,
                                 inject_tvu,
                                 inject_gossip,
                                 &session_events_tx,
@@ -4074,10 +4706,13 @@ async fn run_pop_session(
                         handle_pop_msg(
                             endpoint,
                             &cfg,
+                            auth.as_ref(),
                             &handle,
+                            &ctrl_out_tx,
                             &mut publisher_rx,
                             &shred_deduper,
                             &udp_inject,
+                            inject_tpu,
                             inject_tvu,
                             inject_gossip,
                             &session_events_tx,
@@ -4107,7 +4742,9 @@ async fn run_pop_session(
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
+        let auth = auth.clone();
         let handle = handle.clone();
+        let ctrl_out_tx = ctrl_out_tx.clone();
         Some(tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
@@ -4127,10 +4764,13 @@ async fn run_pop_session(
                 handle_pop_msg(
                     endpoint,
                     &cfg,
+                    auth.as_ref(),
                     &handle,
+                    &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
                     &udp_inject,
+                    inject_tpu,
                     inject_tvu,
                     inject_gossip,
                     &session_events_tx,
@@ -4243,10 +4883,13 @@ async fn run_pop_session(
 async fn handle_pop_msg(
     endpoint: SocketAddr,
     cfg: &SolanaCdnConfig,
+    auth: &AuthContext,
     handle: &SolanaCdnHandle,
+    ctrl_out_tx: &mpsc::Sender<AgentToPop>,
     publisher_rx: &mut watch::Receiver<Option<SocketAddr>>,
     shred_deduper: &ShredBatchDeduper,
     udp_inject: &UdpSocket,
+    inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
     session_events_tx: &mpsc::UnboundedSender<SessionEvent>,
@@ -4305,11 +4948,146 @@ async fn handle_pop_msg(
             }
             handle.rx_vote_packets.fetch_add(1, Ordering::Relaxed);
         }
-        PopToAgent::RelayTransaction(_tx) => {
-            if *publisher_rx.borrow() != Some(endpoint) {
+        PopToAgent::RelayTransaction(tx) => {
+            // Transactions may be routed via multiple POPs (home-POP forwarding, multi-POP, etc),
+            // so do not gate this on the current shred/vote publisher selection.
+            handle.rx_tx_packets.fetch_add(1, Ordering::Relaxed);
+            if udp_inject.send_to(&tx.payload, inject_tpu).await.is_ok() {
+                handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
+            } else {
+                handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        PopToAgent::FairBatch(batch) => {
+            let solanacdn_protocol::messages::FairBatch {
+                origin_pop_id,
+                batch_id,
+                created_at_ms: _,
+                batch_ms: _,
+                target_slot,
+                txs,
+            } = batch;
+
+            if txs.is_empty() {
                 return;
             }
-            handle.rx_tx_packets.fetch_add(1, Ordering::Relaxed);
+
+            handle
+                .rx_tx_packets
+                .fetch_add(txs.len() as u64, Ordering::Relaxed);
+
+            let mut sigs: Vec<solanacdn_protocol::crypto::SignatureBytes> =
+                Vec::with_capacity(txs.len());
+
+            if cfg.tx_fair_ordering {
+                let order_start = handle
+                    .tx_fair_order_next
+                    .fetch_add(txs.len() as u64, Ordering::Relaxed);
+
+                let mut sig_bytes: Vec<[u8; 64]> = Vec::with_capacity(txs.len());
+                for (idx, tx) in txs.iter().enumerate() {
+                    let order_ix = order_start.wrapping_add(idx as u64);
+                    let priority = u64::MAX.wrapping_sub(order_ix);
+                    insert_fair_priority(tx.sig.0, priority);
+                    sigs.push(tx.sig);
+                    sig_bytes.push(tx.sig.0);
+                }
+
+                if cfg.tx_fair_slashing {
+                    if let Some(slot) = target_slot {
+                        if let Some(recent_blockhash) =
+                            recent_blockhash_from_wire_tx(txs[0].payload.as_slice())
+                        {
+                            let commit_txs = build_fair_ledger_commit_memo_txs(
+                                auth,
+                                recent_blockhash,
+                                slot,
+                                batch_id,
+                                order_start,
+                                sig_bytes.as_slice(),
+                            );
+                            for tx_bytes in commit_txs {
+                                let _ = udp_inject.send_to(&tx_bytes, inject_tpu).await;
+                            }
+                        }
+                    }
+                }
+
+                for tx in txs.iter() {
+                    if udp_inject.send_to(&tx.payload, inject_tpu).await.is_ok() {
+                        handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+
+                let leader_time_ms = now_ms();
+                let payload = FairBatchCommitPayload {
+                    origin_pop_id,
+                    batch_id,
+                    order_start,
+                    target_slot,
+                    tx_sigs: sigs,
+                    leader_pubkey: auth.validator_pubkey,
+                    leader_time_ms,
+                };
+                match FairBatchCommit::sign(payload, &auth.signing_key) {
+                    Ok(mut commit) => {
+                        let tx_count: u32 = match commit.payload.tx_sigs.len().try_into() {
+                            Ok(v) => v,
+                            Err(_) => 0,
+                        };
+                        if tx_count > 0 {
+                            let tx_merkle_root = fair_merkle_root(sig_bytes.as_slice());
+                            let receipt_payload = FairBatchReceiptCommitPayload {
+                                origin_pop_id: commit.payload.origin_pop_id.clone(),
+                                batch_id: commit.payload.batch_id,
+                                order_start: commit.payload.order_start,
+                                target_slot: commit.payload.target_slot,
+                                tx_count,
+                                tx_merkle_root,
+                                leader_pubkey: commit.payload.leader_pubkey,
+                                leader_time_ms,
+                            };
+                            if let Ok(receipt_commit) =
+                                FairBatchReceiptCommit::sign(receipt_payload, &auth.signing_key)
+                            {
+                                commit.receipt_commit = Some(receipt_commit);
+                            }
+                        }
+                        let _ = ctrl_out_tx
+                            .send(AgentToPop::FairBatchCommit(commit))
+                            .await;
+                    }
+                    Err(e) => {
+                        debug!("solanacdn: failed to sign fair batch commit: {e}");
+                    }
+                }
+                return;
+            }
+
+            // Not in fair mode: best-effort inject without ordering commit.
+            for tx in txs.iter() {
+                if udp_inject.send_to(&tx.payload, inject_tpu).await.is_ok() {
+                    handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        PopToAgent::FairBatchCommit(commit) => {
+            handle.fair_commits_rx.fetch_add(1, Ordering::Relaxed);
+            if !cfg.tx_fair_slashing {
+                return;
+            }
+            if let Err(e) = commit.verify() {
+                handle
+                    .fair_commits_invalid
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!("solanacdn: invalid fair commit from {endpoint}: {e}");
+                return;
+            }
+            handle.note_fair_commit_for_slashing(&commit);
         }
         PopToAgent::AuthError(err) => {
             debug!(
@@ -4916,8 +5694,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
 
+        let inject_tpu_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let inject_tvu_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let inject_gossip_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let inject_tpu = inject_tpu_socket.local_addr().unwrap();
         let inject_tvu = inject_tvu_socket.local_addr().unwrap();
         let inject_gossip = inject_gossip_socket.local_addr().unwrap();
 
@@ -4930,7 +5710,7 @@ mod tests {
         let handle = Arc::new(SolanaCdnHandle::new((*cfg).clone()));
 
         let identity_keypair = Arc::new(Keypair::new());
-        let auth = Arc::new(AuthContext::new(&identity_keypair).unwrap());
+        let auth = Arc::new(AuthContext::new(identity_keypair.clone()).unwrap());
         let quic_connect = Arc::new(QuicConnectConfig {
             client_config: make_quic_client_config(&cfg).unwrap(),
             server_name: cfg.server_name.clone(),
@@ -4949,6 +5729,7 @@ mod tests {
                 quic_connect,
                 handle,
                 &mut uplink_rx,
+                inject_tpu,
                 inject_tvu,
                 inject_gossip,
                 ShredBatchDeduper::new(64),
@@ -5088,8 +5869,10 @@ mod tests {
             }
         });
 
+        let inject_tpu_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let inject_tvu_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let inject_gossip_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let inject_tpu = inject_tpu_socket.local_addr().unwrap();
         let inject_tvu = inject_tvu_socket.local_addr().unwrap();
         let inject_gossip = inject_gossip_socket.local_addr().unwrap();
 
@@ -5102,7 +5885,7 @@ mod tests {
         let handle = Arc::new(SolanaCdnHandle::new((*cfg).clone()));
 
         let identity_keypair = Arc::new(Keypair::new());
-        let auth = Arc::new(AuthContext::new(&identity_keypair).unwrap());
+        let auth = Arc::new(AuthContext::new(identity_keypair.clone()).unwrap());
         let quic_connect = Arc::new(QuicConnectConfig {
             client_config: make_quic_client_config(&cfg).unwrap(),
             server_name: cfg.server_name.clone(),
@@ -5121,6 +5904,7 @@ mod tests {
                 quic_connect,
                 handle,
                 &mut uplink_rx,
+                inject_tpu,
                 inject_tvu,
                 inject_gossip,
                 ShredBatchDeduper::new(64),
@@ -5281,8 +6065,10 @@ mod tests {
             }
         });
 
+        let inject_tpu_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let inject_tvu_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let inject_gossip_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let inject_tpu = inject_tpu_socket.local_addr().unwrap();
         let inject_tvu = inject_tvu_socket.local_addr().unwrap();
         let inject_gossip = inject_gossip_socket.local_addr().unwrap();
 
@@ -5301,7 +6087,7 @@ mod tests {
 
         let run_exit = Arc::clone(&exit);
         let run_task = tokio::spawn(async move {
-            run(cfg, identity_keypair, run_exit, handle, inject_tvu, inject_gossip)
+            run(cfg, identity_keypair, run_exit, handle, inject_tpu, inject_tvu, inject_gossip)
                 .await
                 .unwrap();
         });

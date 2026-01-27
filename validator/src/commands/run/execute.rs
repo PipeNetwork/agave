@@ -628,6 +628,9 @@ pub fn execute(
         }
         cfg.direct_shreds_from_pop = !matches.is_present("solanacdn_no_direct_shreds");
         cfg.vote_tunnel = !matches.is_present("solanacdn_no_vote_tunnel");
+        let fair_slashing = matches.is_present("fair_slashing");
+        cfg.tx_fair_slashing = fair_slashing;
+        cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
 
         cfg.race_enabled = matches.is_present("solanacdn_race");

@@ -722,6 +722,14 @@ impl Validator {
         let exit = Arc::new(AtomicBool::new(false));
 
         if let Some(solanacdn_cfg) = config.solanacdn.as_ref().cloned() {
+            let tpu_port = node
+                .sockets
+                .tpu
+                .first()
+                .ok_or_else(|| ValidatorError::Other("missing TPU socket".to_string()))?
+                .local_addr()
+                .map_err(|e| ValidatorError::Other(format!("failed to read TPU socket addr: {e}")))?
+                .port();
             let tvu_port = node
                 .sockets
                 .tvu
@@ -740,6 +748,7 @@ impl Validator {
                     ValidatorError::Other(format!("failed to read gossip socket addr: {e}"))
                 })?
                 .port();
+            let inject_tpu = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tpu_port);
             let inject_tvu = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tvu_port);
             let inject_gossip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gossip_port);
             crate::solanacdn::init(
@@ -747,6 +756,7 @@ impl Validator {
                 identity_keypair.clone(),
                 exit.clone(),
                 vote_use_quic,
+                inject_tpu,
                 inject_tvu,
                 inject_gossip,
             );

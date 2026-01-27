@@ -35,13 +35,10 @@ use {
     },
 };
 
-pub(crate) const DEFAULT_FAIR_BATCH_MS: NonZeroU64 = NonZeroU64::new(10).unwrap();
-
 #[derive(Clone)]
 pub struct SchedulerConfig {
     pub scheduler_pacing: SchedulerPacing,
     pub fair_ordering: bool,
-    pub fair_batch_ms: NonZeroU64,
 }
 
 impl Default for SchedulerConfig {
@@ -51,7 +48,6 @@ impl Default for SchedulerConfig {
                 DEFAULT_SCHEDULER_PACING_FILL_TIME_MILLIS,
             ),
             fair_ordering: false,
-            fair_batch_ms: DEFAULT_FAIR_BATCH_MS,
         }
     }
 }
@@ -504,12 +500,7 @@ mod tests {
         receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> TransactionViewReceiveAndBuffer {
-        TransactionViewReceiveAndBuffer::new(
-            receiver,
-            bank_forks,
-            false,
-            DEFAULT_FAIR_BATCH_MS,
-        )
+        TransactionViewReceiveAndBuffer::new(receiver, bank_forks, false)
     }
 
     #[allow(clippy::type_complexity)]
@@ -723,9 +714,8 @@ mod tests {
 
     #[test]
     fn test_schedule_consume_single_threaded_no_conflicts_fair_ordering() {
-        let fair_batch_ms = std::num::NonZeroU64::new(60_000).unwrap();
         let (mut test_frame, mut scheduler_controller) = create_test_frame(1, |receiver, bank_forks| {
-            TransactionViewReceiveAndBuffer::new(receiver, bank_forks, true, fair_batch_ms)
+            TransactionViewReceiveAndBuffer::new(receiver, bank_forks, true)
         });
         let TestFrame {
             bank,
@@ -764,13 +754,16 @@ mod tests {
         let tx1_hash = tx1.message().hash();
         let tx2_hash = tx2.message().hash();
 
-        let tie1 = u32::from_be_bytes(tx1_hash.to_bytes()[0..4].try_into().unwrap());
-        let tie2 = u32::from_be_bytes(tx2_hash.to_bytes()[0..4].try_into().unwrap());
-        let expected = if tie1 < tie2 {
-            vec![&tx1_hash, &tx2_hash]
-        } else {
-            vec![&tx2_hash, &tx1_hash]
-        };
+        // POP receipt priorities should override normal fee-based ordering.
+        crate::solanacdn::insert_fair_priority(
+            tx1.signatures[0].as_ref().try_into().unwrap(),
+            u64::MAX - 1,
+        );
+        crate::solanacdn::insert_fair_priority(
+            tx2.signatures[0].as_ref().try_into().unwrap(),
+            u64::MAX - 2,
+        );
+        let expected = vec![&tx1_hash, &tx2_hash];
 
         let txs = vec![tx1, tx2];
         banking_packet_sender
