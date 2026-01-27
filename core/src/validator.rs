@@ -156,7 +156,7 @@ use {
     std::{
         borrow::Cow,
         collections::{HashMap, HashSet},
-        net::{IpAddr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::FromStr,
@@ -382,6 +382,7 @@ pub struct ValidatorConfig {
     pub use_tpu_client_next: bool,
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
+    pub solanacdn: Option<crate::solanacdn::SolanaCdnConfig>,
 }
 
 impl ValidatorConfig {
@@ -464,6 +465,7 @@ impl ValidatorConfig {
             use_tpu_client_next: true,
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
+            solanacdn: None,
         }
     }
 
@@ -718,6 +720,37 @@ impl Validator {
         let mut bank_notification_senders = Vec::new();
 
         let exit = Arc::new(AtomicBool::new(false));
+
+        if let Some(solanacdn_cfg) = config.solanacdn.as_ref().cloned() {
+            let tvu_port = node
+                .sockets
+                .tvu
+                .first()
+                .ok_or_else(|| ValidatorError::Other("missing TVU socket".to_string()))?
+                .local_addr()
+                .map_err(|e| ValidatorError::Other(format!("failed to read TVU socket addr: {e}")))?
+                .port();
+            let gossip_port = node
+                .sockets
+                .gossip
+                .first()
+                .ok_or_else(|| ValidatorError::Other("missing gossip socket".to_string()))?
+                .local_addr()
+                .map_err(|e| {
+                    ValidatorError::Other(format!("failed to read gossip socket addr: {e}"))
+                })?
+                .port();
+            let inject_tvu = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tvu_port);
+            let inject_gossip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gossip_port);
+            crate::solanacdn::init(
+                solanacdn_cfg,
+                identity_keypair.clone(),
+                exit.clone(),
+                vote_use_quic,
+                inject_tvu,
+                inject_gossip,
+            );
+        }
 
         let geyser_plugin_config_files = config
             .on_start_geyser_plugin_config_files

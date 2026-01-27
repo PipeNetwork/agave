@@ -36,6 +36,7 @@ use {
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
     std::{
+        num::NonZeroU64,
         sync::{Arc, RwLock},
         time::Instant,
     },
@@ -105,6 +106,9 @@ pub(crate) trait ReceiveAndBuffer {
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub bank_forks: Arc<RwLock<BankForks>>,
+    fair_ordering: bool,
+    fair_batch_ms: NonZeroU64,
+    fair_start: Instant,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -230,6 +234,21 @@ pub(crate) enum PacketHandlingError {
 }
 
 impl TransactionViewReceiveAndBuffer {
+    pub(crate) fn new(
+        receiver: BankingPacketReceiver,
+        bank_forks: Arc<RwLock<BankForks>>,
+        fair_ordering: bool,
+        fair_batch_ms: NonZeroU64,
+    ) -> Self {
+        Self {
+            receiver,
+            bank_forks,
+            fair_ordering,
+            fair_batch_ms,
+            fair_start: Instant::now(),
+        }
+    }
+
     /// Return number of received packets.
     fn handle_packet_batch_message(
         &mut self,
@@ -341,6 +360,11 @@ impl TransactionViewReceiveAndBuffer {
                 }
 
                 // Reserve free-space to copy packet into, run sanitization checks, and insert.
+                let fair_bucket_sort_key = self.fair_ordering.then(|| {
+                    let elapsed_ms = self.fair_start.elapsed().as_millis() as u64;
+                    let bucket = elapsed_ms / self.fair_batch_ms.get();
+                    u32::MAX.wrapping_sub(bucket as u32)
+                });
                 if let Some(transaction_id) =
                     container.try_insert_map_only_with_data(packet_data, |bytes| {
                         match Self::try_handle_packet(
@@ -349,6 +373,7 @@ impl TransactionViewReceiveAndBuffer {
                             working_bank,
                             enable_static_instruction_limit,
                             transaction_account_lock_limit,
+                            fair_bucket_sort_key,
                         ) {
                             Ok(state) => Ok(state),
                             Err(
@@ -409,6 +434,7 @@ impl TransactionViewReceiveAndBuffer {
         working_bank: &Bank,
         enable_static_instruction_limit: bool,
         transaction_account_lock_limit: usize,
+        fair_bucket_sort_key: Option<u32>,
     ) -> Result<TransactionViewState, PacketHandlingError> {
         let (view, deactivation_slot) = translate_to_runtime_view(
             bytes,
@@ -435,7 +461,12 @@ impl TransactionViewReceiveAndBuffer {
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
         let fee_budget_limits = FeeBudgetLimits::from(compute_budget_limits);
-        let (priority, cost) = calculate_priority_and_cost(&view, &fee_budget_limits, working_bank);
+        let (priority, cost) = match fair_bucket_sort_key {
+            Some(bucket_sort_key) => {
+                calculate_fair_priority_and_cost(&view, bucket_sort_key, working_bank)
+            }
+            None => calculate_priority_and_cost(&view, &fee_budget_limits, working_bank),
+        };
 
         Ok(TransactionState::new(view, max_age, priority, cost))
     }
@@ -545,6 +576,19 @@ pub(crate) fn calculate_priority_and_cost(
     )
 }
 
+pub(crate) fn calculate_fair_priority_and_cost(
+    transaction: &impl TransactionWithMeta,
+    bucket_sort_key: u32,
+    bank: &Bank,
+) -> (u64, u64) {
+    let cost = CostModel::calculate_cost(transaction, &bank.feature_set).sum();
+    let message_hash_bytes = transaction.message_hash().to_bytes();
+    let tie = u32::from_be_bytes(message_hash_bytes[0..4].try_into().unwrap());
+    let tie_sort_key = u32::MAX.wrapping_sub(tie);
+    let priority = ((bucket_sort_key as u64) << 32) | (tie_sort_key as u64);
+    (priority, cost)
+}
+
 /// Given the epoch, the minimum deactivation slot, and the current slot,
 /// return the `MaxAge` that should be used for the transaction. This is used
 /// to determine the maximum slot that a transaction will be considered valid
@@ -613,10 +657,12 @@ mod tests {
         TransactionViewReceiveAndBuffer,
         TransactionViewStateContainer,
     ) {
-        let receive_and_buffer = TransactionViewReceiveAndBuffer {
+        let receive_and_buffer = TransactionViewReceiveAndBuffer::new(
             receiver,
             bank_forks,
-        };
+            false,
+            crate::banking_stage::transaction_scheduler::scheduler_controller::DEFAULT_FAIR_BATCH_MS,
+        );
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)
     }

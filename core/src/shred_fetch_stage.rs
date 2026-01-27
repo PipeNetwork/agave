@@ -162,21 +162,77 @@ impl ShredFetchStage {
                 )
             };
             let turbine_disabled = turbine_disabled.load(Ordering::Relaxed);
-            for mut packet in packet_batch.iter_mut().filter(|p| !p.meta().discard()) {
-                if turbine_disabled
-                    || should_discard_shred(
-                        packet.as_ref(),
-                        last_root,
-                        max_slot,
-                        shred_version,
-                        enforce_fixed_fec_set,
-                        discard_unexpected_data_complete_shreds,
-                        &mut stats,
-                    )
+            let solanacdn = (!flags.contains(PacketFlags::REPAIR))
+                .then(crate::solanacdn::global)
+                .flatten();
+            let solanacdn_publish = solanacdn.as_ref().filter(|h| h.publish_shreds_enabled());
+            for mut packet in packet_batch.iter_mut() {
+                let discard_by_solanacdn_only = solanacdn
+                    .as_ref()
+                    .is_some_and(|h| !h.should_ingest_tvu_shred(packet.meta().addr));
+                let mut discarded = packet.meta().discard();
+                if !discarded
+                    && (turbine_disabled
+                        || should_discard_shred(
+                            packet.as_ref(),
+                            last_root,
+                            max_slot,
+                            shred_version,
+                            enforce_fixed_fec_set,
+                            discard_unexpected_data_complete_shreds,
+                            &mut stats,
+                        ))
                 {
-                    packet.meta_mut().set_discard(true);
-                } else {
+                    discarded = true;
+                }
+
+                let discarded_for_publish = discarded;
+                discarded |= discard_by_solanacdn_only;
+                packet.meta_mut().set_discard(discarded);
+
+                if !discarded {
                     packet.meta_mut().flags.insert(flags);
+                }
+
+                if let Some(handle) = solanacdn.as_ref().filter(|h| h.race_enabled()) {
+                    // Race is most useful when it can observe both paths even if the slower copy
+                    // is later discarded (e.g., because the slot is already rooted). Avoid copying
+                    // packet bytes unless needed by publishing.
+                    if let Some(shred_bytes) = packet.as_ref().data(..) {
+                        if let Some(shred_id) = solana_ledger::shred::layout::get_shred_id(shred_bytes)
+                        {
+                            handle.note_race_observation(shred_id, packet.meta().addr);
+                        }
+                    }
+                }
+
+                if let Some(bytes) = packet_payload_bytes(packet.as_ref()) {
+
+                    // In `--solanacdn-only` mode, POPs may inject raw shreds directly to the TVU
+                    // socket (bypassing PushShredBatch). Those shreds are sourced from POP IPs
+                    // (added via `note_pop_endpoints` / `note_pop_egress_ip`), so count them here
+                    // to make the SolanaCDN "Pushed" metric reflect actual delivery.
+                    //
+                    // Avoid double-counting the non-direct mode, which injects via localhost.
+                    if solanacdn.as_ref().is_some_and(|h| {
+                        h.is_connected()
+                            && !packet.meta().addr.is_loopback()
+                            && h.should_ignore_src_ip(packet.meta().addr)
+                    }) {
+                        let slot = solana_ledger::shred::layout::get_slot(bytes.as_ref());
+                        solanacdn
+                            .as_ref()
+                            .expect("is_some_and implies Some")
+                            .note_pop_delivered_shred_with_slot(bytes.len(), slot);
+                    }
+
+                    if let Some(handle) = solanacdn_publish {
+                        handle.try_publish_tvu_shred(
+                            packet.meta().addr,
+                            bytes,
+                            discarded_for_publish,
+                        );
+                    }
                 }
             }
             if stats.maybe_submit(name, STATS_SUBMIT_CADENCE) {
@@ -395,6 +451,13 @@ impl ShredFetchStage {
 impl RepairContext {
     fn keypair(&self) -> Arc<Keypair> {
         self.cluster_info.keypair()
+    }
+}
+
+fn packet_payload_bytes(packet: PacketRef<'_>) -> Option<Bytes> {
+    match packet {
+        PacketRef::Bytes(pkt) => Some(pkt.buffer().clone()),
+        PacketRef::Packet(pkt) => pkt.data(..).map(Bytes::copy_from_slice),
     }
 }
 
