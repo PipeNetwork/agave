@@ -2477,6 +2477,7 @@ impl ReplayStage {
     ) {
         crate::solanacdn::fair_slashing_audit_slot(blockstore, bank.collector_id(), bank.slot());
         if crate::solanacdn::fair_slashing_is_slashed_leader(bank.collector_id(), bank.slot()) {
+            crate::solanacdn::fair_slashing_note_vote_withheld(bank.collector_id(), bank.slot());
             datapoint_info!(
                 "replay_stage-fair_slash_skip_vote",
                 ("slot", bank.slot(), i64)

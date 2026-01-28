@@ -19,6 +19,8 @@ When enabled, the validator:
 - optionally requests POP direct injection of raw shred UDP payloads to validator ports (lowest latency)
 - tunnels UDP vote packets via the POP mesh (best-effort)
 - posts per-run counters to the Pipe API ingest endpoint (so the Pipe console can show agent-style metrics)
+- optionally enables fair transaction ordering for transactions submitted via SolanaCDN
+- optionally audits/enforces fair ordering using leader-signed commits and ledger audit
 
 ## Enable (Pipe-managed POP discovery)
 
@@ -49,6 +51,47 @@ Dev-only escape hatch:
 - If you provide `--solanacdn-tls-ca-cert-path`, only that CA bundle is trusted for POP verification.
 - If `/etc/solanacdn/tls/ca.crt` exists, it is used automatically as the POP/control CA bundle.
 
+## Fair transaction ordering (experimental)
+
+Enable fair transaction ordering for SolanaCDN-submitted flow:
+
+- `--fair`
+
+This affects only the SolanaCDN fair-batch path (it does not change how P2P-gossip transactions are prioritized).
+
+## Fair slashing (experimental)
+
+Audit-only mode (records evidence/counters, does not change voting):
+
+- `--fair-slashing`
+
+Enforcement mode (implies `--fair-slashing`; withholds votes when a fair ordering violation is observed):
+
+- `--fair-slashing-enforce`
+
+In enforcement mode, vote withholding triggers on either:
+
+- ledger audit failure, or
+- commit equivocation (conflicting leader-signed fair ordering commits)
+
+### Enforcement kill switch (admin RPC)
+
+To disable enforcement immediately (no restart), call the admin RPC:
+
+- `solanaCdnSetFairSlashingEnforce(false)` (forces enforcement off)
+
+To restore the startup configuration:
+
+- `solanaCdnClearFairSlashingEnforceOverride()` (returns to `--fair-slashing-enforce` / default)
+
+## Observability
+
+- Metrics + status: `--solanacdn-metrics-addr HOST:PORT` exposes Prometheus at `/metrics` and JSON status at `/solanacdn/status`.
+- Admin RPC: `solanaCdnStatus` returns the same `SolanaCdnStatus` JSON (includes fair/slashing counters and enable flags).
+- Fair Prometheus counters include fair-batch tx receive/inject totals (`solanacdn_tx_fair_batch_received_total`, `solanacdn_tx_fair_batch_injected_total`) and fair-priority lookups/hits (`solanacdn_fair_priority_lookups_total`, `solanacdn_fair_priority_hits_total`).
+- Fair/slashing Prometheus counters include commits, audit failures, and vote withholding (`solanacdn_fair_votes_withheld_total`).
+
 ## Notes / limitations
 
 - Vote tunneling is UDP-only. If validator QUIC votes are enabled, SolanaCDN vote tunneling is disabled automatically.
+- `--fair-slashing-enforce` can reduce vote participation if violations are detected; use with care.

@@ -199,6 +199,19 @@ pub trait AdminRpc {
     #[rpc(meta, name = "solanaCdnStatus")]
     fn solana_cdn_status(&self, meta: Self::Metadata) -> Result<Option<solanacdn::SolanaCdnStatus>>;
 
+    #[rpc(meta, name = "solanaCdnSetFairSlashingEnforce")]
+    fn solana_cdn_set_fair_slashing_enforce(
+        &self,
+        meta: Self::Metadata,
+        enforce: bool,
+    ) -> Result<Option<solanacdn::SolanaCdnStatus>>;
+
+    #[rpc(meta, name = "solanaCdnClearFairSlashingEnforceOverride")]
+    fn solana_cdn_clear_fair_slashing_enforce_override(
+        &self,
+        meta: Self::Metadata,
+    ) -> Result<Option<solanacdn::SolanaCdnStatus>>;
+
     #[rpc(meta, name = "addAuthorizedVoter")]
     fn add_authorized_voter(&self, meta: Self::Metadata, keypair_file: String) -> Result<()>;
 
@@ -483,6 +496,34 @@ impl AdminRpc for AdminRpcImpl {
     fn solana_cdn_status(&self, _meta: Self::Metadata) -> Result<Option<solanacdn::SolanaCdnStatus>> {
         debug!("solana_cdn_status admin rpc request received");
         Ok(solanacdn::global().map(|h| h.status_snapshot()))
+    }
+
+    fn solana_cdn_set_fair_slashing_enforce(
+        &self,
+        _meta: Self::Metadata,
+        enforce: bool,
+    ) -> Result<Option<solanacdn::SolanaCdnStatus>> {
+        debug!(
+            "solana_cdn_set_fair_slashing_enforce admin rpc request received: enforce={}",
+            enforce
+        );
+        let Some(handle) = solanacdn::global() else {
+            return Ok(None);
+        };
+        handle.set_tx_fair_slashing_enforce_override(Some(enforce));
+        Ok(Some(handle.status_snapshot()))
+    }
+
+    fn solana_cdn_clear_fair_slashing_enforce_override(
+        &self,
+        _meta: Self::Metadata,
+    ) -> Result<Option<solanacdn::SolanaCdnStatus>> {
+        debug!("solana_cdn_clear_fair_slashing_enforce_override admin rpc request received");
+        let Some(handle) = solanacdn::global() else {
+            return Ok(None);
+        };
+        handle.set_tx_fair_slashing_enforce_override(None);
+        Ok(Some(handle.status_snapshot()))
     }
 
     fn add_authorized_voter(&self, meta: Self::Metadata, keypair_file: String) -> Result<()> {
@@ -1155,6 +1196,42 @@ mod tests {
         } else {
             assert!(result.is_null());
         }
+    }
+
+    #[test]
+    fn test_solana_cdn_set_fair_slashing_enforce_rpc_method_present() {
+        let rpc = RpcHandler::_start();
+        let RpcHandler { io, meta, .. } = rpc;
+
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"solanaCdnSetFairSlashingEnforce","params":[false]}"#;
+        let res = io
+            .handle_request_sync(req, meta)
+            .expect("actual response");
+        let value: Value = serde_json::from_str(&res).expect("json response");
+
+        assert!(
+            value.get("error").is_none(),
+            "unexpected rpc error: {value}"
+        );
+        assert!(value.get("result").is_some());
+    }
+
+    #[test]
+    fn test_solana_cdn_clear_fair_slashing_enforce_override_rpc_method_present() {
+        let rpc = RpcHandler::_start();
+        let RpcHandler { io, meta, .. } = rpc;
+
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"solanaCdnClearFairSlashingEnforceOverride"}"#;
+        let res = io
+            .handle_request_sync(req, meta)
+            .expect("actual response");
+        let value: Value = serde_json::from_str(&res).expect("json response");
+
+        assert!(
+            value.get("error").is_none(),
+            "unexpected rpc error: {value}"
+        );
+        assert!(value.get("result").is_some());
     }
 
     #[test]

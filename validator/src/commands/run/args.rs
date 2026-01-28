@@ -155,7 +155,8 @@ impl FromClapArgMatches for RunArgs {
             || matches.is_present("solanacdn_hybrid")
             || matches.is_present("solanacdn_race")
             || matches.is_present("fair")
-            || matches.is_present("fair_slashing"))
+            || matches.is_present("fair_slashing")
+            || matches.is_present("fair_slashing_enforce"))
             && !has_solanacdn_discovery
         {
             return Err(clap::Error::with_description(
@@ -1389,9 +1390,20 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("fair-slashing")
             .takes_value(false)
             .help(
-                "EXPERIMENTAL: Subscribe to leader-signed fair ordering commits and enforce \
-                 non-equivocation via vote withholding (implies --fair; requires SolanaCDN \
-                 POP/control/API token configuration)",
+                "EXPERIMENTAL: Subscribe to leader-signed fair ordering commits and audit the \
+                 ledger for fair ordering violations (implies --fair; requires SolanaCDN \
+                 POP/control/API token configuration). This mode records evidence/counters only; \
+                 for vote withholding enforcement, also set --fair-slashing-enforce.",
+            ),
+    )
+    .arg(
+        Arg::with_name("fair_slashing_enforce")
+            .long("fair-slashing-enforce")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Enforce fair ordering via vote withholding when a fair ordering \
+                 violation is observed (ledger audit failure or commit equivocation) (implies \
+                 --fair-slashing; requires SolanaCDN POP/control/API token configuration)",
             ),
     )
     .arg(
@@ -1791,6 +1803,25 @@ mod tests {
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
             vec!["--solanacdn-api-token", "pk_test_dummy", "--fair-slashing"],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn fair_slashing_enforce_requires_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_parse_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--fair-slashing-enforce"],
+        );
+    }
+
+    #[test]
+    fn fair_slashing_enforce_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec!["--solanacdn-api-token", "pk_test_dummy", "--fair-slashing-enforce"],
             default_run_args,
         );
     }

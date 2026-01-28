@@ -628,8 +628,10 @@ pub fn execute(
         }
         cfg.direct_shreds_from_pop = !matches.is_present("solanacdn_no_direct_shreds");
         cfg.vote_tunnel = !matches.is_present("solanacdn_no_vote_tunnel");
-        let fair_slashing = matches.is_present("fair_slashing");
+        let fair_slashing_enforce = matches.is_present("fair_slashing_enforce");
+        let fair_slashing = matches.is_present("fair_slashing") || fair_slashing_enforce;
         cfg.tx_fair_slashing = fair_slashing;
+        cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
         cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
 
@@ -755,7 +757,9 @@ pub fn execute(
                 "block_production_pacing_fill_time_millis",
                 SchedulerPacing
             ),
-            fair_ordering: matches.is_present("fair"),
+            fair_ordering: matches.is_present("fair")
+                || matches.is_present("fair_slashing")
+                || matches.is_present("fair_slashing_enforce"),
             ..SchedulerConfig::default()
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
