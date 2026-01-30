@@ -52,6 +52,12 @@ const FNV1A_128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
 
 const FAIR_PRIORITY_TTL_MS: u64 = 30_000;
 const FAIR_PRIORITY_MAX_ENTRIES: usize = 500_000;
+const FAIR_PRIORITY_PRUNE_LIMIT: usize = 50_000;
+const FAIR_PRIORITY_PRUNE_INTERVAL_MS: u64 = 1_000;
+
+const TX_DEDUP_TTL_MS: u64 = 2_000;
+const RELAY_TX_ID_DEDUP_MAX_ENTRIES: usize = 500_000;
+const TX_SIG_DEDUP_MAX_ENTRIES: usize = 300_000;
 
 const FAIR_MERKLE_LEAF_DOMAIN: &[u8] = b"SCDNFAIRLEAFv1";
 const FAIR_MERKLE_NODE_DOMAIN: &[u8] = b"SCDNFAIRNODEv1";
@@ -196,9 +202,22 @@ struct FairSlashedEntry {
 static FAIR_PRIORITIES: OnceLock<DashMap<[u8; 64], FairPriorityEntry>> = OnceLock::new();
 static FAIR_PRIORITY_LOOKUPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAIR_PRIORITY_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAIR_PRIORITY_LAST_PRUNE_MS: AtomicU64 = AtomicU64::new(0);
 
 fn fair_priorities() -> &'static DashMap<[u8; 64], FairPriorityEntry> {
     FAIR_PRIORITIES.get_or_init(DashMap::new)
+}
+
+fn prune_expired_fair_priorities(map: &DashMap<[u8; 64], FairPriorityEntry>, now: u64) {
+    let mut expired: Vec<[u8; 64]> = Vec::new();
+    for entry in map.iter().take(FAIR_PRIORITY_PRUNE_LIMIT) {
+        if entry.expires_at_ms < now {
+            expired.push(*entry.key());
+        }
+    }
+    for key in expired {
+        map.remove(&key);
+    }
 }
 
 pub fn fair_priority_for_tx_signature(sig: &[u8; 64]) -> Option<u64> {
@@ -218,7 +237,18 @@ pub fn fair_priority_for_tx_signature(sig: &[u8; 64]) -> Option<u64> {
 pub(crate) fn insert_fair_priority(sig: [u8; 64], priority: u64) {
     let map = fair_priorities();
     if map.len() > FAIR_PRIORITY_MAX_ENTRIES {
-        map.clear();
+        let now = now_ms();
+        let last = FAIR_PRIORITY_LAST_PRUNE_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= FAIR_PRIORITY_PRUNE_INTERVAL_MS
+            && FAIR_PRIORITY_LAST_PRUNE_MS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            prune_expired_fair_priorities(map, now);
+        }
+        if map.len() > FAIR_PRIORITY_MAX_ENTRIES {
+            map.clear();
+        }
     }
     map.insert(
         sig,
@@ -952,6 +982,8 @@ pub struct SolanaCdnStatus {
     pub tx_fair_batch_received_total: u64,
     pub tx_fair_batch_injected_total: u64,
     pub tx_fair_batch_inject_failed_total: u64,
+    pub tx_deduped_packets_total: u64,
+    pub tx_relay_dropped_fair_mode_total: u64,
     pub fair_priority_lookups_total: u64,
     pub fair_priority_hits_total: u64,
     pub fair_commits_rx_total: u64,
@@ -1006,6 +1038,7 @@ pub struct SolanaCdnHandle {
     tx_injected_packets: AtomicU64,
     tx_deduped_packets: AtomicU64,
     tx_inject_failed: AtomicU64,
+    tx_relay_dropped_fair_mode: AtomicU64,
     tx_fair_batch_received: AtomicU64,
     tx_fair_batch_injected: AtomicU64,
     tx_fair_batch_inject_failed: AtomicU64,
@@ -1033,6 +1066,11 @@ pub struct SolanaCdnHandle {
     publisher_uplink: ArcSwapOption<SessionUplink>,
     rate_state: std::sync::Mutex<RateState>,
     race_state: std::sync::Mutex<RaceTracker>,
+
+    // Recent transaction deduplication. Used to avoid repeated TPU injection due to POP mesh
+    // forwarding/retries.
+    recent_relay_tx_ids: DashMap<u64, u64>,
+    recent_tx_sigs: DashMap<[u8; 64], u64>,
 }
 
 impl SolanaCdnHandle {
@@ -1053,6 +1091,7 @@ impl SolanaCdnHandle {
             tx_injected_packets: AtomicU64::new(0),
             tx_deduped_packets: AtomicU64::new(0),
             tx_inject_failed: AtomicU64::new(0),
+            tx_relay_dropped_fair_mode: AtomicU64::new(0),
             tx_fair_batch_received: AtomicU64::new(0),
             tx_fair_batch_injected: AtomicU64::new(0),
             tx_fair_batch_inject_failed: AtomicU64::new(0),
@@ -1082,7 +1121,46 @@ impl SolanaCdnHandle {
             publisher_uplink: ArcSwapOption::const_empty(),
             rate_state: std::sync::Mutex::new(RateState::default()),
             race_state: std::sync::Mutex::new(RaceTracker::new()),
+            recent_relay_tx_ids: DashMap::new(),
+            recent_tx_sigs: DashMap::new(),
         }
+    }
+
+    fn should_dedup_relay_tx_id(&self, tx_id: u64, now: u64) -> bool {
+        if tx_id == 0 {
+            return false;
+        }
+        if self.recent_relay_tx_ids.len() > RELAY_TX_ID_DEDUP_MAX_ENTRIES {
+            self.recent_relay_tx_ids.clear();
+        }
+        if let Some(entry) = self.recent_relay_tx_ids.get(&tx_id) {
+            let expired = *entry < now;
+            drop(entry);
+            if !expired {
+                return true;
+            }
+            self.recent_relay_tx_ids.remove(&tx_id);
+        }
+        self.recent_relay_tx_ids
+            .insert(tx_id, now.saturating_add(TX_DEDUP_TTL_MS));
+        false
+    }
+
+    fn should_dedup_tx_sig(&self, sig: [u8; 64], now: u64) -> bool {
+        if self.recent_tx_sigs.len() > TX_SIG_DEDUP_MAX_ENTRIES {
+            self.recent_tx_sigs.clear();
+        }
+        if let Some(entry) = self.recent_tx_sigs.get(&sig) {
+            let expired = *entry < now;
+            drop(entry);
+            if !expired {
+                return true;
+            }
+            self.recent_tx_sigs.remove(&sig);
+        }
+        self.recent_tx_sigs
+            .insert(sig, now.saturating_add(TX_DEDUP_TTL_MS));
+        false
     }
 
     pub fn is_connected(&self) -> bool {
@@ -1687,6 +1765,9 @@ impl SolanaCdnHandle {
         let tx_fair_batch_injected_total = self.tx_fair_batch_injected.load(Ordering::Relaxed);
         let tx_fair_batch_inject_failed_total =
             self.tx_fair_batch_inject_failed.load(Ordering::Relaxed);
+        let tx_deduped_packets_total = self.tx_deduped_packets.load(Ordering::Relaxed);
+        let tx_relay_dropped_fair_mode_total =
+            self.tx_relay_dropped_fair_mode.load(Ordering::Relaxed);
         let fair_priority_lookups_total = FAIR_PRIORITY_LOOKUPS_TOTAL.load(Ordering::Relaxed);
         let fair_priority_hits_total = FAIR_PRIORITY_HITS_TOTAL.load(Ordering::Relaxed);
         let fair_commits_rx_total = self.fair_commits_rx.load(Ordering::Relaxed);
@@ -1784,6 +1865,8 @@ impl SolanaCdnHandle {
             tx_fair_batch_received_total,
             tx_fair_batch_injected_total,
             tx_fair_batch_inject_failed_total,
+            tx_deduped_packets_total,
+            tx_relay_dropped_fair_mode_total,
             fair_priority_lookups_total,
             fair_priority_hits_total,
             fair_commits_rx_total,
@@ -1949,6 +2032,7 @@ impl SolanaCdnHandle {
             "tx_injected_packets_total": self.tx_injected_packets.load(Ordering::Relaxed) as i64,
             "tx_deduped_packets_total": self.tx_deduped_packets.load(Ordering::Relaxed) as i64,
             "tx_inject_failed_total": self.tx_inject_failed.load(Ordering::Relaxed) as i64,
+            "tx_relay_dropped_fair_mode_total": self.tx_relay_dropped_fair_mode.load(Ordering::Relaxed) as i64,
             "fair_commits_rx_total": self.fair_commits_rx.load(Ordering::Relaxed) as i64,
             "fair_commits_invalid_total": self.fair_commits_invalid.load(Ordering::Relaxed) as i64,
             "fair_equivocations_total": self.fair_equivocations.load(Ordering::Relaxed) as i64,
@@ -3504,6 +3588,20 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.tx_fair_batch_inject_failed_total
     ));
 
+    out.push_str("# HELP solanacdn_tx_deduped_packets_total Total SolanaCDN transaction packets dropped due to deduplication\n");
+    out.push_str("# TYPE solanacdn_tx_deduped_packets_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_tx_deduped_packets_total {}\n",
+        status.tx_deduped_packets_total
+    ));
+
+    out.push_str("# HELP solanacdn_tx_relay_dropped_fair_mode_total Total RelayTransaction packets dropped because fair ordering is enabled\n");
+    out.push_str("# TYPE solanacdn_tx_relay_dropped_fair_mode_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_tx_relay_dropped_fair_mode_total {}\n",
+        status.tx_relay_dropped_fair_mode_total
+    ));
+
     out.push_str("# HELP solanacdn_fair_priority_lookups_total Total fair priority lookup attempts\n");
     out.push_str("# TYPE solanacdn_fair_priority_lookups_total counter\n");
     out.push_str(&format!(
@@ -4691,7 +4789,12 @@ async fn run_pop_session(
     )
     .await?;
 
-    let udp_inject = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let udp_inject_tpu = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    udp_inject_tpu.connect(inject_tpu).await?;
+    let udp_inject_tvu = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    udp_inject_tvu.connect(inject_tvu).await?;
+    let udp_inject_gossip = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    udp_inject_gossip.connect(inject_gossip).await?;
 
     // Register validator ports + direct injection preference.
     let is_publisher = *publisher_rx.borrow() == Some(endpoint);
@@ -4835,7 +4938,9 @@ async fn run_pop_session(
     let ctrl_reader_task = {
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
-        let udp_inject = udp_inject.clone();
+        let udp_inject_tpu = udp_inject_tpu.clone();
+        let udp_inject_tvu = udp_inject_tvu.clone();
+        let udp_inject_gossip = udp_inject_gossip.clone();
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
@@ -4856,10 +4961,9 @@ async fn run_pop_session(
                     &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
-                    &udp_inject,
-                    inject_tpu,
-                    inject_tvu,
-                    inject_gossip,
+                    &udp_inject_tpu,
+                    &udp_inject_tvu,
+                    &udp_inject_gossip,
                     &session_events_tx,
                     &last_hb_sent_ms,
                     msg,
@@ -4873,7 +4977,9 @@ async fn run_pop_session(
     let shreds_reader_task = {
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
-        let udp_inject = udp_inject.clone();
+        let udp_inject_tpu = udp_inject_tpu.clone();
+        let udp_inject_tvu = udp_inject_tvu.clone();
+        let udp_inject_gossip = udp_inject_gossip.clone();
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
@@ -4894,10 +5000,9 @@ async fn run_pop_session(
                     &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
-                    &udp_inject,
-                    inject_tpu,
-                    inject_tvu,
-                    inject_gossip,
+                    &udp_inject_tpu,
+                    &udp_inject_tvu,
+                    &udp_inject_gossip,
                     &session_events_tx,
                     &last_hb_sent_ms,
                     msg,
@@ -4911,7 +5016,9 @@ async fn run_pop_session(
     let votes_reader_task = {
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
-        let udp_inject = udp_inject.clone();
+        let udp_inject_tpu = udp_inject_tpu.clone();
+        let udp_inject_tvu = udp_inject_tvu.clone();
+        let udp_inject_gossip = udp_inject_gossip.clone();
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
@@ -4932,10 +5039,9 @@ async fn run_pop_session(
                     &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
-                    &udp_inject,
-                    inject_tpu,
-                    inject_tvu,
-                    inject_gossip,
+                    &udp_inject_tpu,
+                    &udp_inject_tvu,
+                    &udp_inject_gossip,
                     &session_events_tx,
                     &last_hb_sent_ms,
                     msg,
@@ -4949,7 +5055,9 @@ async fn run_pop_session(
     let udp_shreds_task = if let Some(sock) = udp_shreds.clone() {
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
-        let udp_inject = udp_inject.clone();
+        let udp_inject_tpu = udp_inject_tpu.clone();
+        let udp_inject_tvu = udp_inject_tvu.clone();
+        let udp_inject_gossip = udp_inject_gossip.clone();
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
@@ -5033,10 +5141,9 @@ async fn run_pop_session(
                                 &ctrl_out_tx,
                                 &mut publisher_rx,
                                 &shred_deduper,
-                                &udp_inject,
-                                inject_tpu,
-                                inject_tvu,
-                                inject_gossip,
+                                &udp_inject_tpu,
+                                &udp_inject_tvu,
+                                &udp_inject_gossip,
                                 &session_events_tx,
                                 &last_hb_sent_ms,
                                 decoded,
@@ -5053,10 +5160,9 @@ async fn run_pop_session(
                             &ctrl_out_tx,
                             &mut publisher_rx,
                             &shred_deduper,
-                            &udp_inject,
-                            inject_tpu,
-                            inject_tvu,
-                            inject_gossip,
+                            &udp_inject_tpu,
+                            &udp_inject_tvu,
+                            &udp_inject_gossip,
                             &session_events_tx,
                             &last_hb_sent_ms,
                             other,
@@ -5080,7 +5186,9 @@ async fn run_pop_session(
     let udp_votes_task = if let Some(sock) = udp_votes.clone() {
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
-        let udp_inject = udp_inject.clone();
+        let udp_inject_tpu = udp_inject_tpu.clone();
+        let udp_inject_tvu = udp_inject_tvu.clone();
+        let udp_inject_gossip = udp_inject_gossip.clone();
         let last_hb_sent_ms = last_hb_sent_ms.clone();
         let session_events_tx = session_events_tx.clone();
         let cfg = cfg.clone();
@@ -5111,10 +5219,9 @@ async fn run_pop_session(
                     &ctrl_out_tx,
                     &mut publisher_rx,
                     &shred_deduper,
-                    &udp_inject,
-                    inject_tpu,
-                    inject_tvu,
-                    inject_gossip,
+                    &udp_inject_tpu,
+                    &udp_inject_tvu,
+                    &udp_inject_gossip,
                     &session_events_tx,
                     &last_hb_sent_ms,
                     msg,
@@ -5230,10 +5337,9 @@ async fn handle_pop_msg(
     ctrl_out_tx: &mpsc::Sender<AgentToPop>,
     publisher_rx: &mut watch::Receiver<Option<SocketAddr>>,
     shred_deduper: &ShredBatchDeduper,
-    udp_inject: &UdpSocket,
-    inject_tpu: SocketAddr,
-    inject_tvu: SocketAddr,
-    inject_gossip: SocketAddr,
+    udp_inject_tpu: &UdpSocket,
+    udp_inject_tvu: &UdpSocket,
+    udp_inject_gossip: &UdpSocket,
     session_events_tx: &mpsc::UnboundedSender<SessionEvent>,
     last_hb_sent_ms: &AtomicU64,
     msg: PopToAgent,
@@ -5277,10 +5383,10 @@ async fn handle_pop_msg(
                 rx_bytes = rx_bytes.saturating_add(shred.payload.len());
                 max_slot = Some(max_slot.unwrap_or(0).max(shred.id.slot));
                 let dst = match shred.kind {
-                    ShredKind::Tvu => inject_tvu,
-                    ShredKind::Gossip => inject_gossip,
+                    ShredKind::Tvu => udp_inject_tvu,
+                    ShredKind::Gossip => udp_inject_gossip,
                 };
-                let _ = udp_inject.send_to(&shred.payload, dst).await;
+                let _ = dst.send(&shred.payload).await;
             }
             handle.note_solanacdn_shreds_rx(rx_bytes, rx_shreds, max_slot);
         }
@@ -5291,10 +5397,21 @@ async fn handle_pop_msg(
             handle.rx_vote_packets.fetch_add(1, Ordering::Relaxed);
         }
         PopToAgent::RelayTransaction(tx) => {
+            handle.rx_tx_packets.fetch_add(1, Ordering::Relaxed);
+            if cfg.tx_fair_ordering {
+                handle
+                    .tx_relay_dropped_fair_mode
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             // Transactions may be routed via multiple POPs (home-POP forwarding, multi-POP, etc),
             // so do not gate this on the current shred/vote publisher selection.
-            handle.rx_tx_packets.fetch_add(1, Ordering::Relaxed);
-            if udp_inject.send_to(&tx.payload, inject_tpu).await.is_ok() {
+            let now = now_ms();
+            if handle.should_dedup_relay_tx_id(tx.tx_id, now) {
+                handle.tx_deduped_packets.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                 handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
             } else {
                 handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
@@ -5320,6 +5437,22 @@ async fn handle_pop_msg(
             handle
                 .tx_fair_batch_received
                 .fetch_add(txs.len() as u64, Ordering::Relaxed);
+
+            let now = now_ms();
+            let original_len = txs.len();
+            let txs: Vec<solanacdn_protocol::messages::FairTx> = txs
+                .into_iter()
+                .filter(|tx| !handle.should_dedup_tx_sig(tx.sig.0, now))
+                .collect();
+            let deduped = original_len.saturating_sub(txs.len());
+            if deduped > 0 {
+                handle
+                    .tx_deduped_packets
+                    .fetch_add(deduped as u64, Ordering::Relaxed);
+            }
+            if txs.is_empty() {
+                return;
+            }
 
             let mut sigs: Vec<solanacdn_protocol::crypto::SignatureBytes> =
                 Vec::with_capacity(txs.len());
@@ -5352,14 +5485,14 @@ async fn handle_pop_msg(
                                 sig_bytes.as_slice(),
                             );
                             for tx_bytes in commit_txs {
-                                let _ = udp_inject.send_to(&tx_bytes, inject_tpu).await;
+                                let _ = udp_inject_tpu.send(&tx_bytes).await;
                             }
                         }
                     }
                 }
 
                 for tx in txs.iter() {
-                    if udp_inject.send_to(&tx.payload, inject_tpu).await.is_ok() {
+                    if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                         handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
                         handle.tx_fair_batch_injected.fetch_add(1, Ordering::Relaxed);
                     } else {
@@ -5416,7 +5549,7 @@ async fn handle_pop_msg(
 
             // Not in fair mode: best-effort inject without ordering commit.
             for tx in txs.iter() {
-                if udp_inject.send_to(&tx.payload, inject_tpu).await.is_ok() {
+                if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                     handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
                     handle.tx_fair_batch_injected.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -5771,6 +5904,8 @@ mod tests {
         assert!(text.contains("solanacdn_tx_fair_batch_received_total "));
         assert!(text.contains("solanacdn_tx_fair_batch_injected_total "));
         assert!(text.contains("solanacdn_tx_fair_batch_inject_failed_total "));
+        assert!(text.contains("solanacdn_tx_deduped_packets_total "));
+        assert!(text.contains("solanacdn_tx_relay_dropped_fair_mode_total "));
         assert!(text.contains("solanacdn_fair_priority_lookups_total "));
         assert!(text.contains("solanacdn_fair_priority_hits_total "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enabled "));

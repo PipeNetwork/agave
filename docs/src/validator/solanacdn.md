@@ -59,6 +59,8 @@ Enable fair transaction ordering for SolanaCDN-submitted flow:
 
 This affects only the SolanaCDN fair-batch path (it does not change how P2P-gossip transactions are prioritized).
 
+When enabled, the validator advertises `tx_fair_ordering` to the POP and **expects transactions via `FairBatch`** (batch-of-1 is fine). Legacy `RelayTransaction` submissions are dropped to avoid bypassing the fair-ordering domain.
+
 ## Fair slashing (experimental)
 
 Audit-only mode (records evidence/counters, does not change voting):
@@ -89,6 +91,7 @@ To restore the startup configuration:
 - Metrics + status: `--solanacdn-metrics-addr HOST:PORT` exposes Prometheus at `/metrics` and JSON status at `/solanacdn/status`.
 - Admin RPC: `solanaCdnStatus` returns the same `SolanaCdnStatus` JSON (includes fair/slashing counters and enable flags).
 - Fair Prometheus counters include fair-batch tx receive/inject totals (`solanacdn_tx_fair_batch_received_total`, `solanacdn_tx_fair_batch_injected_total`) and fair-priority lookups/hits (`solanacdn_fair_priority_lookups_total`, `solanacdn_fair_priority_hits_total`).
+- Transaction hygiene counters include dedup drops (`solanacdn_tx_deduped_packets_total`) and relay drops in fair mode (`solanacdn_tx_relay_dropped_fair_mode_total`).
 - Fair/slashing Prometheus counters include commits, audit failures, and vote withholding (`solanacdn_fair_votes_withheld_total`).
 
 ## Notes / limitations
