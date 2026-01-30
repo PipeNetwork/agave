@@ -635,7 +635,13 @@ pub fn execute(
         cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
 
-        cfg.race_enabled = matches.is_present("solanacdn_race");
+        cfg.race_enabled = matches
+            .value_of("solanacdn_race")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "false" || v == "0")
+            })
+            .unwrap_or(true);
         if cfg.race_enabled {
             cfg.race_sample_bits = value_t!(matches, "solanacdn_race_sample_bits", u8)
                 .unwrap_or(cfg.race_sample_bits)
@@ -643,8 +649,6 @@ pub fn execute(
             cfg.race_window_ms = value_t!(matches, "solanacdn_race_window_ms", u64)
                 .unwrap_or(cfg.race_window_ms)
                 .max(250);
-            // Race mode requires ingesting shreds from both paths.
-            cfg.tvu_shred_ingest_mode = solana_core::solanacdn::TvuShredIngestMode::All;
         }
 
         cfg

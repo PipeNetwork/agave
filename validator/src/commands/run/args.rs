@@ -151,9 +151,17 @@ impl FromClapArgMatches for RunArgs {
                 .is_some_and(|s| !s.trim().is_empty());
         let has_solanacdn_discovery =
             has_solanacdn_pop || has_solanacdn_control || has_solanacdn_api_token;
+        let solanacdn_race_requested = matches
+            .value_of("solanacdn_race")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "false" || v == "0")
+            })
+            .unwrap_or_else(|| matches.is_present("solanacdn_race"));
+
         if (matches.is_present("solanacdn_only")
             || matches.is_present("solanacdn_hybrid")
-            || matches.is_present("solanacdn_race")
+            || solanacdn_race_requested
             || matches.is_present("fair")
             || matches.is_present("fair_slashing")
             || matches.is_present("fair_slashing_enforce"))
@@ -1558,9 +1566,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
     .arg(
         Arg::with_name("solanacdn_race")
             .long("solanacdn-race")
-            .takes_value(false)
-            .conflicts_with_all(&["solanacdn_only", "solanacdn_hybrid"])
-            .help("Measure shred “race” outcomes between SolanaCDN and gossip (ingest both paths; exports Prometheus metrics)"),
+            .takes_value(true)
+            .min_values(0)
+            .max_values(1)
+            .possible_values(&["true", "false", "1", "0"])
+            .case_insensitive(true)
+            .help("Enable shred “race” metrics between SolanaCDN and gossip (default: enabled; disable with --solanacdn-race=false). Does not change shred ingest mode."),
     )
     .arg(
         Arg::with_name("solanacdn_race_sample_bits")
@@ -1568,7 +1579,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .value_name("BITS")
             .takes_value(true)
             .validator(is_parsable::<u8>)
-            .requires("solanacdn_race")
             .help("Deterministic sampling bits for race metrics (track 1/(2^BITS) shreds; 0=all; default: 12)"),
     )
     .arg(
@@ -1577,7 +1587,6 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .value_name("MILLISECONDS")
             .takes_value(true)
             .validator(is_parsable::<u64>)
-            .requires("solanacdn_race")
             .help("Race matching window (ms) to wait for the other source (default: 5000)"),
     )
     .arg(
@@ -1907,9 +1916,9 @@ mod tests {
     }
 
     #[test]
-    fn solanacdn_race_conflicts_with_only_and_hybrid() {
+    fn solanacdn_race_can_coexist_with_only_and_hybrid() {
         let default_run_args = RunArgs::default();
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
+        verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
             vec![
                 "--solanacdn-api-token",
@@ -1917,33 +1926,64 @@ mod tests {
                 "--solanacdn-only",
                 "--solanacdn-race",
             ],
+            default_run_args.clone(),
         );
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
-            default_run_args,
+
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
             vec![
                 "--solanacdn-api-token",
                 "pk_test_dummy",
                 "--solanacdn-hybrid",
                 "--solanacdn-race",
             ],
+            default_run_args,
         );
     }
 
     #[test]
-    fn solanacdn_race_sample_bits_requires_race() {
+    fn solanacdn_only_allows_race_false() {
         let default_run_args = RunArgs::default();
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--solanacdn-only",
+                "--solanacdn-race=false",
+            ],
             default_run_args,
+        );
+    }
+
+    #[test]
+    fn solanacdn_race_sample_bits_does_not_require_race() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
             vec!["--solanacdn-race-sample-bits", "10"],
+            default_run_args,
         );
     }
 
     #[test]
-    fn solanacdn_race_window_ms_requires_race() {
+    fn solanacdn_race_window_ms_does_not_require_race() {
         let default_run_args = RunArgs::default();
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
             vec!["--solanacdn-race-window-ms", "5000"],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn solanacdn_race_false_does_not_require_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec!["--solanacdn-race=false"],
+            default_run_args,
         );
     }
 

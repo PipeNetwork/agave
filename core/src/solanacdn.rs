@@ -474,7 +474,7 @@ impl SolanaCdnConfig {
             pipe_api_tls_insecure_skip_verify: false,
             pipe_api_tls_ca_cert_path: None,
             metrics_listen_addr: None,
-            race_enabled: false,
+            race_enabled: true,
             race_sample_bits: 12,
             race_window_ms: 5_000,
             publish_shreds: true,
@@ -513,7 +513,7 @@ impl Default for SolanaCdnConfig {
             pipe_api_tls_insecure_skip_verify: false,
             pipe_api_tls_ca_cert_path: None,
             metrics_listen_addr: None,
-            race_enabled: false,
+            race_enabled: true,
             race_sample_bits: 12,
             race_window_ms: 5_000,
             publish_shreds: true,
@@ -700,7 +700,7 @@ impl RaceHistogram {
             hist.observe(delta_ms);
         }
 
-        const MAX_POP_SEGMENTS: usize = 32;
+        const MAX_POP_SEGMENTS: usize = 64;
         if let Some(endpoint) = solanacdn_endpoint {
             if self.delta_by_pop_endpoint.len() < MAX_POP_SEGMENTS
                 || self.delta_by_pop_endpoint.contains_key(&endpoint)
@@ -1539,16 +1539,11 @@ impl SolanaCdnHandle {
     }
 
     pub fn race_enabled(&self) -> bool {
-        self.cfg.race_enabled
-            && self.cfg.tvu_shred_ingest_mode == TvuShredIngestMode::All
-            && self.is_connected()
+        self.cfg.race_enabled && self.is_connected()
     }
 
     pub fn note_race_observation(&self, shred_id: LedgerShredId, src_ip: IpAddr) {
         if !self.cfg.race_enabled {
-            return;
-        }
-        if self.cfg.tvu_shred_ingest_mode != TvuShredIngestMode::All {
             return;
         }
         if !self.is_connected() {
@@ -1593,9 +1588,6 @@ impl SolanaCdnHandle {
 
     pub fn note_race_observation_from_pop(&self, shred_id: LedgerShredId, pop_endpoint: SocketAddr) {
         if !self.cfg.race_enabled {
-            return;
-        }
-        if self.cfg.tvu_shred_ingest_mode != TvuShredIngestMode::All {
             return;
         }
         if !self.is_connected() {

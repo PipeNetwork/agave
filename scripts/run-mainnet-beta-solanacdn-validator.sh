@@ -17,10 +17,10 @@ Optional env vars:
   SOLANACDN_ONLY         (default: "1"; set "0" to disable --solanacdn-only)
   SOLANACDN_HYBRID       (default: "1"; set "0" to disable --solanacdn-hybrid)
   SOLANACDN_HYBRID_STALE_MS (default: 2000; only when SOLANACDN_HYBRID=1)
-  SOLANACDN_RACE         (default: "0"; set "1" to enable --solanacdn-race (disables only/hybrid))
-  SOLANACDN_RACE_SAMPLE_BITS (default: 12; only when SOLANACDN_RACE=1)
-  SOLANACDN_RACE_WINDOW_MS   (default: 5000; only when SOLANACDN_RACE=1)
-  SOLANACDN_METRICS_ADDR (optional; sets --solanacdn-metrics-addr. Auto-set to 127.0.0.1:19100 when --solanacdn-race is used)
+  SOLANACDN_RACE         (default: "1"; set "0" to disable SolanaCDN vs gossip race metrics)
+  SOLANACDN_RACE_SAMPLE_BITS (default: 12; only when SOLANACDN_RACE!=0)
+  SOLANACDN_RACE_WINDOW_MS   (default: 5000; only when SOLANACDN_RACE!=0)
+  SOLANACDN_METRICS_ADDR (optional; sets --solanacdn-metrics-addr for local /metrics + /solanacdn/status)
   BOOTSTRAP_RPC_ADDRS_URL (optional; sets --bootstrap-rpc-addrs-url to reduce RPC scan noise)
   BOOTSTRAP_RPC_ADDRS    (optional; comma/space-separated; adds --bootstrap-rpc-addr entries)
   SNAPSHOT_MANIFEST_URL  (default: https://data.pipedev.network/snapshot-manifest.json)
@@ -412,14 +412,6 @@ if [[ -n "${SOLANACDN_TLS_CA_CERT_PATH_ARG}" ]]; then
   args+=(--solanacdn-tls-ca-cert-path "${SOLANACDN_TLS_CA_CERT_PATH_ARG}")
 fi
 
-if (args_has --solanacdn-race "$@" || [[ "${SOLANACDN_RACE:-0}" == "1" ]]) \
-  && ! args_has --solanacdn-metrics-addr "$@" \
-  && [[ -z "${SOLANACDN_METRICS_ADDR:-}" ]]; then
-  # Race mode needs an easy way to read results; default to localhost on a port less likely to
-  # conflict with node_exporter (often 9100).
-  SOLANACDN_METRICS_ADDR="127.0.0.1:19100"
-fi
-
 if [[ -n "${SOLANACDN_METRICS_ADDR:-}" ]] && ! args_has --solanacdn-metrics-addr "$@"; then
   args+=(--solanacdn-metrics-addr "${SOLANACDN_METRICS_ADDR}")
 fi
@@ -437,15 +429,29 @@ if [[ -n "${BOOTSTRAP_RPC_ADDRS:-}" ]] && ! args_has --bootstrap-rpc-addr "$@"; 
   done
 fi
 
-# Respect explicit SolanaCDN mode flags passed by the caller.
-if ! args_has --solanacdn-race "$@" \
-  && ! args_has --solanacdn-only "$@" \
+# Enable/disable SolanaCDN vs gossip race metrics (enabled by default).
+race_env="${SOLANACDN_RACE:-1}"
+race_env="$(echo "${race_env}" | tr '[:upper:]' '[:lower:]' | xargs || true)"
+race_disabled=0
+if [[ "${race_env}" == "0" || "${race_env}" == "false" || "${race_env}" == "no" || "${race_env}" == "off" ]]; then
+  race_disabled=1
+fi
+if ! args_has --solanacdn-race "$@" && [[ "${race_disabled}" -eq 1 ]]; then
+  args+=(--solanacdn-race=false)
+fi
+if [[ "${race_disabled}" -eq 0 ]]; then
+  if [[ -n "${SOLANACDN_RACE_SAMPLE_BITS:-}" ]] && ! args_has --solanacdn-race-sample-bits "$@"; then
+    args+=(--solanacdn-race-sample-bits "${SOLANACDN_RACE_SAMPLE_BITS}")
+  fi
+  if [[ -n "${SOLANACDN_RACE_WINDOW_MS:-}" ]] && ! args_has --solanacdn-race-window-ms "$@"; then
+    args+=(--solanacdn-race-window-ms "${SOLANACDN_RACE_WINDOW_MS}")
+  fi
+fi
+
+# Respect explicit SolanaCDN ingest mode flags passed by the caller.
+if ! args_has --solanacdn-only "$@" \
   && ! args_has --solanacdn-hybrid "$@"; then
-  if [[ "${SOLANACDN_RACE:-0}" == "1" ]]; then
-    args+=(--solanacdn-race)
-    args+=(--solanacdn-race-sample-bits "${SOLANACDN_RACE_SAMPLE_BITS:-12}")
-    args+=(--solanacdn-race-window-ms "${SOLANACDN_RACE_WINDOW_MS:-5000}")
-  elif [[ "${SOLANACDN_HYBRID:-1}" == "1" ]]; then
+  if [[ "${SOLANACDN_HYBRID:-1}" == "1" ]]; then
     args+=(--solanacdn-hybrid)
     args+=(--solanacdn-hybrid-stale-ms "${SOLANACDN_HYBRID_STALE_MS:-2000}")
   elif [[ "${SOLANACDN_ONLY:-1}" != "0" ]]; then
