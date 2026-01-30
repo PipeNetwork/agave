@@ -90,7 +90,7 @@ To restore the startup configuration:
 
 - Metrics + status: `--solanacdn-metrics-addr HOST:PORT` exposes Prometheus at `/metrics` and JSON status at `/solanacdn/status`.
 - Admin RPC: `solanaCdnStatus` returns the same `SolanaCdnStatus` JSON (includes fair/slashing counters and enable flags).
-- Race metrics (SolanaCDN vs gossip): enabled by default; disable with `--solanacdn-race=false`. Tune via `--solanacdn-race-sample-bits` and `--solanacdn-race-window-ms` (does not change shred ingest mode).
+- Race metrics (SolanaCDN vs gossip): enabled by default; disable with `--solanacdn-race=false`. Tune via `--solanacdn-race-sample-bits` and `--solanacdn-race-window-ms` (compatible with `--solanacdn-only` / `--solanacdn-hybrid`; does not change shred ingest mode).
 - Fair Prometheus counters include fair-batch tx receive/inject totals (`solanacdn_tx_fair_batch_received_total`, `solanacdn_tx_fair_batch_injected_total`) and fair-priority lookups/hits (`solanacdn_fair_priority_lookups_total`, `solanacdn_fair_priority_hits_total`).
 - Transaction hygiene counters include dedup drops (`solanacdn_tx_deduped_packets_total`) and relay drops in fair mode (`solanacdn_tx_relay_dropped_fair_mode_total`).
 - Fair/slashing Prometheus counters include commits, audit failures, and vote withholding (`solanacdn_fair_votes_withheld_total`).
