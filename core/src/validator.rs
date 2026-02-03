@@ -383,6 +383,7 @@ pub struct ValidatorConfig {
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
     pub solanacdn: Option<crate::solanacdn::SolanaCdnConfig>,
+    pub mcp: Option<crate::mcp::McpConfig>,
 }
 
 impl ValidatorConfig {
@@ -466,6 +467,7 @@ impl ValidatorConfig {
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
             solanacdn: None,
+            mcp: None,
         }
     }
 
@@ -720,6 +722,8 @@ impl Validator {
         let mut bank_notification_senders = Vec::new();
 
         let exit = Arc::new(AtomicBool::new(false));
+
+        crate::mcp::configure(config.mcp.clone());
 
         if let Some(solanacdn_cfg) = config.solanacdn.as_ref().cloned() {
             let tpu_port = node

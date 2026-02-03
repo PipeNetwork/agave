@@ -216,6 +216,35 @@ impl<Tx: TransactionWithMeta> StateContainer<Tx> for TransactionStateContainer<T
 }
 
 impl<Tx: TransactionWithMeta> TransactionStateContainer<Tx> {
+    pub(crate) fn reapply_priority_overrides<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&Tx) -> Option<u64>,
+    {
+        for state in self.id_to_transaction_state.iter_mut().map(|(_, v)| v) {
+            if let Some(tx) = state.transaction_if_available() {
+                let override_priority = f(tx);
+                state.set_priority_override(override_priority);
+            }
+        }
+
+        let mut updated_ids: Vec<TransactionPriorityId> =
+            Vec::with_capacity(self.priority_queue.len());
+        while let Some(priority_id) = self.priority_queue.pop_max() {
+            if let Some(state) = self.id_to_transaction_state.get(priority_id.id) {
+                updated_ids.push(TransactionPriorityId::new(state.priority(), priority_id.id));
+            }
+        }
+        for priority_id in updated_ids {
+            self.priority_queue.push(priority_id);
+        }
+
+        for held in &mut self.held_transactions {
+            if let Some(state) = self.id_to_transaction_state.get(held.id) {
+                held.priority = state.priority();
+            }
+        }
+    }
+
     /// Insert a new transaction into the container's queues and maps.
     /// Returns `true` if a packet was dropped due to capacity limits.
     #[cfg(test)]
@@ -293,6 +322,13 @@ impl TransactionViewStateContainer {
         } else {
             None
         }
+    }
+
+    pub(crate) fn reapply_priority_overrides<F>(&mut self, f: F)
+    where
+        F: FnMut(&RuntimeTransactionView) -> Option<u64>,
+    {
+        self.inner.reapply_priority_overrides(f);
     }
 }
 

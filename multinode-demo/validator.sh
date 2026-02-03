@@ -188,6 +188,99 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --wen-restart-coordinator ]]; then
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 == --mcp ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --mcp-enforce ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --mcp-any-leader ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --mcp-scheduled ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --mcp-lanes ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --mcp-da-threshold-bps ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --mcp-da-solanacdn ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --mcp-no-da-solanacdn ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --mcp-microblock-max-refs ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --fair ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --fair-slashing ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --fair-slashing-enforce ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-pop ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-control ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-api-base ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-api-token ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-metrics-addr ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-server-name ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-tls-ca-cert-path ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-tls-insecure-skip-verify ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-control-server-name ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-control-tls-ca-cert-path ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-control-tls-insecure-skip-verify ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-only ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-hybrid ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-udp ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-no-shreds ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-no-subscribe ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-no-inject ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-no-direct-shreds ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-no-vote-tunnel ]]; then
+      args+=("$1")
+      shift
     elif [[ $1 = -h ]]; then
       usage "$@"
     else

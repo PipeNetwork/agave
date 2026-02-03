@@ -22,9 +22,12 @@ use {
     },
     solana_clock::MAX_PROCESSING_AGE,
     solana_cost_model::cost_tracker::SharedBlockCost,
+    solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
+    solana_svm_transaction::svm_message::SVMMessage,
+    std::collections::HashMap,
     std::{
         num::{NonZeroU64, Saturating},
         sync::{
@@ -68,6 +71,7 @@ where
     decision_maker: DecisionMaker,
     receive_and_buffer: R,
     bank_forks: Arc<RwLock<BankForks>>,
+    leader_schedule_cache: Arc<LeaderScheduleCache>,
     /// Container for transaction state.
     /// Shared resource between `packet_receiver` and `scheduler`.
     container: R::Container,
@@ -96,6 +100,7 @@ where
         decision_maker: DecisionMaker,
         receive_and_buffer: R,
         bank_forks: Arc<RwLock<BankForks>>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     ) -> Self {
@@ -105,6 +110,7 @@ where
             decision_maker,
             receive_and_buffer,
             bank_forks,
+            leader_schedule_cache,
             container: R::Container::with_capacity(TOTAL_BUFFERED_PACKETS),
             scheduler,
             count_metrics: SchedulerCountMetrics::default(),
@@ -213,11 +219,19 @@ where
                 let scheduling_budget = cost_pacer
                     .expect("cost pacer must be set for Consume")
                     .scheduling_budget(now);
+                let mcp_filter =
+                    McpPreGraphFilterV1::maybe_new(bank, self.leader_schedule_cache.as_ref());
                 let (scheduling_summary, schedule_time_us) = measure_us!(self.scheduler.schedule(
                     &mut self.container,
                     scheduling_budget,
                     |txs, results| {
-                        Self::pre_graph_filter(txs, results, bank, MAX_PROCESSING_AGE)
+                        Self::pre_graph_filter(
+                            txs,
+                            results,
+                            bank,
+                            MAX_PROCESSING_AGE,
+                            mcp_filter.as_ref(),
+                        )
                     },
                     |_| PreLockFilterAction::AttemptToSchedule // no pre-lock filter for now
                 )?);
@@ -260,6 +274,7 @@ where
         results: &mut [bool],
         bank: &Bank,
         max_age: usize,
+        mcp_filter: Option<&McpPreGraphFilterV1>,
     ) {
         let lock_results = vec![Ok(()); transactions.len()];
         let mut error_counters = TransactionErrorMetrics::default();
@@ -275,9 +290,15 @@ where
             .zip(transactions)
             .zip(results.iter_mut())
         {
-            *result = check_result
+            let mut ok = check_result
                 .and_then(|_| Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters))
                 .is_ok();
+            if ok {
+                if let Some(filter) = mcp_filter {
+                    ok = filter.allow_tx(*tx);
+                }
+            }
+            *result = ok;
         }
     }
 
@@ -421,6 +442,76 @@ where
     }
 }
 
+#[derive(Clone, Debug)]
+struct McpPreGraphFilterV1 {
+    slot: u64,
+    lanes_per_slot: u8,
+    expected_slot_leader: [u8; 32],
+    leader_mode: crate::mcp::McpLeaderMode,
+    scheduled_lane_leaders: Option<HashMap<crate::mcp::LaneId, [u8; 32]>>,
+}
+
+impl McpPreGraphFilterV1 {
+    fn maybe_new(bank: &Bank, leader_schedule_cache: &LeaderScheduleCache) -> Option<Self> {
+        let mcp = crate::mcp::global()?;
+        let cfg = mcp.status_snapshot().cfg;
+        let leader_mode = cfg.leader_mode;
+        let slot = bank.slot();
+        let expected_slot_leader = bank.collector_id().to_bytes();
+        let scheduled_lane_leaders =
+            (leader_mode == crate::mcp::McpLeaderMode::ScheduledLeaderSchedule).then(|| {
+                mcp.scheduled_lane_leaders_from_leader_schedule_v1(slot, bank, leader_schedule_cache)
+            });
+        Some(Self {
+            slot,
+            lanes_per_slot: cfg.lanes_per_slot.max(1),
+            expected_slot_leader,
+            leader_mode,
+            scheduled_lane_leaders,
+        })
+    }
+
+    fn allow_tx<T: SVMMessage>(&self, tx: &T) -> bool {
+        for (program_id, ix) in tx.program_instructions_iter() {
+            let Some(parse) = crate::mcp::parse_mcp_memo_ix_data_v1(program_id, ix.data) else {
+                continue;
+            };
+            match parse {
+                crate::mcp::McpMemoIxParseV1::InvalidSignature => return false,
+                crate::mcp::McpMemoIxParseV1::Valid(meta) => {
+                    if meta.slot != self.slot {
+                        continue;
+                    }
+                    if meta.lane_id >= self.lanes_per_slot {
+                        return false;
+                    }
+                    match self.leader_mode {
+                        crate::mcp::McpLeaderMode::SlotLeaderOnly => {
+                            if meta.leader_pubkey != self.expected_slot_leader {
+                                return false;
+                            }
+                        }
+                        crate::mcp::McpLeaderMode::AnyLeader => {}
+                        crate::mcp::McpLeaderMode::ScheduledLeaderSchedule => {
+                            let Some(scheduled_lane_leaders) = self.scheduled_lane_leaders.as_ref()
+                            else {
+                                return false;
+                            };
+                            let Some(&lane_leader) = scheduled_lane_leaders.get(&meta.lane_id) else {
+                                return false;
+                            };
+                            if meta.leader_pubkey != lane_leader {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
 struct CostPacer {
     block_limit: u64,
     shared_block_cost: SharedBlockCost,
@@ -469,6 +560,7 @@ mod tests {
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::genesis_utils::GenesisConfigInfo,
+        solana_ledger::leader_schedule_cache::LeaderScheduleCache,
         solana_message::Message,
         solana_perf::packet::{to_packet_batches, PacketBatch, NUM_PACKETS},
         solana_poh::poh_recorder::{LeaderState, SharedLeaderState},
@@ -500,7 +592,10 @@ mod tests {
         receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> TransactionViewReceiveAndBuffer {
-        TransactionViewReceiveAndBuffer::new(receiver, bank_forks, false)
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
+            &bank_forks.read().unwrap().working_bank(),
+        ));
+        TransactionViewReceiveAndBuffer::new(receiver, bank_forks, leader_schedule_cache, false)
     }
 
     #[allow(clippy::type_complexity)]
@@ -518,6 +613,7 @@ mod tests {
         } = create_slow_genesis_config(u64::MAX);
         genesis_config.fee_rate_governor = FeeRateGovernor::new(5000, 0);
         let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
 
         let shared_leader_state = SharedLeaderState::new(0, None, None);
 
@@ -551,11 +647,203 @@ mod tests {
             decision_maker,
             receive_and_buffer,
             bank_forks,
+            leader_schedule_cache,
             scheduler,
             vec![], // no actual workers with metrics to report, this can be empty
         );
 
         (test_frame, scheduler_controller)
+    }
+
+    #[test]
+    fn test_mcp_filter_scheduled_rejects_unscheduled_leader() {
+        use {
+            ed25519_dalek_v2::SigningKey,
+            solana_transaction::sanitized::SanitizedTransaction,
+            std::collections::HashSet,
+        };
+
+        let slot = 1;
+        let lane_id: crate::mcp::LaneId = 0;
+        let recent_blockhash = Hash::new_unique();
+
+        let identity_scheduled = Keypair::new();
+        let seed_scheduled: [u8; 32] = identity_scheduled.to_bytes()[..32].try_into().unwrap();
+        let signing_scheduled = SigningKey::from_bytes(&seed_scheduled);
+        assert_eq!(
+            identity_scheduled.pubkey().to_bytes(),
+            signing_scheduled.verifying_key().to_bytes()
+        );
+
+        let identity_unscheduled = Keypair::new();
+        let seed_unscheduled: [u8; 32] = identity_unscheduled.to_bytes()[..32].try_into().unwrap();
+        let signing_unscheduled = SigningKey::from_bytes(&seed_unscheduled);
+
+        let mut scheduled_lane_leaders = HashMap::new();
+        scheduled_lane_leaders.insert(lane_id, identity_scheduled.pubkey().to_bytes());
+
+        let filter = McpPreGraphFilterV1 {
+            slot,
+            lanes_per_slot: 2,
+            expected_slot_leader: identity_scheduled.pubkey().to_bytes(),
+            leader_mode: crate::mcp::McpLeaderMode::ScheduledLeaderSchedule,
+            scheduled_lane_leaders: Some(scheduled_lane_leaders),
+        };
+
+        let refs = vec![crate::mcp::McpTxRefV1 {
+            blob_id: crate::mcp::tx_blob_id_v1(b"tx1"),
+            bid_hint: crate::mcp::BidHintV1 {
+                cu_price: 1,
+                cu_limit: 1,
+                sig_count: 1,
+            },
+        }];
+        let mut mb = crate::mcp::McpMicroblockV1::build_unsigned(
+            slot,
+            lane_id,
+            0,
+            [0u8; 32],
+            [0u8; 32],
+            refs,
+            0,
+            identity_unscheduled.pubkey(),
+        );
+        mb.sign_v1(&signing_unscheduled);
+
+        let memos = crate::mcp::build_mcp_microblock_memo_txs_v1(
+            &identity_unscheduled,
+            &signing_unscheduled,
+            recent_blockhash,
+            &mb,
+        );
+        assert_eq!(memos.len(), 1);
+
+        let tx: Transaction = bincode::deserialize(&memos[0]).unwrap();
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+        assert!(!filter.allow_tx(&sanitized));
+    }
+
+    #[test]
+    fn test_mcp_filter_scheduled_allows_scheduled_leader() {
+        use {
+            ed25519_dalek_v2::SigningKey,
+            solana_transaction::sanitized::SanitizedTransaction,
+            std::collections::HashSet,
+        };
+
+        let slot = 1;
+        let lane_id: crate::mcp::LaneId = 0;
+        let recent_blockhash = Hash::new_unique();
+
+        let identity_scheduled = Keypair::new();
+        let seed_scheduled: [u8; 32] = identity_scheduled.to_bytes()[..32].try_into().unwrap();
+        let signing_scheduled = SigningKey::from_bytes(&seed_scheduled);
+
+        let mut scheduled_lane_leaders = HashMap::new();
+        scheduled_lane_leaders.insert(lane_id, identity_scheduled.pubkey().to_bytes());
+
+        let filter = McpPreGraphFilterV1 {
+            slot,
+            lanes_per_slot: 2,
+            expected_slot_leader: identity_scheduled.pubkey().to_bytes(),
+            leader_mode: crate::mcp::McpLeaderMode::ScheduledLeaderSchedule,
+            scheduled_lane_leaders: Some(scheduled_lane_leaders),
+        };
+
+        let refs = vec![crate::mcp::McpTxRefV1 {
+            blob_id: crate::mcp::tx_blob_id_v1(b"tx1"),
+            bid_hint: crate::mcp::BidHintV1 {
+                cu_price: 1,
+                cu_limit: 1,
+                sig_count: 1,
+            },
+        }];
+        let mut mb = crate::mcp::McpMicroblockV1::build_unsigned(
+            slot,
+            lane_id,
+            0,
+            [0u8; 32],
+            [0u8; 32],
+            refs,
+            0,
+            identity_scheduled.pubkey(),
+        );
+        mb.sign_v1(&signing_scheduled);
+
+        let memos = crate::mcp::build_mcp_microblock_memo_txs_v1(
+            &identity_scheduled,
+            &signing_scheduled,
+            recent_blockhash,
+            &mb,
+        );
+        assert_eq!(memos.len(), 1);
+
+        let tx: Transaction = bincode::deserialize(&memos[0]).unwrap();
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+        assert!(filter.allow_tx(&sanitized));
+    }
+
+    #[test]
+    fn test_mcp_filter_rejects_invalid_chunk_signature() {
+        use {
+            ed25519_dalek_v2::SigningKey,
+            solana_transaction::sanitized::SanitizedTransaction,
+            std::collections::HashSet,
+        };
+
+        let slot = 1;
+        let lane_id: crate::mcp::LaneId = 0;
+        let recent_blockhash = Hash::new_unique();
+
+        let identity = Keypair::new();
+        let seed: [u8; 32] = identity.to_bytes()[..32].try_into().unwrap();
+        let signing = SigningKey::from_bytes(&seed);
+
+        let filter = McpPreGraphFilterV1 {
+            slot,
+            lanes_per_slot: 2,
+            expected_slot_leader: identity.pubkey().to_bytes(),
+            leader_mode: crate::mcp::McpLeaderMode::AnyLeader,
+            scheduled_lane_leaders: None,
+        };
+
+        let refs = vec![crate::mcp::McpTxRefV1 {
+            blob_id: crate::mcp::tx_blob_id_v1(b"tx1"),
+            bid_hint: crate::mcp::BidHintV1 {
+                cu_price: 1,
+                cu_limit: 1,
+                sig_count: 1,
+            },
+        }];
+        let mut mb = crate::mcp::McpMicroblockV1::build_unsigned(
+            slot,
+            lane_id,
+            0,
+            [0u8; 32],
+            [0u8; 32],
+            refs,
+            0,
+            identity.pubkey(),
+        );
+        mb.sign_v1(&signing);
+
+        let memos =
+            crate::mcp::build_mcp_microblock_memo_txs_v1(&identity, &signing, recent_blockhash, &mb);
+        assert_eq!(memos.len(), 1);
+
+        let mut tx: Transaction = bincode::deserialize(&memos[0]).unwrap();
+        let memo_ix_data = &mut tx.message.instructions[1].data;
+        *memo_ix_data
+            .last_mut()
+            .expect("mcp memo instruction must have bytes") ^= 0x01;
+        let signers = vec![&identity as &dyn Signer];
+        tx.sign(&signers, recent_blockhash);
+
+        let sanitized =
+            SanitizedTransaction::try_from_legacy_transaction(tx, &HashSet::new()).unwrap();
+        assert!(!filter.allow_tx(&sanitized));
     }
 
     fn create_and_fund_prioritized_transfer(
@@ -715,7 +1003,10 @@ mod tests {
     #[test]
     fn test_schedule_consume_single_threaded_no_conflicts_fair_ordering() {
         let (mut test_frame, mut scheduler_controller) = create_test_frame(1, |receiver, bank_forks| {
-            TransactionViewReceiveAndBuffer::new(receiver, bank_forks, true)
+            let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
+                &bank_forks.read().unwrap().working_bank(),
+            ));
+            TransactionViewReceiveAndBuffer::new(receiver, bank_forks, leader_schedule_cache, true)
         });
         let TestFrame {
             bank,

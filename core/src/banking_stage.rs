@@ -411,9 +411,15 @@ impl BankingStage {
         let mut thread_hdls = Vec::with_capacity(num_workers.get() + 2);
         thread_hdls.push(Self::spawn_vote_worker(&context));
 
+        let leader_schedule_cache = context
+            .poh_recorder
+            .read()
+            .unwrap()
+            .leader_schedule_cache();
         let receive_and_buffer = TransactionViewReceiveAndBuffer::new(
             context.non_vote_receiver.clone(),
             context.bank_forks.clone(),
+            leader_schedule_cache,
             scheduler_config.fair_ordering,
         );
         Self::spawn_scheduler_and_workers(
@@ -455,9 +461,15 @@ impl BankingStage {
             context.exit_signal.store(false, Ordering::Relaxed);
             self.thread_hdls.push(Self::spawn_vote_worker(context));
 
+            let leader_schedule_cache = context
+                .poh_recorder
+                .read()
+                .unwrap()
+                .leader_schedule_cache();
             let receive_and_buffer = TransactionViewReceiveAndBuffer::new(
                 context.non_vote_receiver.clone(),
                 context.bank_forks.clone(),
+                leader_schedule_cache,
                 scheduler_config.fair_ordering,
             );
             Self::spawn_scheduler_and_workers(
@@ -496,6 +508,11 @@ impl BankingStage {
 
         // Spawn the worker threads
         let decision_maker = DecisionMaker::from(context.poh_recorder.read().unwrap().deref());
+        let leader_schedule_cache = context
+            .poh_recorder
+            .read()
+            .unwrap()
+            .leader_schedule_cache();
         let mut worker_metrics = Vec::with_capacity(num_workers);
         for (index, work_receiver) in work_receivers.into_iter().enumerate() {
             let id = index as u32;
@@ -531,6 +548,7 @@ impl BankingStage {
             ($scheduler:ident) => {
                 let exit = exit.clone();
                 let bank_forks = context.bank_forks.clone();
+                let leader_schedule_cache = leader_schedule_cache.clone();
                 non_vote_thread_hdls.push(
                     Builder::new()
                         .name("solBnkTxSched".to_string())
@@ -541,6 +559,7 @@ impl BankingStage {
                                 decision_maker,
                                 receive_and_buffer,
                                 bank_forks,
+                                leader_schedule_cache,
                                 $scheduler,
                                 worker_metrics,
                             );

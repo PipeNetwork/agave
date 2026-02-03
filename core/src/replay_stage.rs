@@ -2475,6 +2475,15 @@ impl ReplayStage {
         first_alpenglow_slot: &mut Option<Slot>,
         tbft_structs: &mut TowerBFTStructures,
     ) {
+        crate::mcp::audit_votable_bank(blockstore, bank, leader_schedule_cache);
+        if crate::mcp::mcp_slashing_is_slashed_leader(bank.collector_id(), bank) {
+            crate::mcp::mcp_slashing_note_vote_withheld(bank.collector_id(), bank.slot());
+            datapoint_info!(
+                "replay_stage-mcp_slash_skip_vote",
+                ("slot", bank.slot(), i64)
+            );
+            return;
+        }
         crate::solanacdn::fair_slashing_audit_slot(blockstore, bank.collector_id(), bank.slot());
         if crate::solanacdn::fair_slashing_is_slashed_leader(bank.collector_id(), bank.slot()) {
             crate::solanacdn::fair_slashing_note_vote_withheld(bank.collector_id(), bank.slot());

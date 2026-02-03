@@ -41,21 +41,52 @@ args=(
                         "$SOLANA_CONFIG_DIR"/bootstrap-validator/stake-account.json
 )
 
-"$SOLANA_ROOT"/fetch-core-bpf.sh
-if [[ -r core-bpf-genesis-args.sh ]]; then
-  CORE_BPF_GENESIS_ARGS=$(cat "$SOLANA_ROOT"/core-bpf-genesis-args.sh)
-  #shellcheck disable=SC2207
-  #shellcheck disable=SC2206
-  args+=($CORE_BPF_GENESIS_ARGS)
-fi
+  if [[ -z ${SOLANA_SKIP_PROGRAM_FETCH-} ]]; then
+    "$SOLANA_ROOT"/fetch-core-bpf.sh
+    if [[ -r core-bpf-genesis-args.sh ]]; then
+      CORE_BPF_GENESIS_ARGS=$(cat "$SOLANA_ROOT"/core-bpf-genesis-args.sh)
+      #shellcheck disable=SC2207
+      #shellcheck disable=SC2206
+      args+=($CORE_BPF_GENESIS_ARGS)
+    fi
 
-"$SOLANA_ROOT"/fetch-spl.sh
-if [[ -r spl-genesis-args.sh ]]; then
-  SPL_GENESIS_ARGS=$(cat "$SOLANA_ROOT"/spl-genesis-args.sh)
-  #shellcheck disable=SC2207
-  #shellcheck disable=SC2206
-  args+=($SPL_GENESIS_ARGS)
-fi
+    "$SOLANA_ROOT"/fetch-spl.sh
+    if [[ -r spl-genesis-args.sh ]]; then
+      SPL_GENESIS_ARGS=$(cat "$SOLANA_ROOT"/spl-genesis-args.sh)
+      #shellcheck disable=SC2207
+      #shellcheck disable=SC2206
+      args+=($SPL_GENESIS_ARGS)
+    fi
+  else
+    echo "Skipping fetch-core-bpf.sh and fetch-spl.sh (SOLANA_SKIP_PROGRAM_FETCH=1)"
+
+    # For local/offline development, include the vendored program binaries shipped with this repo.
+    # This enables features like MCP that rely on SPL Memo being present in the genesis config.
+    programs_dir="${SOLANA_PROGRAM_BINARIES_DIR:-$SOLANA_ROOT/program-binaries/src/programs}"
+    if [[ -d "$programs_dir" ]]; then
+      echo "Using program binaries from: $programs_dir"
+
+      # Core BPF programs (upgradeable loader v3)
+      args+=(
+        --upgradeable-program AddressLookupTab1e1111111111111111111111111 BPFLoaderUpgradeab1e11111111111111111111111 "$programs_dir/core_bpf_address_lookup_table-3.0.0.so" none
+        --upgradeable-program Config1111111111111111111111111111111111111 BPFLoaderUpgradeab1e11111111111111111111111 "$programs_dir/core_bpf_config-3.0.0.so" none
+        --upgradeable-program Feature111111111111111111111111111111111111 BPFLoaderUpgradeab1e11111111111111111111111 "$programs_dir/core_bpf_feature_gate-0.0.1.so" none
+        --upgradeable-program Stake11111111111111111111111111111111111111 BPFLoaderUpgradeab1e11111111111111111111111 "$programs_dir/core_bpf_stake-1.0.1.so" none
+      )
+
+      # SPL programs
+      args+=(
+        --bpf-program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA BPFLoader2111111111111111111111111111111111 "$programs_dir/spl_token-3.5.0.so"
+        --upgradeable-program TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb BPFLoaderUpgradeab1e11111111111111111111111 "$programs_dir/spl_token_2022-10.0.0.so" none
+        --bpf-program Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo BPFLoader1111111111111111111111111111111111 "$programs_dir/spl_memo-1.0.0.so"
+        --bpf-program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr BPFLoader2111111111111111111111111111111111 "$programs_dir/spl_memo-3.0.0.so"
+        --bpf-program ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL BPFLoader2111111111111111111111111111111111 "$programs_dir/spl_associated_token_account-1.1.1.so"
+      )
+    else
+      echo "Warning: program binaries directory not found: $programs_dir"
+      echo "Genesis will not include vended core/spl BPF programs."
+    fi
+  fi
 
 default_arg --ledger "$SOLANA_CONFIG_DIR"/bootstrap-validator
 default_arg --faucet-pubkey "$SOLANA_CONFIG_DIR"/faucet.json

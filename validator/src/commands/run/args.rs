@@ -1385,12 +1385,107 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("mcp")
+            .long("mcp")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Enable MCP (Multiple Concurrent Proposals) scaffolding. When \
+                 SolanaCDN is configured (POP/control/API token), this implies --fair (fair \
+                 transaction ordering) and enables MCP DA checkpoint distribution + attestation \
+                 collection over SolanaCDN for fast propagation.",
+            ),
+    )
+    .arg(
+        Arg::with_name("mcp_enforce")
+            .long("mcp-enforce")
+            .takes_value(false)
+            .requires("mcp")
+            .help(
+                "EXPERIMENTAL: Enforce MCP ledger audit failures via vote withholding (requires \
+                 --mcp). This is feature-gated; if the on-chain feature is not active, this \
+                 runs in observe-only mode (no vote withholding).",
+            ),
+    )
+    .arg(
+        Arg::with_name("mcp_any_leader")
+            .long("mcp-any-leader")
+            .takes_value(false)
+            .requires("mcp")
+            .conflicts_with("mcp_scheduled")
+            .help(
+                "EXPERIMENTAL: Allow MCP objects to be signed by any validator (per-lane leader \
+                 selection is performed during audit).",
+            ),
+    )
+    .arg(
+        Arg::with_name("mcp_scheduled")
+            .long("mcp-scheduled")
+            .takes_value(false)
+            .requires("mcp")
+            .conflicts_with("mcp_any_leader")
+            .help(
+                "EXPERIMENTAL: Allow MCP objects to be signed only by a deterministic scheduled \
+                 K-set derived from the leader schedule.",
+            ),
+    )
+    .arg(
+        Arg::with_name("mcp_lanes")
+            .long("mcp-lanes")
+            .value_name("K")
+            .takes_value(true)
+            .validator(|s| is_within_range(s, 1..))
+            .requires("mcp")
+            .help("EXPERIMENTAL: MCP concurrent proposer set size per slot (default: 2)"),
+    )
+    .arg(
+        Arg::with_name("mcp_da_threshold_bps")
+            .long("mcp-da-threshold-bps")
+            .value_name("BPS")
+            .takes_value(true)
+            .validator(|s| is_within_range(s, 1..=10_000))
+            .requires("mcp")
+            .help("EXPERIMENTAL: MCP data-availability threshold in basis points (default: 6667)"),
+    )
+    .arg(
+        Arg::with_name("mcp_da_solanacdn")
+            .long("mcp-da-solanacdn")
+            .takes_value(false)
+            .requires("mcp")
+            .conflicts_with("mcp_no_da_solanacdn")
+            .help(
+                "EXPERIMENTAL: Use SolanaCDN control-plane transport for MCP DA attestations \
+                 (checkpoint distribution + attestation collection). Requires SolanaCDN POP/control/API token configuration. \
+                 If validators are connected to different POPs, POPs must enable MCP DA forwarding across the POP mesh.",
+            ),
+    )
+    .arg(
+        Arg::with_name("mcp_no_da_solanacdn")
+            .long("mcp-no-da-solanacdn")
+            .takes_value(false)
+            .requires("mcp")
+            .conflicts_with("mcp_da_solanacdn")
+            .help(
+                "EXPERIMENTAL: Disable MCP DA checkpoint distribution + attestation collection over SolanaCDN \
+                 (enabled by default when --mcp and SolanaCDN is configured).",
+            ),
+    )
+    .arg(
+        Arg::with_name("mcp_microblock_max_refs")
+            .long("mcp-microblock-max-refs")
+            .value_name("COUNT")
+            .takes_value(true)
+            .validator(|s| is_within_range(s, 1..))
+            .requires("mcp")
+            .help("EXPERIMENTAL: MCP microblock max tx refs (default: 64)"),
+    )
+    .arg(
         Arg::with_name("fair")
             .long("fair")
             .takes_value(false)
             .help(
                 "EXPERIMENTAL: Enable fair transaction ordering for flow submitted via \
-                 SolanaCDN (requires SolanaCDN POP/control/API token configuration)",
+                 SolanaCDN (implied by --mcp; requires SolanaCDN POP/control/API token \
+                 configuration)",
             ),
     )
     .arg(
@@ -1788,11 +1883,109 @@ mod tests {
     }
 
     #[test]
+    fn mcp_does_not_require_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec!["--mcp"],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn mcp_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec!["--solanacdn-api-token", "pk_test_dummy", "--mcp"],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn mcp_any_leader_requires_mcp() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--mcp-any-leader"],
+        );
+    }
+
+    #[test]
+    fn mcp_any_leader_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--mcp",
+                "--mcp-any-leader",
+            ],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn mcp_scheduled_requires_mcp() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--mcp-scheduled"],
+        );
+    }
+
+    #[test]
+    fn mcp_scheduled_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--mcp",
+                "--mcp-scheduled",
+            ],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn mcp_scheduled_conflicts_with_any_leader() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_is_error_with_identity_setup(
+            default_run_args,
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--mcp",
+                "--mcp-scheduled",
+                "--mcp-any-leader",
+            ],
+        );
+    }
+
+    #[test]
     fn fair_accepts_api_token() {
         let default_run_args = RunArgs::default();
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
             vec!["--solanacdn-api-token", "pk_test_dummy", "--fair"],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn mcp_and_fair_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--mcp",
+                "--fair",
+            ],
             default_run_args,
         );
     }
@@ -1830,7 +2023,11 @@ mod tests {
         let default_run_args = RunArgs::default();
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
-            vec!["--solanacdn-api-token", "pk_test_dummy", "--fair-slashing-enforce"],
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-slashing-enforce",
+            ],
             default_run_args,
         );
     }
@@ -1868,7 +2065,11 @@ mod tests {
         let default_run_args = RunArgs::default();
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
-            vec!["--solanacdn-api-token", "pk_test_dummy", "--solanacdn-hybrid"],
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--solanacdn-hybrid",
+            ],
             default_run_args,
         );
     }

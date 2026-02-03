@@ -19,7 +19,9 @@ pub(crate) struct TransactionState<Tx> {
     /// is valid for. This includes sanitization features, as well as resolved
     /// address lookups.
     max_age: MaxAge,
-    /// Priority of the transaction.
+    /// Base priority of the transaction (fee-derived).
+    base_priority: u64,
+    /// Effective priority of the transaction (after overrides).
     priority: u64,
     /// Estimated cost of the transaction.
     cost: u64,
@@ -31,6 +33,7 @@ impl<Tx> TransactionState<Tx> {
         Self {
             transaction: Some(transaction),
             max_age,
+            base_priority: priority,
             priority,
             cost,
         }
@@ -46,6 +49,16 @@ impl<Tx> TransactionState<Tx> {
     /// Return the cost of the transaction.
     pub(crate) fn cost(&self) -> u64 {
         self.cost
+    }
+
+    /// Update the priority, using the base priority when no override is provided.
+    pub(crate) fn set_priority_override(&mut self, override_priority: Option<u64>) {
+        self.priority = override_priority.unwrap_or(self.base_priority);
+    }
+
+    /// Get a reference to the transaction if it is available for scheduling.
+    pub(crate) fn transaction_if_available(&self) -> Option<&Tx> {
+        self.transaction.as_ref()
     }
 
     /// Intended to be called when a transaction is scheduled. This method
@@ -165,6 +178,17 @@ mod tests {
         let (transaction, _max_age) = transaction_state.take_transaction_for_scheduling();
         assert_eq!(transaction_state.priority(), priority);
         transaction_state.retry_transaction(transaction);
+        assert_eq!(transaction_state.priority(), priority);
+    }
+
+    #[test]
+    fn test_priority_override_reverts_to_base() {
+        let priority = 7;
+        let mut transaction_state = create_transaction_state(priority);
+        assert_eq!(transaction_state.priority(), priority);
+        transaction_state.set_priority_override(Some(42));
+        assert_eq!(transaction_state.priority(), 42);
+        transaction_state.set_priority_override(None);
         assert_eq!(transaction_state.priority(), priority);
     }
 

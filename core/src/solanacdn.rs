@@ -40,8 +40,8 @@ use solanacdn_protocol::frame::{DEFAULT_MAX_FRAME_BYTES, FrameError, decode_enve
 use solanacdn_protocol::messages::{
     AgentCapabilities, AgentToPop, AuthRefresh, AuthRequest, AuthRequestPayload, AuthWithSessionToken,
     ControlRequest, ControlResponse, FairBatchCommit, FairBatchCommitPayload, FairBatchReceiptCommit,
-    FairBatchReceiptCommitPayload, Heartbeat, HeartbeatStats, PopToAgent, Shred, ShredBatch, ShredId,
-    ShredKind, StreamKind, VoteDatagram,
+    FairBatchReceiptCommitPayload, Heartbeat, HeartbeatStats, McpDaAttest, McpDaRequest, PopToAgent,
+    Shred, ShredBatch, ShredId, ShredKind, StreamKind, VoteDatagram,
 };
 
 static GLOBAL: ArcSwapOption<SolanaCdnHandle> = ArcSwapOption::const_empty();
@@ -58,6 +58,10 @@ const FAIR_PRIORITY_PRUNE_INTERVAL_MS: u64 = 1_000;
 const TX_DEDUP_TTL_MS: u64 = 2_000;
 const RELAY_TX_ID_DEDUP_MAX_ENTRIES: usize = 500_000;
 const TX_SIG_DEDUP_MAX_ENTRIES: usize = 300_000;
+
+const MCP_DA_ATTEST_TTL_MS: u64 = 60_000;
+const MCP_DA_ATTEST_DEDUP_MAX_ENTRIES: usize = 200_000;
+const MCP_DA_MAX_ATTESTATIONS_PER_CHECKPOINT: usize = 4_096;
 
 const FAIR_MERKLE_LEAF_DOMAIN: &[u8] = b"SCDNFAIRLEAFv1";
 const FAIR_MERKLE_NODE_DOMAIN: &[u8] = b"SCDNFAIRNODEv1";
@@ -197,6 +201,15 @@ struct FairSlashedKey {
 #[derive(Clone, Copy, Debug)]
 struct FairSlashedEntry {
     expires_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct McpDaKey {
+    epoch: u64,
+    slot: u64,
+    lane_id: u8,
+    checkpoint_ix: u16,
+    checkpoint_id: [u8; 32],
 }
 
 static FAIR_PRIORITIES: OnceLock<DashMap<[u8; 64], FairPriorityEntry>> = OnceLock::new();
@@ -450,6 +463,8 @@ pub struct SolanaCdnConfig {
     /// vote withholding when a fair ordering violation is observed (ledger audit failure or
     /// commit equivocation).
     pub tx_fair_slashing_enforce: bool,
+    /// If enabled, participate in MCP data-availability attestation over SolanaCDN.
+    pub mcp_da: bool,
 
     pub shreds_queue_len: usize,
     pub votes_queue_len: usize,
@@ -488,6 +503,7 @@ impl SolanaCdnConfig {
             tx_fair_ordering: false,
             tx_fair_slashing: false,
             tx_fair_slashing_enforce: false,
+            mcp_da: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
         }
@@ -527,6 +543,7 @@ impl Default for SolanaCdnConfig {
             tx_fair_ordering: false,
             tx_fair_slashing: false,
             tx_fair_slashing_enforce: false,
+            mcp_da: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
         }
@@ -1071,6 +1088,11 @@ pub struct SolanaCdnHandle {
     // forwarding/retries.
     recent_relay_tx_ids: DashMap<u64, u64>,
     recent_tx_sigs: DashMap<[u8; 64], u64>,
+
+    // MCP DA transport over SolanaCDN (experimental; opt-in).
+    mcp_da_ctrl_out_txs: DashMap<SocketAddr, mpsc::Sender<AgentToPop>>,
+    mcp_da_attested_checkpoint_ids: DashMap<[u8; 32], u64>,
+    mcp_da_attests: DashMap<McpDaKey, HashMap<[u8; 32], [u8; 64]>>,
 }
 
 impl SolanaCdnHandle {
@@ -1123,6 +1145,9 @@ impl SolanaCdnHandle {
             race_state: std::sync::Mutex::new(RaceTracker::new()),
             recent_relay_tx_ids: DashMap::new(),
             recent_tx_sigs: DashMap::new(),
+            mcp_da_ctrl_out_txs: DashMap::new(),
+            mcp_da_attested_checkpoint_ids: DashMap::new(),
+            mcp_da_attests: DashMap::new(),
         }
     }
 
@@ -1161,6 +1186,95 @@ impl SolanaCdnHandle {
         self.recent_tx_sigs
             .insert(sig, now.saturating_add(TX_DEDUP_TTL_MS));
         false
+    }
+
+    fn register_mcp_da_ctrl_sender(&self, endpoint: SocketAddr, tx: mpsc::Sender<AgentToPop>) {
+        if !self.cfg.mcp_da {
+            return;
+        }
+        self.mcp_da_ctrl_out_txs.insert(endpoint, tx);
+    }
+
+    fn unregister_mcp_da_ctrl_sender(&self, endpoint: SocketAddr) {
+        self.mcp_da_ctrl_out_txs.remove(&endpoint);
+    }
+
+    fn mcp_da_try_send_request(&self, req: McpDaRequest) -> usize {
+        if !self.cfg.mcp_da {
+            return 0;
+        }
+
+        // Prefer sending to the currently-selected publisher POP (single fanout), and fall back to
+        // broadcasting across all connected POP sessions.
+        if let Some(publisher) = self
+            .publisher_endpoint
+            .load_full()
+            .and_then(|p| p.parse::<SocketAddr>().ok())
+        {
+            if let Some(sender) = self.mcp_da_ctrl_out_txs.get(&publisher) {
+                if sender.try_send(AgentToPop::McpDaRequest(req.clone())).is_ok() {
+                    return 1;
+                }
+            }
+        }
+
+        let mut sent: usize = 0;
+        for sender in self.mcp_da_ctrl_out_txs.iter() {
+            if sender
+                .value()
+                .try_send(AgentToPop::McpDaRequest(req.clone()))
+                .is_ok()
+            {
+                sent = sent.saturating_add(1);
+            }
+        }
+        sent
+    }
+
+    fn should_dedup_mcp_da_checkpoint_id(&self, checkpoint_id: [u8; 32], now: u64) -> bool {
+        if self.mcp_da_attested_checkpoint_ids.len() > MCP_DA_ATTEST_DEDUP_MAX_ENTRIES {
+            self.mcp_da_attested_checkpoint_ids.clear();
+        }
+        if let Some(entry) = self.mcp_da_attested_checkpoint_ids.get(&checkpoint_id) {
+            let expired = *entry < now;
+            drop(entry);
+            if !expired {
+                return true;
+            }
+            self.mcp_da_attested_checkpoint_ids.remove(&checkpoint_id);
+        }
+        self.mcp_da_attested_checkpoint_ids.insert(
+            checkpoint_id,
+            now.saturating_add(MCP_DA_ATTEST_TTL_MS),
+        );
+        false
+    }
+
+    fn mcp_da_note_attest(&self, attest: &McpDaAttest) {
+        if !self.cfg.mcp_da {
+            return;
+        }
+
+        let key = McpDaKey {
+            epoch: attest.epoch,
+            slot: attest.slot,
+            lane_id: attest.lane_id,
+            checkpoint_ix: attest.checkpoint_ix,
+            checkpoint_id: attest.checkpoint_id,
+        };
+
+        let mut entry = self.mcp_da_attests.entry(key).or_insert_with(HashMap::new);
+        if entry.len() >= MCP_DA_MAX_ATTESTATIONS_PER_CHECKPOINT {
+            return;
+        }
+        entry.insert(attest.validator_pubkey.0, attest.sig.0);
+    }
+
+    fn mcp_da_take_attests(&self, key: McpDaKey) -> Vec<([u8; 32], [u8; 64])> {
+        self.mcp_da_attests
+            .remove(&key)
+            .map(|(_k, v)| v.into_iter().collect())
+            .unwrap_or_default()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -2089,6 +2203,47 @@ pub fn fair_slashing_note_vote_withheld(leader: &Pubkey, slot: u64) {
     handle.note_fair_vote_withheld(leader, slot);
 }
 
+pub fn mcp_da_try_send_request_for_checkpoint(epoch: u64, checkpoint: &crate::mcp::McpCheckpointV1) -> usize {
+    let Some(handle) = global() else {
+        return 0;
+    };
+    if !handle.cfg.mcp_da {
+        return 0;
+    }
+
+    let req = McpDaRequest {
+        epoch,
+        slot: checkpoint.header.slot,
+        lane_id: checkpoint.header.lane_id,
+        checkpoint_ix: checkpoint.header.checkpoint_ix,
+        checkpoint_id: checkpoint.header.checkpoint_id_v1(),
+        checkpoint_bytes: checkpoint.encode_v1(),
+    };
+    handle.mcp_da_try_send_request(req)
+}
+
+pub fn mcp_da_take_attests_for_checkpoint(
+    epoch: u64,
+    slot: u64,
+    lane_id: u8,
+    checkpoint_ix: u16,
+    checkpoint_id: [u8; 32],
+) -> Vec<([u8; 32], [u8; 64])> {
+    let Some(handle) = global() else {
+        return Vec::new();
+    };
+    if !handle.cfg.mcp_da {
+        return Vec::new();
+    }
+    handle.mcp_da_take_attests(McpDaKey {
+        epoch,
+        slot,
+        lane_id,
+        checkpoint_ix,
+        checkpoint_id,
+    })
+}
+
 pub fn init(
     mut cfg: SolanaCdnConfig,
     identity_keypair: Arc<Keypair>,
@@ -2112,7 +2267,13 @@ pub fn init(
         return;
     }
 
-    if !cfg.publish_shreds && !cfg.subscribe_shreds && !cfg.vote_tunnel {
+    let any_feature_enabled = cfg.publish_shreds
+        || cfg.subscribe_shreds
+        || cfg.vote_tunnel
+        || cfg.tx_fair_ordering
+        || cfg.tx_fair_slashing
+        || cfg.mcp_da;
+    if !any_feature_enabled {
         warn!("solanacdn: configured but all features are disabled; skipping init");
         return;
     }
@@ -4714,6 +4875,10 @@ async fn run_pop_session(
     )
     .await?;
 
+    if cfg.mcp_da {
+        write_agent_msg(&mut ctrl_send, &AgentToPop::SubscribeMcpDa).await?;
+    }
+
     if cfg.tx_fair_slashing {
         write_agent_msg(&mut ctrl_send, &AgentToPop::SubscribeFairCommits).await?;
     }
@@ -4813,6 +4978,7 @@ async fn run_pop_session(
             }
         }
     });
+    handle.register_mcp_da_ctrl_sender(endpoint, ctrl_out_tx.clone());
 
     // Pipe session token refresher: push AuthRefresh updates on the control stream.
     let auth_refresh_task = if let Some(mut token_rx) = pipe_session_token_rx.take() {
@@ -5298,6 +5464,7 @@ async fn run_pop_session(
         }
     }
 
+    handle.unregister_mcp_da_ctrl_sender(endpoint);
     let _ = session_events_tx.send(SessionEvent::Disconnected { endpoint });
 
     ctrl_writer_task.abort();
@@ -5463,6 +5630,54 @@ async fn handle_pop_msg(
                     sig_bytes.push(tx.sig.0);
                 }
 
+                if let Some(mcp) = crate::mcp::global() {
+                    // In scheduled MCP mode, memo proposals are produced by the scheduled lane
+                    // leaders via the forwarding stage (which has access to leader schedule
+                    // context). Avoid emitting memos here where we cannot validate leadership.
+                    if mcp.status_snapshot().cfg.leader_mode
+                        == crate::mcp::McpLeaderMode::ScheduledLeaderSchedule
+                    {
+                        // Continue injecting payloads and fair ordering commits, but do not emit
+                        // MCP memo transactions from the SolanaCDN agent task.
+                    } else if let Some(slot) = target_slot {
+                        if let Some(recent_blockhash) =
+                            recent_blockhash_from_wire_tx(txs[0].payload.as_slice())
+                        {
+                            let lane_id = mcp.select_lane_for_slot_v1(
+                                slot,
+                                auth.identity_keypair.pubkey(),
+                            );
+                            let mut refs: Vec<crate::mcp::McpTxRefV1> =
+                                Vec::with_capacity(txs.len());
+                            for (idx, tx) in txs.iter().enumerate() {
+                                let order_ix = order_start.wrapping_add(idx as u64);
+                                let priority = u64::MAX.wrapping_sub(order_ix);
+                                refs.push(crate::mcp::McpTxRefV1 {
+                                    blob_id: crate::mcp::tx_blob_id_v1(tx.payload.as_slice()),
+                                    bid_hint: crate::mcp::BidHintV1 {
+                                        cu_price: priority,
+                                        cu_limit: 0,
+                                        sig_count: 0,
+                                    },
+                                });
+                            }
+
+                            let mcp_memos = mcp
+                                .build_lane_microblock_and_checkpoint_memo_txs_from_refs_v1(
+                                    auth.identity_keypair.as_ref(),
+                                    &auth.signing_key,
+                                    recent_blockhash,
+                                    slot,
+                                    lane_id,
+                                    refs,
+                                );
+                            for tx_bytes in mcp_memos {
+                                let _ = udp_inject_tpu.send(&tx_bytes).await;
+                            }
+                        }
+                    }
+                }
+
                 if cfg.tx_fair_slashing {
                     if let Some(slot) = target_slot {
                         if let Some(recent_blockhash) =
@@ -5540,7 +5755,61 @@ async fn handle_pop_msg(
             }
 
             // Not in fair mode: best-effort inject without ordering commit.
-            for tx in txs.iter() {
+            let mut ordered_txs: Vec<&solanacdn_protocol::messages::FairTx> =
+                txs.iter().collect();
+
+            if let Some(mcp) = crate::mcp::global() {
+                // In scheduled MCP mode, memo proposals are produced by the scheduled lane
+                // leaders via the forwarding stage (which has access to leader schedule
+                // context). Avoid emitting memos here where we cannot validate leadership.
+                if mcp.status_snapshot().cfg.leader_mode
+                    == crate::mcp::McpLeaderMode::ScheduledLeaderSchedule
+                {
+                    // Do not emit MCP memo txs from the SolanaCDN agent task in scheduled mode.
+                } else if let Some(slot) = target_slot {
+                    if let Some(recent_blockhash) =
+                        recent_blockhash_from_wire_tx(txs[0].payload.as_slice())
+                    {
+                        let lane_id =
+                            mcp.select_lane_for_slot_v1(slot, auth.identity_keypair.pubkey());
+                        let payloads: Vec<&[u8]> =
+                            txs.iter().map(|tx| tx.payload.as_slice()).collect();
+                        let refs = mcp.bid_sorted_refs_from_payloads_v1(payloads.as_slice());
+                        let ordered_blob_ids: Vec<crate::mcp::TxBlobId> =
+                            refs.iter().map(|r| r.blob_id).collect();
+
+                        let mcp_memos =
+                            mcp.build_lane_microblock_and_checkpoint_memo_txs_from_refs_v1(
+                                auth.identity_keypair.as_ref(),
+                                &auth.signing_key,
+                                recent_blockhash,
+                                slot,
+                                lane_id,
+                                refs,
+                            );
+                        for tx_bytes in mcp_memos {
+                            let _ = udp_inject_tpu.send(&tx_bytes).await;
+                        }
+
+                        let mut by_blob: std::collections::HashMap<crate::mcp::TxBlobId, &solanacdn_protocol::messages::FairTx> =
+                            std::collections::HashMap::with_capacity(txs.len());
+                        for tx in txs.iter() {
+                            by_blob.insert(crate::mcp::tx_blob_id_v1(tx.payload.as_slice()), tx);
+                        }
+
+                        ordered_txs = Vec::with_capacity(txs.len());
+                        for blob_id in ordered_blob_ids {
+                            if let Some(tx) = by_blob.remove(&blob_id) {
+                                ordered_txs.push(tx);
+                            }
+                        }
+                        // Fallback: inject anything missing (should not happen under normal conditions).
+                        ordered_txs.extend(by_blob.into_values());
+                    }
+                }
+            }
+
+            for tx in ordered_txs {
                 if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                     handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
                     handle.tx_fair_batch_injected.fetch_add(1, Ordering::Relaxed);
@@ -5564,6 +5833,78 @@ async fn handle_pop_msg(
                 return;
             }
             handle.note_fair_commit_for_slashing(&commit);
+        }
+        PopToAgent::McpDaRequest(req) => {
+            if !cfg.mcp_da {
+                return;
+            }
+            let Ok(checkpoint) = crate::mcp::McpCheckpointV1::decode_v1(&req.checkpoint_bytes) else {
+                return;
+            };
+            if checkpoint.header.slot != req.slot
+                || checkpoint.header.lane_id != req.lane_id
+                || checkpoint.header.checkpoint_ix != req.checkpoint_ix
+            {
+                return;
+            }
+            if checkpoint.header.checkpoint_id_v1() != req.checkpoint_id {
+                return;
+            }
+            if checkpoint.verify_v1().is_err() {
+                return;
+            }
+
+            let now = now_ms();
+            if handle.should_dedup_mcp_da_checkpoint_id(req.checkpoint_id, now) {
+                return;
+            }
+
+            let mut attest = crate::mcp::DaAttestV1 {
+                header: crate::mcp::DaAttestHeaderV1 {
+                    epoch: req.epoch,
+                    slot: req.slot,
+                    lane_id: req.lane_id,
+                    checkpoint_ix: req.checkpoint_ix,
+                    checkpoint_id: req.checkpoint_id,
+                    validator_pubkey: auth.identity_keypair.pubkey(),
+                },
+                sig: [0u8; 64],
+            };
+            attest.sign_v1(&auth.signing_key);
+
+            let _ = ctrl_out_tx
+                .send(AgentToPop::McpDaAttest(McpDaAttest {
+                    epoch: req.epoch,
+                    slot: req.slot,
+                    lane_id: req.lane_id,
+                    checkpoint_ix: req.checkpoint_ix,
+                    checkpoint_id: req.checkpoint_id,
+                    validator_pubkey: auth.validator_pubkey,
+                    sig: SignatureBytes(attest.sig),
+                }))
+                .await;
+        }
+        PopToAgent::McpDaAttest(attest) => {
+            if !cfg.mcp_da {
+                return;
+            }
+
+            let att = crate::mcp::DaAttestV1 {
+                header: crate::mcp::DaAttestHeaderV1 {
+                    epoch: attest.epoch,
+                    slot: attest.slot,
+                    lane_id: attest.lane_id,
+                    checkpoint_ix: attest.checkpoint_ix,
+                    checkpoint_id: attest.checkpoint_id,
+                    validator_pubkey: Pubkey::new_from_array(attest.validator_pubkey.0),
+                },
+                sig: attest.sig.0,
+            };
+            if att.verify_v1().is_err() {
+                return;
+            }
+
+            handle.mcp_da_note_attest(&attest);
         }
         PopToAgent::AuthError(err) => {
             debug!(

@@ -12,22 +12,22 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. || exit 1; pwd)"
 source "$here"/net/common.sh
 
 prebuild=
-if [[ $1 = "--prebuild" ]]; then
+if [[ ${1-} = "--prebuild" ]]; then
   prebuild=true
 fi
 
 if [[ $(uname) != Linux ]]; then
   # Protect against unsupported configurations to prevent non-obvious errors
   # later. Arguably these should be fatal errors but for now prefer tolerance.
-  if [[ -n $SOLANA_CUDA ]]; then
+  if [[ -n ${SOLANA_CUDA-} ]]; then
     echo "Warning: CUDA is not supported on $(uname)"
     SOLANA_CUDA=
   fi
 fi
 
-if [[ -n $USE_INSTALL || ! -f "$SOLANA_ROOT"/Cargo.toml ]]; then
+if [[ -n ${USE_INSTALL-} || ! -f "$SOLANA_ROOT"/Cargo.toml ]]; then
   solana_program() {
-    declare program="$1"
+    declare program="${1-}"
     if [[ -z $program ]]; then
       printf "solana"
     else
@@ -40,9 +40,9 @@ if [[ -n $USE_INSTALL || ! -f "$SOLANA_ROOT"/Cargo.toml ]]; then
   }
 else
   solana_program() {
-    declare program="$1"
+    declare program="${1-}"
     declare crate="$program"
-    declare manifest_path
+    manifest_path=""
     if [[ $program == "bench-tps" || $program == "ledger-tool" ]]; then
       manifest_path="--manifest-path $here/dev-bins/Cargo.toml"
     fi
@@ -55,7 +55,8 @@ else
       program="solana-$program"
     fi
 
-    if [[ -n $CARGO_BUILD_PROFILE ]]; then
+    profile_arg=""
+    if [[ -n ${CARGO_BUILD_PROFILE-} ]]; then
       profile_arg="--profile $CARGO_BUILD_PROFILE"
     fi
 
@@ -64,11 +65,11 @@ else
       (
         set -x
         # shellcheck disable=SC2086 # Don't want to double quote
-        cargo $CARGO_TOOLCHAIN build $manifest_path $profile_arg --bin $program
+        cargo ${CARGO_TOOLCHAIN-} build $manifest_path $profile_arg --bin $program
       )
     fi
 
-    printf "cargo $CARGO_TOOLCHAIN run $manifest_path $profile_arg --bin %s %s -- " "$program"
+    printf "cargo %s run %s %s --bin %s %s -- " "${CARGO_TOOLCHAIN-}" "$manifest_path" "$profile_arg" "$program" ""
   }
 fi
 

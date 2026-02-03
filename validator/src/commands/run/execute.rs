@@ -34,8 +34,8 @@ use {
         banking_trace::DISABLED_BAKING_TRACE_DIR,
         consensus::tower_storage,
         repair::repair_handler::RepairHandlerType,
-        solanacdn::SolanaCdnConfig,
         snapshot_packager_service::SnapshotPackagerService,
+        solanacdn::SolanaCdnConfig,
         system_monitor_service::SystemMonitorService,
         tpu::MAX_VOTES_PER_SECOND,
         validator::{
@@ -88,6 +88,25 @@ use {
 pub enum Operation {
     Initialize,
     Run,
+}
+
+fn is_fair_slashing_enforce_enabled(matches: &ArgMatches) -> bool {
+    matches.is_present("fair_slashing_enforce")
+}
+
+fn is_fair_slashing_enabled(matches: &ArgMatches) -> bool {
+    matches.is_present("fair_slashing") || is_fair_slashing_enforce_enabled(matches)
+}
+
+fn is_fair_ordering_enabled(matches: &ArgMatches) -> bool {
+    matches.is_present("fair") || is_fair_slashing_enabled(matches) || matches.is_present("mcp")
+}
+
+fn is_mcp_da_over_solanacdn_enabled(matches: &ArgMatches) -> bool {
+    if matches.is_present("mcp_no_da_solanacdn") {
+        return false;
+    }
+    matches.is_present("mcp_da_solanacdn") || matches.is_present("mcp")
 }
 
 pub fn execute(
@@ -540,117 +559,145 @@ pub fn execute(
             .ok()
             .is_some_and(|s| !s.trim().is_empty());
 
+    // Link MCP to fair ordering by default: when MCP is enabled, also enable the fair ordering
+    // code paths (and advertise fair-ordering capability to SolanaCDN POPs when configured).
+    let mcp_enabled = matches.is_present("mcp");
+    let fair_slashing_enforce = is_fair_slashing_enforce_enabled(matches);
+    let fair_slashing = is_fair_slashing_enabled(matches);
+    let fair_ordering_enabled = is_fair_ordering_enabled(matches);
+
     let solanacdn = (!solanacdn_pops.is_empty()
         || solanacdn_control.is_some()
         || has_solanacdn_api_token)
         .then(|| {
-        let mut cfg = SolanaCdnConfig::default();
+            let mut cfg = SolanaCdnConfig::default();
 
-        cfg.pop_endpoints = solanacdn_pops;
-        cfg.control_endpoint = solanacdn_control;
+            cfg.pop_endpoints = solanacdn_pops;
+            cfg.control_endpoint = solanacdn_control;
 
-        if let Some(server_name) = matches.value_of("solanacdn_server_name") {
-            cfg.server_name = server_name.to_string();
-        }
-        cfg.tls_ca_cert_path = matches
-            .value_of("solanacdn_tls_ca_cert_path")
-            .map(PathBuf::from);
-        cfg.tls_insecure_skip_verify = matches.is_present("solanacdn_tls_insecure_skip_verify");
+            if let Some(server_name) = matches.value_of("solanacdn_server_name") {
+                cfg.server_name = server_name.to_string();
+            }
+            cfg.tls_ca_cert_path = matches
+                .value_of("solanacdn_tls_ca_cert_path")
+                .map(PathBuf::from);
+            cfg.tls_insecure_skip_verify = matches.is_present("solanacdn_tls_insecure_skip_verify");
 
-        let default_ca = PathBuf::from("/etc/solanacdn/tls/ca.crt");
-        if cfg.tls_ca_cert_path.is_none() && default_ca.exists() {
-            cfg.tls_ca_cert_path = Some(default_ca.clone());
-        }
+            let default_ca = PathBuf::from("/etc/solanacdn/tls/ca.crt");
+            if cfg.tls_ca_cert_path.is_none() && default_ca.exists() {
+                cfg.tls_ca_cert_path = Some(default_ca.clone());
+            }
 
-        if let Some(control_server_name) = matches.value_of("solanacdn_control_server_name") {
-            cfg.control_server_name = control_server_name.to_string();
-        }
-        cfg.control_tls_ca_cert_path = matches
-            .value_of("solanacdn_control_tls_ca_cert_path")
-            .map(PathBuf::from);
-        cfg.control_tls_insecure_skip_verify =
-            matches.is_present("solanacdn_control_tls_insecure_skip_verify");
-        if cfg.control_endpoint.is_some()
-            && cfg.control_tls_ca_cert_path.is_none()
-            && default_ca.exists()
-        {
-            cfg.control_tls_ca_cert_path = Some(default_ca.clone());
-        }
-        cfg.control_refresh_ms =
-            value_t!(matches, "solanacdn_control_refresh_ms", u64).unwrap_or(1_000);
+            if let Some(control_server_name) = matches.value_of("solanacdn_control_server_name") {
+                cfg.control_server_name = control_server_name.to_string();
+            }
+            cfg.control_tls_ca_cert_path = matches
+                .value_of("solanacdn_control_tls_ca_cert_path")
+                .map(PathBuf::from);
+            cfg.control_tls_insecure_skip_verify =
+                matches.is_present("solanacdn_control_tls_insecure_skip_verify");
+            if cfg.control_endpoint.is_some()
+                && cfg.control_tls_ca_cert_path.is_none()
+                && default_ca.exists()
+            {
+                cfg.control_tls_ca_cert_path = Some(default_ca.clone());
+            }
+            cfg.control_refresh_ms =
+                value_t!(matches, "solanacdn_control_refresh_ms", u64).unwrap_or(1_000);
 
-        cfg.pipe_api_base_url = matches
-            .value_of("solanacdn_api_base")
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("SOLANACDN_AGENT_API_BASE").ok())
-            .or_else(|| std::env::var("PIPE_API_BASE").ok())
-            .unwrap_or_else(|| "https://api.pipedev.network".to_string())
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
-        cfg.pipe_api_token = matches
-            .value_of("solanacdn_api_token")
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("SOLANACDN_AGENT_API_TOKEN").ok())
-            .or_else(|| std::env::var("PIPE_API_KEY").ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        cfg.pipe_api_timeout_ms = value_t!(matches, "solanacdn_api_timeout_ms", u64)
-            .unwrap_or(2_000)
-            .max(250);
-        cfg.pipe_api_tls_ca_cert_path = matches
-            .value_of("solanacdn_api_tls_ca_cert_path")
-            .map(PathBuf::from);
-        cfg.pipe_api_tls_insecure_skip_verify =
-            matches.is_present("solanacdn_api_tls_insecure_skip_verify");
-
-        cfg.udp_mode = match matches.value_of("solanacdn_udp").unwrap_or("auto") {
-            "off" => solana_core::solanacdn::DataPlaneMode::Off,
-            "always" => solana_core::solanacdn::DataPlaneMode::Always,
-            _ => solana_core::solanacdn::DataPlaneMode::Auto,
-        };
-
-        cfg.publish_shreds = !matches.is_present("solanacdn_no_shreds");
-        cfg.publish_discarded_shreds = !matches.is_present("solanacdn_only_accepted_shreds");
-        cfg.subscribe_shreds = !matches.is_present("solanacdn_no_subscribe");
-        cfg.inject_shreds = !matches.is_present("solanacdn_no_inject");
-        cfg.tvu_shred_ingest_mode = if matches.is_present("solanacdn_only") {
-            solana_core::solanacdn::TvuShredIngestMode::SolanaCdnOnly
-        } else if matches.is_present("solanacdn_hybrid") {
-            solana_core::solanacdn::TvuShredIngestMode::SolanaCdnPreferred
-        } else {
-            solana_core::solanacdn::TvuShredIngestMode::All
-        };
-        if matches.is_present("solanacdn_hybrid") {
-            cfg.tvu_shred_hybrid_stale_ms = value_t!(matches, "solanacdn_hybrid_stale_ms", u64)
-                .unwrap_or(cfg.tvu_shred_hybrid_stale_ms)
+            cfg.pipe_api_base_url = matches
+                .value_of("solanacdn_api_base")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("SOLANACDN_AGENT_API_BASE").ok())
+                .or_else(|| std::env::var("PIPE_API_BASE").ok())
+                .unwrap_or_else(|| "https://api.pipedev.network".to_string())
+                .trim()
+                .trim_end_matches('/')
+                .to_string();
+            cfg.pipe_api_token = matches
+                .value_of("solanacdn_api_token")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("SOLANACDN_AGENT_API_TOKEN").ok())
+                .or_else(|| std::env::var("PIPE_API_KEY").ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            cfg.pipe_api_timeout_ms = value_t!(matches, "solanacdn_api_timeout_ms", u64)
+                .unwrap_or(2_000)
                 .max(250);
-        }
-        cfg.direct_shreds_from_pop = !matches.is_present("solanacdn_no_direct_shreds");
-        cfg.vote_tunnel = !matches.is_present("solanacdn_no_vote_tunnel");
-        let fair_slashing_enforce = matches.is_present("fair_slashing_enforce");
-        let fair_slashing = matches.is_present("fair_slashing") || fair_slashing_enforce;
-        cfg.tx_fair_slashing = fair_slashing;
-        cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
-        cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
-        cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
+            cfg.pipe_api_tls_ca_cert_path = matches
+                .value_of("solanacdn_api_tls_ca_cert_path")
+                .map(PathBuf::from);
+            cfg.pipe_api_tls_insecure_skip_verify =
+                matches.is_present("solanacdn_api_tls_insecure_skip_verify");
 
-        cfg.race_enabled = matches
-            .value_of("solanacdn_race")
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                !(v == "false" || v == "0")
-            })
-            .unwrap_or(true);
-        if cfg.race_enabled {
-            cfg.race_sample_bits = value_t!(matches, "solanacdn_race_sample_bits", u8)
-                .unwrap_or(cfg.race_sample_bits)
-                .min(31);
-            cfg.race_window_ms = value_t!(matches, "solanacdn_race_window_ms", u64)
-                .unwrap_or(cfg.race_window_ms)
-                .max(250);
-        }
+            cfg.udp_mode = match matches.value_of("solanacdn_udp").unwrap_or("auto") {
+                "off" => solana_core::solanacdn::DataPlaneMode::Off,
+                "always" => solana_core::solanacdn::DataPlaneMode::Always,
+                _ => solana_core::solanacdn::DataPlaneMode::Auto,
+            };
 
+            cfg.publish_shreds = !matches.is_present("solanacdn_no_shreds");
+            cfg.publish_discarded_shreds = !matches.is_present("solanacdn_only_accepted_shreds");
+            cfg.subscribe_shreds = !matches.is_present("solanacdn_no_subscribe");
+            cfg.inject_shreds = !matches.is_present("solanacdn_no_inject");
+            cfg.tvu_shred_ingest_mode = if matches.is_present("solanacdn_only") {
+                solana_core::solanacdn::TvuShredIngestMode::SolanaCdnOnly
+            } else if matches.is_present("solanacdn_hybrid") {
+                solana_core::solanacdn::TvuShredIngestMode::SolanaCdnPreferred
+            } else {
+                solana_core::solanacdn::TvuShredIngestMode::All
+            };
+            if matches.is_present("solanacdn_hybrid") {
+                cfg.tvu_shred_hybrid_stale_ms = value_t!(matches, "solanacdn_hybrid_stale_ms", u64)
+                    .unwrap_or(cfg.tvu_shred_hybrid_stale_ms)
+                    .max(250);
+            }
+            cfg.direct_shreds_from_pop = !matches.is_present("solanacdn_no_direct_shreds");
+            cfg.vote_tunnel = !matches.is_present("solanacdn_no_vote_tunnel");
+            cfg.tx_fair_slashing = fair_slashing;
+            cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
+            cfg.tx_fair_ordering = fair_ordering_enabled;
+            cfg.mcp_da = is_mcp_da_over_solanacdn_enabled(matches);
+            cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
+
+            cfg.race_enabled = matches
+                .value_of("solanacdn_race")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    !(v == "false" || v == "0")
+                })
+                .unwrap_or(true);
+            if cfg.race_enabled {
+                cfg.race_sample_bits = value_t!(matches, "solanacdn_race_sample_bits", u8)
+                    .unwrap_or(cfg.race_sample_bits)
+                    .min(31);
+                cfg.race_window_ms = value_t!(matches, "solanacdn_race_window_ms", u64)
+                    .unwrap_or(cfg.race_window_ms)
+                    .max(250);
+            }
+
+            cfg
+        });
+
+    let mcp = mcp_enabled.then(|| {
+        let mut cfg = solana_core::mcp::McpConfig::default();
+        cfg.enforce_vote_withholding = matches.is_present("mcp_enforce");
+        if matches.is_present("mcp_scheduled") {
+            cfg.leader_mode = solana_core::mcp::McpLeaderMode::ScheduledLeaderSchedule;
+        }
+        if matches.is_present("mcp_any_leader") {
+            cfg.leader_mode = solana_core::mcp::McpLeaderMode::AnyLeader;
+        }
+        if let Ok(v) = value_t!(matches, "mcp_lanes", u8) {
+            cfg.lanes_per_slot = v;
+        }
+        if let Ok(v) = value_t!(matches, "mcp_da_threshold_bps", u16) {
+            cfg.da_threshold_bps = v;
+        }
+        if let Ok(v) = value_t!(matches, "mcp_microblock_max_refs", u16) {
+            cfg.microblock_max_refs = v;
+        }
+        cfg.validate().expect("mcp config validated");
         cfg
     });
 
@@ -688,6 +735,7 @@ pub fn execute(
         repair_whitelist,
         repair_handler_type: RepairHandlerType::default(),
         solanacdn,
+        mcp,
         gossip_validators,
         max_ledger_shreds,
         blockstore_options: run_args.blockstore_options,
@@ -761,9 +809,7 @@ pub fn execute(
                 "block_production_pacing_fill_time_millis",
                 SchedulerPacing
             ),
-            fair_ordering: matches.is_present("fair")
-                || matches.is_present("fair_slashing")
-                || matches.is_present("fair_slashing_enforce"),
+            fair_ordering: fair_ordering_enabled,
             ..SchedulerConfig::default()
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
@@ -1411,4 +1457,59 @@ fn new_snapshot_config(
     }
 
     Ok(snapshot_config)
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{is_fair_ordering_enabled, is_mcp_da_over_solanacdn_enabled},
+        clap::{App, Arg},
+    };
+
+    fn test_matches<'a>(args: &'a [&'a str]) -> clap::ArgMatches<'a> {
+        App::new("test")
+            .arg(Arg::with_name("mcp").long("mcp"))
+            .arg(Arg::with_name("mcp_da_solanacdn").long("mcp-da-solanacdn"))
+            .arg(
+                Arg::with_name("mcp_no_da_solanacdn")
+                    .long("mcp-no-da-solanacdn"),
+            )
+            .arg(Arg::with_name("fair").long("fair"))
+            .arg(Arg::with_name("fair_slashing").long("fair-slashing"))
+            .arg(
+                Arg::with_name("fair_slashing_enforce")
+                    .long("fair-slashing-enforce"),
+            )
+            .get_matches_from(args)
+    }
+
+    #[test]
+    fn mcp_implies_fair_ordering() {
+        let matches = test_matches(&["test", "--mcp"]);
+        assert!(is_fair_ordering_enabled(&matches));
+    }
+
+    #[test]
+    fn no_flags_disables_fair_ordering() {
+        let matches = test_matches(&["test"]);
+        assert!(!is_fair_ordering_enabled(&matches));
+    }
+
+    #[test]
+    fn mcp_implies_mcp_da_over_solanacdn() {
+        let matches = test_matches(&["test", "--mcp"]);
+        assert!(is_mcp_da_over_solanacdn_enabled(&matches));
+    }
+
+    #[test]
+    fn mcp_can_disable_mcp_da_over_solanacdn() {
+        let matches = test_matches(&["test", "--mcp", "--mcp-no-da-solanacdn"]);
+        assert!(!is_mcp_da_over_solanacdn_enabled(&matches));
+    }
+
+    #[test]
+    fn explicit_mcp_da_flag_enables_mcp_da_over_solanacdn() {
+        let matches = test_matches(&["test", "--mcp", "--mcp-da-solanacdn"]);
+        assert!(is_mcp_da_over_solanacdn_enabled(&matches));
+    }
 }

@@ -650,6 +650,10 @@ impl PohRecorder {
             .map(|leader| (leader, target_slot))
     }
 
+    pub fn leader_schedule_cache(&self) -> Arc<LeaderScheduleCache> {
+        self.leader_schedule_cache.clone()
+    }
+
     pub fn shared_leader_state(&self) -> SharedLeaderState {
         self.shared_leader_state.clone()
     }

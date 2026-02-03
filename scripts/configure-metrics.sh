@@ -12,7 +12,7 @@
 #
 
 configureMetrics() {
-  [[ -n $SOLANA_METRICS_CONFIG ]] || return 0
+  [[ -n ${SOLANA_METRICS_CONFIG-} ]] || return 0
 
   declare metricsParams
   IFS=',' read -r -a metricsParams <<< "$SOLANA_METRICS_CONFIG"

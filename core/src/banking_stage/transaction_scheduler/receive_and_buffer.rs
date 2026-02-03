@@ -25,6 +25,7 @@ use {
     solana_clock::{Epoch, Slot, MAX_PROCESSING_AGE},
     solana_cost_model::cost_model::CostModel,
     solana_fee_structure::FeeBudgetLimits,
+    solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_message::v0::LoadedAddresses,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_runtime_transaction::{
@@ -36,6 +37,7 @@ use {
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransactionError,
     std::{
+        collections::{HashMap, VecDeque},
         sync::{Arc, RwLock},
         time::Instant,
     },
@@ -105,6 +107,7 @@ pub(crate) trait ReceiveAndBuffer {
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub bank_forks: Arc<RwLock<BankForks>>,
+    pub leader_schedule_cache: Arc<LeaderScheduleCache>,
     fair_ordering: bool,
 }
 
@@ -230,15 +233,157 @@ pub(crate) enum PacketHandlingError {
     ALTResolution,
 }
 
+struct McpMemoIngressFilterV1 {
+    leader_schedule_cache: Arc<LeaderScheduleCache>,
+    mcp: Arc<crate::mcp::McpHandle>,
+    cfg: crate::mcp::McpConfig,
+    scheduled_lane_leaders: HashMap<u64, HashMap<crate::mcp::LaneId, [u8; 32]>>,
+    scheduled_lane_leaders_order: VecDeque<u64>,
+    slot_leaders: HashMap<u64, Option<[u8; 32]>>,
+    slot_leaders_order: VecDeque<u64>,
+    ordering_updated_current_slot: bool,
+}
+
+impl McpMemoIngressFilterV1 {
+    const MAX_CACHED_SLOTS: usize = 32;
+
+    fn maybe_new(leader_schedule_cache: Arc<LeaderScheduleCache>) -> Option<Self> {
+        let mcp = crate::mcp::global()?;
+        let cfg = mcp.status_snapshot().cfg;
+        Some(Self {
+            leader_schedule_cache,
+            mcp,
+            cfg,
+            scheduled_lane_leaders: HashMap::new(),
+            scheduled_lane_leaders_order: VecDeque::new(),
+            slot_leaders: HashMap::new(),
+            slot_leaders_order: VecDeque::new(),
+            ordering_updated_current_slot: false,
+        })
+    }
+
+    fn slot_leader_for_slot(&mut self, slot: u64, bank: &Bank) -> Option<[u8; 32]> {
+        if let Some(entry) = self.slot_leaders.get(&slot) {
+            return *entry;
+        }
+
+        let leader = self
+            .leader_schedule_cache
+            .slot_leader_at(slot, Some(bank))
+            .map(|pk| pk.to_bytes());
+
+        if self.slot_leaders.len() >= Self::MAX_CACHED_SLOTS {
+            if let Some(evict) = self.slot_leaders_order.pop_front() {
+                self.slot_leaders.remove(&evict);
+            }
+        }
+        self.slot_leaders_order.push_back(slot);
+        self.slot_leaders.insert(slot, leader);
+        leader
+    }
+
+    fn lane_leaders_for_slot(
+        &mut self,
+        slot: u64,
+        bank: &Bank,
+    ) -> Option<&HashMap<crate::mcp::LaneId, [u8; 32]>> {
+        if self.cfg.leader_mode != crate::mcp::McpLeaderMode::ScheduledLeaderSchedule {
+            return None;
+        }
+
+        if !self.scheduled_lane_leaders.contains_key(&slot) {
+            let leaders = self.mcp.scheduled_lane_leaders_from_leader_schedule_v1(
+                slot,
+                bank,
+                self.leader_schedule_cache.as_ref(),
+            );
+            if self.scheduled_lane_leaders.len() >= Self::MAX_CACHED_SLOTS {
+                if let Some(evict) = self.scheduled_lane_leaders_order.pop_front() {
+                    self.scheduled_lane_leaders.remove(&evict);
+                }
+            }
+            self.scheduled_lane_leaders_order.push_back(slot);
+            self.scheduled_lane_leaders.insert(slot, leaders);
+        }
+        self.scheduled_lane_leaders.get(&slot)
+    }
+
+    fn allow_tx<T: SVMMessage>(&mut self, tx: &T, bank: &Bank) -> bool {
+        let lanes_per_slot = self.cfg.lanes_per_slot.max(1);
+
+        for (program_id, ix) in tx.program_instructions_iter() {
+            let Some(parse) = crate::mcp::parse_mcp_memo_chunk_payload_v1(program_id, ix.data)
+            else {
+                continue;
+            };
+
+            match parse {
+                crate::mcp::McpMemoChunkParseV1::InvalidSignature => return false,
+                crate::mcp::McpMemoChunkParseV1::Valid(p) => {
+                    if p.lane_id >= lanes_per_slot {
+                        return false;
+                    }
+
+                    match self.cfg.leader_mode {
+                        crate::mcp::McpLeaderMode::SlotLeaderOnly => {
+                            let Some(expected_leader) =
+                                self.slot_leader_for_slot(p.slot, bank)
+                            else {
+                                // If we cannot compute the slot leader, do not hard-fail here.
+                                continue;
+                            };
+                            if p.leader_pubkey != expected_leader {
+                                return false;
+                            }
+                        }
+                        crate::mcp::McpLeaderMode::AnyLeader => {}
+                        crate::mcp::McpLeaderMode::ScheduledLeaderSchedule => {
+                            let Some(leaders) = self.lane_leaders_for_slot(p.slot, bank) else {
+                                continue;
+                            };
+                            let Some(&expected_leader) = leaders.get(&p.lane_id) else {
+                                // If we cannot fill this lane from the schedule, do not
+                                // hard-fail at ingress.
+                                continue;
+                            };
+                            if p.leader_pubkey != expected_leader {
+                                return false;
+                            }
+                        }
+                    }
+
+                    // The memo is valid and (when applicable) lane-leader checks have passed.
+                    let memo_slot = p.slot;
+                    if self.mcp.ingest_memo_chunk_for_ordering_v1(p)
+                        && memo_slot == bank.slot()
+                    {
+                        self.ordering_updated_current_slot = true;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn take_ordering_updated_current_slot(&mut self) -> bool {
+        let updated = self.ordering_updated_current_slot;
+        self.ordering_updated_current_slot = false;
+        updated
+    }
+}
+
 impl TransactionViewReceiveAndBuffer {
     pub(crate) fn new(
         receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
+        leader_schedule_cache: Arc<LeaderScheduleCache>,
         fair_ordering: bool,
     ) -> Self {
         Self {
             receiver,
             bank_forks,
+            leader_schedule_cache,
             fair_ordering,
         }
     }
@@ -260,6 +405,9 @@ impl TransactionViewReceiveAndBuffer {
             .feature_set
             .is_active(&agave_feature_set::static_instruction_limit::ID);
         let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
+        let mut mcp_ingress_filter =
+            McpMemoIngressFilterV1::maybe_new(self.leader_schedule_cache.clone());
+        let mcp = crate::mcp::global();
 
         // Create temporary batches of transactions to be age-checked.
         let mut transaction_priority_ids = ArrayVec::<_, EXTRA_CAPACITY>::new();
@@ -340,6 +488,33 @@ impl TransactionViewReceiveAndBuffer {
         let mut num_dropped_on_parsing_and_sanitization = 0;
         let mut num_dropped_on_lock_validation = 0;
         let mut num_dropped_on_compute_budget = 0;
+        let slot = working_bank.slot();
+        let fair_ordering = self.fair_ordering;
+        let apply_mcp_ordering_updates =
+            |container: &mut TransactionViewStateContainer,
+             transaction_priority_ids: &mut ArrayVec<TransactionPriorityId, EXTRA_CAPACITY>| {
+            let Some(mcp) = mcp.as_ref() else {
+                return;
+            };
+            container.reapply_priority_overrides(|tx| {
+                let fair_override = if fair_ordering {
+                    try_first_signature_bytes(tx.data())
+                        .and_then(|sig| crate::solanacdn::fair_priority_for_tx_signature(&sig))
+                } else {
+                    None
+                };
+                if fair_override.is_some() {
+                    return fair_override;
+                }
+                let blob_id = crate::mcp::tx_blob_id_v1(tx.data());
+                mcp.ordering_priority_for_slot_blob_id_v1(slot, blob_id)
+            });
+            for priority_id in transaction_priority_ids.iter_mut() {
+                if let Some(state) = container.get_mut_transaction_state(priority_id.id) {
+                    priority_id.priority = state.priority();
+                }
+            }
+        };
 
         for packet_batch in packet_batch_message.iter() {
             for packet in packet_batch.iter() {
@@ -354,41 +529,55 @@ impl TransactionViewReceiveAndBuffer {
                 }
 
                 // Reserve free-space to copy packet into, run sanitization checks, and insert.
-                let priority_override = if self.fair_ordering {
+                let mut priority_override = if fair_ordering {
                     try_first_signature_bytes(packet_data)
                         .and_then(|sig| crate::solanacdn::fair_priority_for_tx_signature(&sig))
                 } else {
                     None
                 };
-                if let Some(transaction_id) =
-                    container.try_insert_map_only_with_data(packet_data, |bytes| {
-                        match Self::try_handle_packet(
-                            bytes,
-                            root_bank,
-                            working_bank,
-                            enable_static_instruction_limit,
-                            transaction_account_lock_limit,
-                            priority_override,
-                        ) {
-                            Ok(state) => Ok(state),
-                            Err(
-                                PacketHandlingError::Sanitization
-                                | PacketHandlingError::ALTResolution,
-                            ) => {
-                                num_dropped_on_parsing_and_sanitization += 1;
-                                Err(())
-                            }
-                            Err(PacketHandlingError::LockValidation) => {
-                                num_dropped_on_lock_validation += 1;
-                                Err(())
-                            }
-                            Err(PacketHandlingError::ComputeBudget) => {
-                                num_dropped_on_compute_budget += 1;
-                                Err(())
-                            }
+                if priority_override.is_none() {
+                    if let Some(mcp) = mcp.as_ref() {
+                        let blob_id = crate::mcp::tx_blob_id_v1(packet_data);
+                        priority_override = mcp.ordering_priority_for_slot_blob_id_v1(slot, blob_id);
+                    }
+                }
+                let transaction_id = container.try_insert_map_only_with_data(packet_data, |bytes| {
+                    match Self::try_handle_packet(
+                        bytes,
+                        root_bank,
+                        working_bank,
+                        enable_static_instruction_limit,
+                        transaction_account_lock_limit,
+                        priority_override,
+                        mcp_ingress_filter.as_mut(),
+                    ) {
+                        Ok(state) => Ok(state),
+                        Err(
+                            PacketHandlingError::Sanitization | PacketHandlingError::ALTResolution,
+                        ) => {
+                            num_dropped_on_parsing_and_sanitization += 1;
+                            Err(())
                         }
-                    })
+                        Err(PacketHandlingError::LockValidation) => {
+                            num_dropped_on_lock_validation += 1;
+                            Err(())
+                        }
+                        Err(PacketHandlingError::ComputeBudget) => {
+                            num_dropped_on_compute_budget += 1;
+                            Err(())
+                        }
+                    }
+                });
+
+                if mcp_ingress_filter
+                    .as_mut()
+                    .map(|filter| filter.take_ordering_updated_current_slot())
+                    .unwrap_or(false)
                 {
+                    apply_mcp_ordering_updates(container, &mut transaction_priority_ids);
+                }
+
+                if let Some(transaction_id) = transaction_id {
                     let priority = container
                         .get_mut_transaction_state(transaction_id)
                         .expect("transaction must exist")
@@ -430,6 +619,7 @@ impl TransactionViewReceiveAndBuffer {
         enable_static_instruction_limit: bool,
         transaction_account_lock_limit: usize,
         priority_override: Option<u64>,
+        mut mcp_ingress_filter: Option<&mut McpMemoIngressFilterV1>,
     ) -> Result<TransactionViewState, PacketHandlingError> {
         let (view, deactivation_slot) = translate_to_runtime_view(
             bytes,
@@ -438,6 +628,11 @@ impl TransactionViewReceiveAndBuffer {
             enable_static_instruction_limit,
             transaction_account_lock_limit,
         )?;
+        if let Some(filter) = mcp_ingress_filter.as_mut() {
+            if !filter.allow_tx(&view, working_bank) {
+                return Err(PacketHandlingError::Sanitization);
+            }
+        }
         if validate_account_locks(
             view.account_keys(),
             root_bank.get_transaction_account_lock_limit(),
@@ -456,12 +651,12 @@ impl TransactionViewReceiveAndBuffer {
 
         let max_age = calculate_max_age(root_bank.epoch(), deactivation_slot, root_bank.slot());
         let fee_budget_limits = FeeBudgetLimits::from(compute_budget_limits);
-        let (mut priority, cost) = calculate_priority_and_cost(&view, &fee_budget_limits, working_bank);
-        if let Some(override_priority) = priority_override {
-            priority = override_priority;
-        }
+        let (base_priority, cost) =
+            calculate_priority_and_cost(&view, &fee_budget_limits, working_bank);
+        let mut state = TransactionState::new(view, max_age, base_priority, cost);
+        state.set_priority_override(priority_override);
 
-        Ok(TransactionState::new(view, max_age, priority, cost))
+        Ok(state)
     }
 }
 
@@ -666,9 +861,13 @@ mod tests {
         TransactionViewReceiveAndBuffer,
         TransactionViewStateContainer,
     ) {
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
+            &bank_forks.read().unwrap().working_bank(),
+        ));
         let receive_and_buffer = TransactionViewReceiveAndBuffer::new(
             receiver,
             bank_forks,
+            leader_schedule_cache,
             false,
         );
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);

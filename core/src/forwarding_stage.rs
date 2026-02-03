@@ -7,7 +7,9 @@ use {
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     async_trait::async_trait,
     crossbeam_channel::{Receiver, RecvTimeoutError},
+    ed25519_dalek_v2::SigningKey,
     packet_container::PacketContainer,
+    solana_clock::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET,
     solana_client::connection_cache::ConnectionCache,
     solana_connection_cache::client_connection::ClientConnection,
     solana_cost_model::cost_model::CostModel,
@@ -26,6 +28,7 @@ use {
     solana_runtime_transaction::{
         runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
     },
+    solana_signer::Signer,
     solana_streamer::sendmmsg::{batch_send, SendPktsError},
     solana_tpu_client_next::{
         connection_workers_scheduler::{
@@ -36,8 +39,10 @@ use {
         ConnectionWorkersScheduler,
     },
     solana_transaction::sanitized::MessageHash,
+    solana_transaction::Transaction,
     solana_transaction_error::TransportError,
     std::{
+        collections::{HashMap, HashSet, VecDeque},
         net::{SocketAddr, UdpSocket},
         sync::{Arc, RwLock},
         thread::{Builder, JoinHandle},
@@ -51,6 +56,64 @@ use {
 };
 
 mod packet_container;
+
+fn try_first_signature_bytes(payload: &[u8]) -> Option<[u8; 64]> {
+    let (sig_count, consumed) = parse_shortvec_len(payload)?;
+    if sig_count == 0 {
+        return None;
+    }
+    let start = consumed;
+    let end = start.saturating_add(64);
+    if payload.len() < end {
+        return None;
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&payload[start..end]);
+    Some(sig)
+}
+
+fn parse_shortvec_len(input: &[u8]) -> Option<(usize, usize)> {
+    // Solana shortvec: 7-bit groups, MSB is continuation.
+    let mut value: usize = 0;
+    let mut shift: u32 = 0;
+    for (idx, byte) in input.iter().copied().take(3).enumerate() {
+        value |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, idx + 1));
+        }
+        shift = shift.saturating_add(7);
+    }
+    None
+}
+
+fn bid_hint_for_forwarded_tx(tx: &[u8]) -> crate::mcp::BidHintV1 {
+    let mut bid_hint = crate::mcp::bid_hint_from_wire_tx_v1(tx).unwrap_or(crate::mcp::BidHintV1 {
+        cu_price: 0,
+        cu_limit: 0,
+        sig_count: 0,
+    });
+    if let Some(sig) = try_first_signature_bytes(tx) {
+        if let Some(priority) = crate::solanacdn::fair_priority_for_tx_signature(&sig) {
+            bid_hint.cu_price = priority;
+        }
+    }
+    bid_hint
+}
+
+fn mcp_memo_kind_from_wire_tx(tx_bytes: &[u8]) -> Option<crate::mcp::McpLedgerMemoKindV1> {
+    let tx: Transaction = bincode::deserialize(tx_bytes).ok()?;
+    for ix in tx.message.instructions.iter() {
+        let program_id = tx
+            .message
+            .account_keys
+            .get(ix.program_id_index as usize)?;
+        let parse = crate::mcp::parse_mcp_memo_chunk_payload_v1(program_id, ix.data.as_slice())?;
+        if let crate::mcp::McpMemoChunkParseV1::Valid(p) = parse {
+            return Some(p.kind);
+        }
+    }
+    None
+}
 
 /// [`ForwardingClientOption`] enum represents the available client types for
 /// TPU communication:
@@ -86,6 +149,248 @@ const FORWARD_BATCH_SIZE: usize = 128;
 /// all lookahead slots is negligible.
 const NUM_LOOKAHEAD_LEADERS: u64 = 3;
 
+fn mcp_forwarding_fanout_v1() -> usize {
+    const MAX_FANOUT: usize = 8;
+    crate::mcp::status_snapshot()
+        .map(|s| usize::from(s.cfg.lanes_per_slot).max(1).min(MAX_FANOUT))
+        .unwrap_or(1)
+}
+
+fn mcp_signing_key_from_solana_keypair_v1(identity: &Keypair) -> Option<SigningKey> {
+    let bytes = identity.secret_bytes();
+    let sk = SigningKey::from_bytes(&bytes);
+    if sk.verifying_key().to_bytes() != identity.pubkey().to_bytes() {
+        return None;
+    }
+    Some(sk)
+}
+
+struct McpForwardingProposerV1 {
+    identity_keypair: Arc<Keypair>,
+    signing_key: SigningKey,
+    mcp: Arc<crate::mcp::McpHandle>,
+    cfg: crate::mcp::McpConfig,
+    pending_slot: Option<u64>,
+    pending_lane_id: Option<crate::mcp::LaneId>,
+    pending_refs: Vec<crate::mcp::McpTxRefV1>,
+    seen_blob_ids: HashSet<crate::mcp::TxBlobId>,
+    last_emit: Instant,
+    pending_da: VecDeque<McpPendingDaCertV1>,
+}
+
+struct McpPendingDaCertV1 {
+    epoch: u64,
+    checkpoint: crate::mcp::McpCheckpointV1,
+    sigs: HashMap<[u8; 32], [u8; 64]>,
+    requested_at: Instant,
+}
+
+impl McpForwardingProposerV1 {
+    fn maybe_new(identity_keypair: &Keypair) -> Option<Self> {
+        let mcp = crate::mcp::global()?;
+        let cfg = mcp.status_snapshot().cfg;
+        if cfg.leader_mode != crate::mcp::McpLeaderMode::ScheduledLeaderSchedule {
+            return None;
+        }
+        let signing_key = mcp_signing_key_from_solana_keypair_v1(identity_keypair)?;
+        Some(Self {
+            identity_keypair: Arc::new(identity_keypair.insecure_clone()),
+            signing_key,
+            mcp,
+            cfg,
+            pending_slot: None,
+            pending_lane_id: None,
+            pending_refs: Vec::new(),
+            seen_blob_ids: HashSet::new(),
+            last_emit: Instant::now(),
+            pending_da: VecDeque::new(),
+        })
+    }
+
+    fn reset_for_slot_lane(&mut self, slot: u64, lane_id: crate::mcp::LaneId) {
+        self.pending_slot = Some(slot);
+        self.pending_lane_id = Some(lane_id);
+        self.pending_refs.clear();
+        self.seen_blob_ids.clear();
+        self.last_emit = Instant::now();
+    }
+
+    fn maybe_build_da_cert_memos(&mut self, bank: &Bank) -> Vec<Vec<u8>> {
+        let recent_blockhash = bank.last_blockhash();
+        let mut out: Vec<Vec<u8>> = Vec::new();
+
+        // Drain any newly-arrived DA attests from SolanaCDN and emit DA cert memos when the
+        // configured stake threshold is met.
+        const MCP_DA_MAX_PENDING_CHECKPOINTS: usize = 64;
+        let pending_len = self.pending_da.len();
+        for _ in 0..pending_len {
+            let mut pending = self.pending_da.pop_front().expect("len checked");
+
+            let ckpt = &pending.checkpoint;
+            let ckpt_id = ckpt.header.checkpoint_id_v1();
+            for (pk, sig) in crate::solanacdn::mcp_da_take_attests_for_checkpoint(
+                pending.epoch,
+                ckpt.header.slot,
+                ckpt.header.lane_id,
+                ckpt.header.checkpoint_ix,
+                ckpt_id,
+            ) {
+                pending.sigs.insert(pk, sig);
+            }
+
+            let mut sigs: Vec<([u8; 32], [u8; 64])> =
+                pending.sigs.iter().map(|(k, v)| (*k, *v)).collect();
+            sigs.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let cert = crate::mcp::DaCertV1 {
+                epoch: pending.epoch,
+                slot: ckpt.header.slot,
+                lane_id: ckpt.header.lane_id,
+                checkpoint_ix: ckpt.header.checkpoint_ix,
+                checkpoint_id: ckpt_id,
+                stake_threshold_bps: self.cfg.da_threshold_bps,
+                sigs,
+            };
+
+            let stakes = bank
+                .epoch_staked_nodes(pending.epoch)
+                .unwrap_or_else(|| bank.current_epoch_staked_nodes());
+            if cert.verify_with_stakes_v1(stakes.as_ref()).is_ok() {
+                out.extend(crate::mcp::build_mcp_da_cert_memo_txs_v1(
+                    self.identity_keypair.as_ref(),
+                    &self.signing_key,
+                    recent_blockhash,
+                    &cert,
+                ));
+            } else if pending.requested_at.elapsed() <= Duration::from_secs(2) {
+                self.pending_da.push_back(pending);
+            }
+        }
+        while self.pending_da.len() > MCP_DA_MAX_PENDING_CHECKPOINTS {
+            self.pending_da.pop_front();
+        }
+
+        out
+    }
+
+    fn ingest_wire_tx_for_slot_lane(&mut self, slot: u64, lane_id: crate::mcp::LaneId, tx: &[u8]) {
+        if self.pending_slot != Some(slot) || self.pending_lane_id != Some(lane_id) {
+            self.reset_for_slot_lane(slot, lane_id);
+        }
+
+        // Cap buffered refs to avoid unbounded memory growth.
+        let max_pending = usize::from(self.cfg.microblock_max_refs)
+            .max(1)
+            .saturating_mul(8)
+            .min(2048);
+        if self.pending_refs.len() >= max_pending {
+            return;
+        }
+
+        // Avoid self-referential proposals by skipping MCP memo transactions.
+        const MCP_LEDGER_MEMO_MAGIC_V1: &[u8; 8] = b"SCDNMCP\0";
+        if tx
+            .windows(MCP_LEDGER_MEMO_MAGIC_V1.len())
+            .any(|w| w == MCP_LEDGER_MEMO_MAGIC_V1)
+        {
+            return;
+        }
+
+        let lanes_per_slot = self.cfg.lanes_per_slot.max(1);
+        let blob_id = crate::mcp::tx_blob_id_v1(tx);
+        if crate::mcp::select_lane_for_blob_id_v1(slot, blob_id, lanes_per_slot) != lane_id {
+            return;
+        }
+
+        if !self.seen_blob_ids.insert(blob_id) {
+            return;
+        }
+
+        let bid_hint = bid_hint_for_forwarded_tx(tx);
+
+        self.pending_refs.push(crate::mcp::McpTxRefV1 { blob_id, bid_hint });
+    }
+
+    fn maybe_build_memos_for_slot_lane(
+        &mut self,
+        slot: u64,
+        lane_id: crate::mcp::LaneId,
+        bank: &Bank,
+    ) -> Vec<Vec<u8>> {
+        if self.pending_slot != Some(slot) || self.pending_lane_id != Some(lane_id) {
+            self.reset_for_slot_lane(slot, lane_id);
+        }
+
+        let mut out = self.maybe_build_da_cert_memos(bank);
+
+        if self.pending_refs.is_empty() {
+            return out;
+        }
+
+        // Emit once the lane has enough refs for a full microblock, or after a short delay
+        // to keep latency bounded under low traffic.
+        let max_refs = usize::from(self.cfg.microblock_max_refs).max(1);
+        let min_emit_ms: u64 = 25;
+        if self.pending_refs.len() < max_refs && self.last_emit.elapsed() < Duration::from_millis(min_emit_ms) {
+            return out;
+        }
+
+        // Propose at most one microblock worth of refs per emission to bound memo overhead.
+        self.pending_refs.sort_by(|a, b| {
+            crate::mcp::bid_key_from_hint_v1(a.blob_id, a.bid_hint)
+                .cmp(&crate::mcp::bid_key_from_hint_v1(b.blob_id, b.bid_hint))
+        });
+        let take = self.pending_refs.len().min(max_refs);
+        let refs: Vec<crate::mcp::McpTxRefV1> = self.pending_refs.drain(..take).collect();
+
+        self.last_emit = Instant::now();
+
+        let recent_blockhash = bank.last_blockhash();
+        let (mut memos, checkpoint) = self
+            .mcp
+            .build_lane_microblocks_and_checkpoint_memos_with_checkpoint_v1(
+                self.identity_keypair.as_ref(),
+                &self.signing_key,
+                recent_blockhash,
+                slot,
+                lane_id,
+                refs,
+            );
+        out.append(&mut memos);
+
+        if let Some(checkpoint) = checkpoint {
+            let epoch: u64 = bank.epoch_schedule().get_epoch(slot);
+            let _sent = crate::solanacdn::mcp_da_try_send_request_for_checkpoint(epoch, &checkpoint);
+
+            // Seed with our own attestation so low-stake/dev clusters can reach threshold without
+            // waiting for POP delivery.
+            let mut attest = crate::mcp::DaAttestV1 {
+                header: crate::mcp::DaAttestHeaderV1 {
+                    epoch,
+                    slot,
+                    lane_id,
+                    checkpoint_ix: checkpoint.header.checkpoint_ix,
+                    checkpoint_id: checkpoint.header.checkpoint_id_v1(),
+                    validator_pubkey: self.identity_keypair.pubkey(),
+                },
+                sig: [0u8; 64],
+            };
+            attest.sign_v1(&self.signing_key);
+
+            let mut sigs = HashMap::new();
+            sigs.insert(self.identity_keypair.pubkey().to_bytes(), attest.sig);
+            self.pending_da.push_back(McpPendingDaCertV1 {
+                epoch,
+                checkpoint,
+                sigs,
+                requested_at: Instant::now(),
+            });
+        }
+
+        out
+    }
+}
+
 /// [`ForwardAddressGetter`] provides helper methods for retrieving forwarding
 /// addresses for both vote and non-vote transactions.
 #[derive(Clone)]
@@ -108,9 +413,90 @@ impl ForwardAddressGetter {
         max_count: u64,
         protocol: Protocol,
     ) -> Vec<SocketAddr> {
+        if let Some(mcp) = crate::mcp::status_snapshot() {
+            if mcp.cfg.leader_mode == crate::mcp::McpLeaderMode::ScheduledLeaderSchedule {
+                return self.get_mcp_scheduled_forwarding_addresses_v1(max_count, protocol);
+            }
+        }
         next_leaders(&self.cluster_info, &self.poh_recorder, max_count, |node| {
             node.tpu_forwards(protocol)
         })
+    }
+
+    fn get_mcp_scheduled_forwarding_addresses_v1(
+        &self,
+        max_count: u64,
+        protocol: Protocol,
+    ) -> Vec<SocketAddr> {
+        const SCAN_SLOTS: u64 = 256;
+
+        let Some(mcp) = crate::mcp::global() else {
+            return Vec::new();
+        };
+        let lanes_per_slot: u8 = mcp.status_snapshot().cfg.lanes_per_slot.max(1);
+
+        let (lane_leaders, protocol) = {
+            let recorder = self.poh_recorder.read().unwrap();
+            let Some((_slot_leader, target_slot)) =
+                recorder.leader_and_slot_after_n_slots(FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET)
+            else {
+                return Vec::new();
+            };
+
+            let want = usize::from(lanes_per_slot).min(max_count as usize).max(1);
+            let mut by_lane: HashMap<u8, solana_pubkey::Pubkey> = HashMap::with_capacity(want);
+            for offset in 0..SCAN_SLOTS {
+                if by_lane.len() >= want {
+                    break;
+                }
+                let slots_ahead = FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET.saturating_add(offset);
+                let Some(leader) = recorder.leader_after_n_slots(slots_ahead) else {
+                    continue;
+                };
+                let lane_id = mcp.select_lane_for_slot_v1(target_slot, leader);
+                by_lane.entry(lane_id).or_insert(leader);
+            }
+
+            let mut lane_ids: Vec<u8> = by_lane.keys().copied().collect();
+            lane_ids.sort_unstable();
+            let leaders: Vec<solana_pubkey::Pubkey> = lane_ids
+                .into_iter()
+                .filter_map(|lane_id| by_lane.get(&lane_id).copied())
+                .collect();
+            (leaders, protocol)
+        };
+
+        let mut out: Vec<SocketAddr> = Vec::new();
+        let mut seen: HashSet<SocketAddr> = HashSet::new();
+
+        for leader in lane_leaders {
+            if let Some(addr) = self
+                .cluster_info
+                .lookup_contact_info(&leader, |node| node.tpu_forwards(protocol))
+                .flatten()
+            {
+                if seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+
+        // Fallback to legacy next-leaders forwarding (fill up to max_count).
+        if out.len() < max_count as usize {
+            let fallback = next_leaders(&self.cluster_info, &self.poh_recorder, max_count, |node| {
+                node.tpu_forwards(protocol)
+            });
+            for addr in fallback {
+                if out.len() >= max_count as usize {
+                    break;
+                }
+                if seen.insert(addr) {
+                    out.push(addr);
+                }
+            }
+        }
+
+        out
     }
 
     /// Returns the TPU vote forwarding address of the next leader, if
@@ -137,12 +523,16 @@ pub(crate) fn spawn_forwarding_stage(
     sharable_banks: SharableBanks,
     forward_address_getter: ForwardAddressGetter,
     data_budget: DataBudget,
+    identity_keypair: &Keypair,
 ) -> SpawnForwardingStageResult {
     let vote_client = VoteClient::new(vote_client_udp_socket, forward_address_getter.clone());
+    let mcp_proposer = McpForwardingProposerV1::maybe_new(identity_keypair);
     match client {
         ForwardingClientOption::ConnectionCache(connection_cache) => {
-            let non_vote_client =
-                ConnectionCacheClient::new(connection_cache.clone(), forward_address_getter);
+            let non_vote_client = ConnectionCacheClient::new(
+                connection_cache.clone(),
+                forward_address_getter.clone(),
+            );
             let forwarding_stage = ForwardingStage::new(
                 receiver,
                 vote_client,
@@ -150,6 +540,8 @@ pub(crate) fn spawn_forwarding_stage(
                 sharable_banks,
                 data_budget,
                 None,
+                Some(forward_address_getter),
+                mcp_proposer,
             );
             SpawnForwardingStageResult {
                 join_handle: Builder::new()
@@ -188,6 +580,8 @@ pub(crate) fn spawn_forwarding_stage(
                 sharable_banks,
                 data_budget,
                 Some(node_multihoming.bind_ip_addrs.clone()),
+                Some(forward_address_getter),
+                mcp_proposer,
             );
             SpawnForwardingStageResult {
                 join_handle: Builder::new()
@@ -218,6 +612,8 @@ struct ForwardingStage<VoteClient: ForwardingClient, NonVoteClient: ForwardingCl
     data_budget: DataBudget,
     metrics: ForwardingStageMetrics,
     bind_ip_addrs: Option<Arc<BindIpAddrs>>,
+    forward_address_getter: Option<ForwardAddressGetter>,
+    mcp_proposer: Option<McpForwardingProposerV1>,
 }
 
 impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
@@ -230,6 +626,8 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
         sharable_banks: SharableBanks,
         data_budget: DataBudget,
         bind_ip_addrs: Option<Arc<BindIpAddrs>>,
+        forward_address_getter: Option<ForwardAddressGetter>,
+        mcp_proposer: Option<McpForwardingProposerV1>,
     ) -> Self {
         Self {
             receiver,
@@ -240,6 +638,8 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
             data_budget,
             metrics: ForwardingStageMetrics::default(),
             bind_ip_addrs,
+            forward_address_getter,
+            mcp_proposer,
         }
     }
 
@@ -365,18 +765,108 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
         self.metrics.did_something |= !self.packet_container.is_empty();
         self.refresh_data_budget();
 
+        let mcp_bank = self.sharable_banks.working();
+
+        let mcp_slot_lane: Option<(u64, crate::mcp::LaneId)> = (|| {
+            let proposer = self.mcp_proposer.as_ref()?;
+            let forward_address_getter = self.forward_address_getter.as_ref()?;
+
+            let (target_slot, leader_schedule_cache) = {
+                let recorder = forward_address_getter.poh_recorder.read().unwrap();
+                let (_slot_leader, target_slot) = recorder
+                    .leader_and_slot_after_n_slots(FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET)?;
+                (target_slot, recorder.leader_schedule_cache())
+            };
+
+            let my_pubkey = proposer.identity_keypair.pubkey();
+            let lane_id = proposer.mcp.select_lane_for_slot_v1(target_slot, my_pubkey);
+            let scheduled_lane_leaders = proposer.mcp.scheduled_lane_leaders_from_leader_schedule_v1(
+                target_slot,
+                &mcp_bank,
+                leader_schedule_cache.as_ref(),
+            );
+            let my_pk_bytes = my_pubkey.to_bytes();
+
+            (scheduled_lane_leaders.get(&lane_id) == Some(&my_pk_bytes))
+                .then_some((target_slot, lane_id))
+        })();
+
+        let maybe_send_mcp_memos = |me: &mut Self| {
+            let Some(proposer) = me.mcp_proposer.as_mut() else {
+                return;
+            };
+
+            let memos = if let Some((target_slot, lane_id)) = mcp_slot_lane {
+                proposer.maybe_build_memos_for_slot_lane(target_slot, lane_id, &mcp_bank)
+            } else {
+                proposer.maybe_build_da_cert_memos(&mcp_bank)
+            };
+            if memos.is_empty() {
+                return;
+            }
+
+            me.metrics.did_something = true;
+            me.metrics.mcp_memos_built += memos.len();
+            for tx_bytes in memos.iter() {
+                match mcp_memo_kind_from_wire_tx(tx_bytes.as_slice()) {
+                    Some(crate::mcp::McpLedgerMemoKindV1::Microblock) => {
+                        me.metrics.mcp_microblock_memo_txs_built += 1;
+                    }
+                    Some(crate::mcp::McpLedgerMemoKindV1::Checkpoint) => {
+                        me.metrics.mcp_checkpoint_memo_txs_built += 1;
+                    }
+                    Some(crate::mcp::McpLedgerMemoKindV1::DaCert) => {
+                        me.metrics.mcp_da_cert_memo_txs_built += 1;
+                    }
+                    None => {}
+                }
+            }
+
+            let active_non_vote_client_index = {
+                let active_index = me
+                    .bind_ip_addrs
+                    .as_ref()
+                    .map(|binds| binds.active_index())
+                    .unwrap_or(0);
+                active_index
+            };
+            let active_non_vote_client = &me.non_vote_clients[active_non_vote_client_index];
+
+            let mut to_send: Vec<Vec<u8>> = Vec::with_capacity(memos.len());
+            for bytes in memos {
+                if me.data_budget.take(bytes.len()) {
+                    to_send.push(bytes);
+                } else {
+                    me.metrics.mcp_memos_dropped_on_data_budget += 1;
+                }
+            }
+
+            if to_send.is_empty() {
+                return;
+            }
+
+            let num = to_send.len();
+            me.metrics.mcp_memos_forwarded += num;
+            if active_non_vote_client
+                .send_transactions_in_batch(to_send)
+                .is_err()
+            {
+                me.metrics.mcp_memos_dropped_on_send += num;
+            }
+        };
+
         let mut non_vote_batch = Vec::with_capacity(FORWARD_BATCH_SIZE);
         let mut vote_batch = Vec::with_capacity(FORWARD_BATCH_SIZE);
 
         // determine the client to use for next batch based on current active interface
         // use primary interface bind (index 0) if not in multihoming context.
-        let active_non_vote_client = {
+        let active_non_vote_client_index = {
             let active_index = self
                 .bind_ip_addrs
                 .as_ref()
                 .map(|binds| binds.active_index())
                 .unwrap_or(0);
-            &self.non_vote_clients[active_index]
+            active_index
         };
         // Loop through packets creating batches of packets to forward.
         while let Some(packet) = self.packet_container.pop_max() {
@@ -400,13 +890,31 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
                     &mut self.metrics.votes_dropped_on_send,
                 );
             } else {
+                if let Some((target_slot, lane_id)) = mcp_slot_lane {
+                    if let Some(proposer) = self.mcp_proposer.as_mut() {
+                        proposer.ingest_wire_tx_for_slot_lane(
+                            target_slot,
+                            lane_id,
+                            packet_data_vec.as_slice(),
+                        );
+                    }
+                }
                 non_vote_batch.push(packet_data_vec);
-                send_batch_if_full(
-                    &mut non_vote_batch,
-                    active_non_vote_client,
-                    &mut self.metrics.non_votes_forwarded,
-                    &mut self.metrics.non_votes_dropped_on_send,
-                );
+                if non_vote_batch.len() == FORWARD_BATCH_SIZE {
+                    // Prefer to send lane microblock memos before sending the referenced payloads.
+                    maybe_send_mcp_memos(self);
+
+                    self.metrics.non_votes_forwarded += non_vote_batch.len();
+                    let mut swap_batch = Vec::with_capacity(FORWARD_BATCH_SIZE);
+                    std::mem::swap(&mut non_vote_batch, &mut swap_batch);
+                    let active_non_vote_client = &self.non_vote_clients[active_non_vote_client_index];
+                    if active_non_vote_client
+                        .send_transactions_in_batch(swap_batch)
+                        .is_err()
+                    {
+                        self.metrics.non_votes_dropped_on_send += FORWARD_BATCH_SIZE;
+                    }
+                }
             }
         }
 
@@ -423,8 +931,12 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
             }
         }
         if !non_vote_batch.is_empty() {
+            // Prefer to send lane microblock memos before sending the referenced payloads.
+            maybe_send_mcp_memos(self);
+
             let num_non_votes = non_vote_batch.len();
             self.metrics.non_votes_forwarded += num_non_votes;
+            let active_non_vote_client = &self.non_vote_clients[active_non_vote_client_index];
             if active_non_vote_client
                 .send_transactions_in_batch(non_vote_batch)
                 .is_err()
@@ -432,6 +944,9 @@ impl<VoteClient: ForwardingClient, NonVoteClient: ForwardingClient>
                 self.metrics.non_votes_dropped_on_send += num_non_votes;
             }
         }
+
+        // Flush any remaining MCP memos after forwarding payloads.
+        maybe_send_mcp_memos(self);
     }
 
     /// Re-fill the data budget if enough time has passed
@@ -537,14 +1052,15 @@ impl ConnectionCacheClient {
             forward_address_getter,
         }
     }
-    fn get_next_valid_leader(&self) -> Option<SocketAddr> {
+    fn get_next_valid_leaders_v1(&self, fanout: usize) -> Vec<SocketAddr> {
+        let max_count = NUM_LOOKAHEAD_LEADERS.max(fanout as u64);
         let node_addresses = self
             .forward_address_getter
             .get_non_vote_forwarding_addresses(
-                NUM_LOOKAHEAD_LEADERS,
+                max_count,
                 self.connection_cache.protocol(),
             );
-        node_addresses.first().copied()
+        node_addresses.into_iter().take(fanout).collect()
     }
 }
 
@@ -553,11 +1069,34 @@ impl ForwardingClient for ConnectionCacheClient {
         &self,
         wire_transactions: Vec<Vec<u8>>,
     ) -> Result<(), ForwardingClientError> {
-        let Some(current_address) = self.get_next_valid_leader() else {
+        let fanout = mcp_forwarding_fanout_v1();
+        let node_addresses = self.get_next_valid_leaders_v1(fanout);
+        if node_addresses.is_empty() {
+            return Err(ForwardingClientError::LeaderContactMissing);
+        }
+        let node_count = node_addresses.len();
+
+        // ConnectionCache's send API consumes the batch, so clone for fanout>1.
+        let mut iter = node_addresses.into_iter();
+        let Some(first) = iter.next() else {
             return Err(ForwardingClientError::LeaderContactMissing);
         };
-        let conn = self.connection_cache.get_connection(&current_address);
-        conn.send_data_batch_async(wire_transactions)?;
+        if node_count <= 1 {
+            let conn = self.connection_cache.get_connection(&first);
+            conn.send_data_batch_async(wire_transactions)?;
+            return Ok(());
+        }
+
+        // Fanout>1: send original batch to the first leader, clones to the rest.
+        let rest_template = wire_transactions.clone();
+        {
+            let conn = self.connection_cache.get_connection(&first);
+            conn.send_data_batch_async(wire_transactions)?;
+        }
+        for addr in iter {
+            let conn = self.connection_cache.get_connection(&addr);
+            conn.send_data_batch_async(rest_template.clone())?;
+        }
         Ok(())
     }
 }
@@ -616,6 +1155,7 @@ impl TpuClientNextClient {
         bind_socket: UdpSocket,
         stake_identity: Option<&Keypair>,
     ) -> ConnectionWorkersSchedulerConfig {
+        let fanout_send = mcp_forwarding_fanout_v1();
         ConnectionWorkersSchedulerConfig {
             bind: BindTarget::Socket(bind_socket),
             stake_identity: stake_identity.map(StakeIdentity::new),
@@ -628,8 +1168,8 @@ impl TpuClientNextClient {
             // Send to the next leader only, but verify that connections exist
             // for the leaders of the next `4 * NUM_CONSECUTIVE_SLOTS`.
             leaders_fanout: Fanout {
-                send: 1,
-                connect: 4,
+                send: fanout_send,
+                connect: 4usize.max(fanout_send.saturating_mul(2)),
             },
         }
     }
@@ -755,6 +1295,14 @@ struct ForwardingStageMetrics {
     non_votes_dropped_on_data_budget: usize,
     non_votes_forwarded: usize,
     non_votes_dropped_on_send: usize,
+
+    mcp_memos_built: usize,
+    mcp_microblock_memo_txs_built: usize,
+    mcp_checkpoint_memo_txs_built: usize,
+    mcp_da_cert_memo_txs_built: usize,
+    mcp_memos_forwarded: usize,
+    mcp_memos_dropped_on_data_budget: usize,
+    mcp_memos_dropped_on_send: usize,
 }
 
 impl ForwardingStageMetrics {
@@ -812,6 +1360,33 @@ impl ForwardingStageMetrics {
                     metrics.non_votes_dropped_on_send,
                     i64
                 ),
+                ("mcp_memos_built", metrics.mcp_memos_built, i64),
+                ("mcp_memos_forwarded", metrics.mcp_memos_forwarded, i64),
+                (
+                    "mcp_memos_dropped_on_data_budget",
+                    metrics.mcp_memos_dropped_on_data_budget,
+                    i64
+                ),
+                (
+                    "mcp_memos_dropped_on_send",
+                    metrics.mcp_memos_dropped_on_send,
+                    i64
+                ),
+                (
+                    "mcp_microblock_memo_txs_built",
+                    metrics.mcp_microblock_memo_txs_built,
+                    i64
+                ),
+                (
+                    "mcp_checkpoint_memo_txs_built",
+                    metrics.mcp_checkpoint_memo_txs_built,
+                    i64
+                ),
+                (
+                    "mcp_da_cert_memo_txs_built",
+                    metrics.mcp_da_cert_memo_txs_built,
+                    i64
+                ),
             );
         }
     }
@@ -834,6 +1409,13 @@ impl Default for ForwardingStageMetrics {
             non_votes_dropped_on_data_budget: 0,
             non_votes_forwarded: 0,
             non_votes_dropped_on_send: 0,
+            mcp_memos_built: 0,
+            mcp_microblock_memo_txs_built: 0,
+            mcp_checkpoint_memo_txs_built: 0,
+            mcp_da_cert_memo_txs_built: 0,
+            mcp_memos_forwarded: 0,
+            mcp_memos_dropped_on_data_budget: 0,
+            mcp_memos_dropped_on_send: 0,
         }
     }
 }
@@ -848,12 +1430,17 @@ mod tests {
         super::*,
         crossbeam_channel::unbounded,
         packet::PacketFlags,
+        solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
         solana_keypair::Keypair,
+        solana_message::Message,
         solana_perf::packet::{Packet, PacketBatch, PinnedPacketBatch},
         solana_pubkey::Pubkey,
         solana_runtime::genesis_utils::create_genesis_config,
+        solana_signer::Signer,
         solana_system_transaction as system_transaction,
+        solana_transaction::Transaction,
+        solana_transaction::versioned::VersionedTransaction,
         std::sync::{Arc, Mutex},
     };
 
@@ -938,6 +1525,8 @@ mod tests {
             sharable_banks,
             DataBudget::default(),
             None,
+            None,
+            None,
         );
 
         // Send packet batches.
@@ -994,5 +1583,24 @@ mod tests {
             non_vote_wired_txs[0],
             non_vote_packets[0].first().unwrap().data(..).unwrap()
         );
+    }
+
+    #[test]
+    fn test_mcp_forwarding_proposer_overrides_bid_with_fair_priority() {
+        // Build a versioned transaction with a non-zero CU price so we can see it overridden.
+        let recent_blockhash = Hash::new_unique();
+        let ix_price = ComputeBudgetInstruction::set_compute_unit_price(123);
+        let payer = Keypair::new();
+        let message = Message::new(&[ix_price], Some(&payer.pubkey()));
+        let tx = Transaction::new(&[&payer], message, recent_blockhash);
+        let vtx: VersionedTransaction = tx.into();
+        let tx_bytes = bincode::serialize(&vtx).unwrap();
+
+        // Insert a fair priority for this tx signature and ensure MCP uses it as the bid hint.
+        let sig = try_first_signature_bytes(&tx_bytes).unwrap();
+        crate::solanacdn::insert_fair_priority(sig, 999);
+
+        let bid_hint = bid_hint_for_forwarded_tx(&tx_bytes);
+        assert_eq!(bid_hint.cu_price, 999);
     }
 }

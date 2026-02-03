@@ -1187,6 +1187,10 @@ pub mod fix_alt_bn128_pairing_length_check {
     solana_pubkey::declare_id!("bnYzodLwmybj7e1HAe98yZrdJTd7we69eMMLgCXqKZm");
 }
 
+pub mod mcp_vote_withholding {
+    solana_pubkey::declare_id!("Dnscgakm5WULSoZq8hbBHcnfd3xTwZ4VDmGtmn1DijTR");
+}
+
 pub mod replace_spl_token_with_p_token {
     use super::Pubkey;
 
@@ -2157,6 +2161,10 @@ pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::n
         (
             relax_programdata_account_check_migration::id(),
             "SIMD-0444: Relax program data account check in migration",
+        ),
+        (
+            mcp_vote_withholding::id(),
+            "MCP: enable vote-withholding enforcement",
         ),
         /*************** ADD NEW FEATURES HERE ***************/
     ]

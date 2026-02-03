@@ -354,6 +354,7 @@ impl Tpu {
             bank_forks.read().unwrap().sharable_banks(),
             ForwardAddressGetter::new(cluster_info.clone(), poh_recorder.clone()),
             DataBudget::default(),
+            keypair,
         );
 
         let (entry_receiver, tpu_entry_notifier) =
