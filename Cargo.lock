@@ -432,6 +432,7 @@ dependencies = [
  "predicates",
  "pretty_assertions",
  "qualifier_attr",
+ "quinn",
  "rand 0.8.5",
  "rayon",
  "reqwest 0.12.24",
@@ -484,12 +485,14 @@ dependencies = [
  "solana-system-interface",
  "solana-test-validator",
  "solana-time-utils",
+ "solana-tls-utils",
  "solana-tpu-client",
  "solana-turbine",
  "solana-unified-scheduler-pool",
  "solana-validator-exit",
  "solana-version",
  "solana-vote-program",
+ "solanacdn-protocol",
  "spl-generic-token",
  "spl-token-2022-interface",
  "symlink",
@@ -12258,8 +12261,8 @@ dependencies = [
 
 [[package]]
 name = "solanacdn-protocol"
-version = "0.1.6"
-source = "git+https://github.com/pipenetwork/solanacdn-protocol?tag=v0.1.6#153d5df3c15df5c4dfa3cc5649447a51c0e45cb5"
+version = "0.1.7"
+source = "git+https://github.com/pipenetwork/solanacdn-protocol?tag=v0.1.7#29ca4b11b871de4cb3f34b9f4f50992504317933"
 dependencies = [
  "bs58",
  "ed25519-dalek 2.2.0",

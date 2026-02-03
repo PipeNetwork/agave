@@ -38,6 +38,7 @@ libloading = { workspace = true }
 log = { workspace = true }
 num_cpus = { workspace = true }
 qualifier_attr = { workspace = true }
+quinn = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
@@ -84,12 +85,14 @@ solana-storage-bigtable = { workspace = true }
 solana-streamer = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-test-validator = { workspace = true }
+solana-tls-utils = { workspace = true }
 solana-tpu-client = { workspace = true }
 solana-turbine = { workspace = true }
 solana-unified-scheduler-pool = { workspace = true }
 solana-validator-exit = { workspace = true }
 solana-version = { workspace = true }
 solana-vote-program = { workspace = true }
+solanacdn-protocol = { git = "https://github.com/pipenetwork/solanacdn-protocol", tag = "v0.1.7" }
 symlink = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

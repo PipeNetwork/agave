@@ -4,3 +4,7 @@ rustflags = ["-Ctarget-cpu=x86-64-v2"]
 
 [alias]
 xtask = "run --manifest-path ci/xtask/Cargo.toml --bin xtask --"
+
+# Local dev override (uncomment locally; do not commit):
+# [patch."https://github.com/pipenetwork/solanacdn-protocol"]
+# solanacdn-protocol = { path = "/path/to/solanacdn-protocol" }
