@@ -6,6 +6,21 @@ source "$here"/common.sh
 
 set -e
 
+enable_warmup_epochs=true
+passthrough_args=()
+while [[ -n ${1-} ]]; do
+  case "$1" in
+    --no-warmup-epochs)
+      enable_warmup_epochs=false
+      shift
+      ;;
+    *)
+      passthrough_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
 rm -rf "$SOLANA_CONFIG_DIR"/bootstrap-validator
 mkdir -p "$SOLANA_CONFIG_DIR"/bootstrap-validator
 
@@ -33,13 +48,16 @@ else
 fi
 
 args=(
-  "$@"
+  "${passthrough_args[@]}"
   --max-genesis-archive-unpacked-size 1073741824
-  --enable-warmup-epochs
   --bootstrap-validator "$SOLANA_CONFIG_DIR"/bootstrap-validator/identity.json
                         "$SOLANA_CONFIG_DIR"/bootstrap-validator/vote-account.json
                         "$SOLANA_CONFIG_DIR"/bootstrap-validator/stake-account.json
 )
+
+if [[ $enable_warmup_epochs == true ]]; then
+  args+=(--enable-warmup-epochs)
+fi
 
   if [[ -z ${SOLANA_SKIP_PROGRAM_FETCH-} ]]; then
     "$SOLANA_ROOT"/fetch-core-bpf.sh

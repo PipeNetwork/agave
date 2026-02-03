@@ -40,6 +40,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --dynamic-port-range ]]; then
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 = --snapshot-interval-slots ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = --limit-ledger-size ]]; then
       args+=("$1" "$2")
       shift 2
@@ -58,6 +61,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --enable-rpc-bigtable-ledger-storage ]]; then
       args+=("$1")
       shift
+    elif [[ $1 = --snapshot-manifest-url ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = --tpu-disable-quic ]]; then
       args+=("$1")
       shift
@@ -94,6 +100,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --maximum-snapshots-to-retain ]]; then
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 == --no-genesis-fetch ]]; then
+      args+=("$1")
+      shift
     elif [[ $1 == --no-snapshot-fetch ]]; then
       args+=("$1")
       shift
@@ -211,6 +220,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --solanacdn-no-vote-tunnel ]]; then
       args+=("$1")
       shift
+    elif [[ $1 == --staked-nodes-overrides ]]; then
+      args+=("$1" "$2")
+      shift 2
     else
       echo "Unknown argument: $1"
       $program --help
@@ -242,7 +254,6 @@ fi
 args+=(
   --ledger "$ledger_dir"
   --rpc-port 8899
-  --snapshot-interval-slots 200
   --no-incremental-snapshots
   --identity "$identity"
   --vote-account "$vote_account"
@@ -253,6 +264,7 @@ args+=(
   --full-rpc-api
   --allow-private-addr
 )
+default_arg --snapshot-interval-slots 200
 default_arg --gossip-port 8001
 default_arg --log -
 

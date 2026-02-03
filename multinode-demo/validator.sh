@@ -38,6 +38,7 @@ OPTIONS:
                               multiple validators in the same workspace
   --node-sol SOL            - Number of SOL this node has been funded from the genesis config (default: $node_sol)
   --no-voting               - start node without vote signer
+  --bind-address HOST       - bind to this address
   --rpc-port port           - custom RPC port for this node
   --no-restart              - do not restart the node if it exits
   --no-airdrop              - The genesis config has an account for the node. Airdrops are not required.
@@ -85,6 +86,9 @@ while [[ -n $1 ]]; do
       vote_account=$2
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 = --bind-address ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = --init-complete-file ]]; then
       args+=("$1" "$2")
       shift 2
@@ -95,10 +99,19 @@ while [[ -n $1 ]]; do
       gossip_entrypoint=$2
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 = --no-genesis-fetch ]]; then
+      args+=("$1")
+      shift
     elif [[ $1 = --no-snapshot-fetch ]]; then
       args+=("$1")
       shift
+    elif [[ $1 = --snapshot-manifest-url ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = --no-voting ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 = --no-wait-for-vote-to-start-leader ]]; then
       args+=("$1")
       shift
     elif [[ $1 = --dev-no-sigverify ]]; then
@@ -281,6 +294,9 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --solanacdn-no-vote-tunnel ]]; then
       args+=("$1")
       shift
+    elif [[ $1 == --staked-nodes-overrides ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = -h ]]; then
       usage "$@"
     else
