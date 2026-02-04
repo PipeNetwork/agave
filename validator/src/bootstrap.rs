@@ -1402,6 +1402,7 @@ fn download_http_file_concurrent_ranges(
         let stop = Arc::clone(&stop);
         let progress_done = Arc::clone(&progress_done);
         let progress_name = progress_name.to_string();
+        let progress_start = progress_start;
         std::thread::spawn(move || {
             let mut last_bytes: u64 = 0;
             let mut last_at = Instant::now();
@@ -1427,9 +1428,37 @@ fn download_http_file_concurrent_ranges(
                 let pct = ((bytes as f64) / (expected_size_bytes as f64) * 100.0)
                     .clamp(0.0, 100.0);
 
+                let remaining_bytes = expected_size_bytes.saturating_sub(bytes);
+                let bytes_per_sec = mib_per_sec * 1024.0 * 1024.0;
+                let mut eta_secs = if bytes_per_sec > 0.0 {
+                    (remaining_bytes as f64) / bytes_per_sec
+                } else {
+                    f64::INFINITY
+                };
+
+                if !eta_secs.is_finite() || eta_secs < 0.0 {
+                    let elapsed = progress_start.elapsed().as_secs_f64().max(0.001);
+                    let avg_bytes_per_sec = (bytes as f64) / elapsed;
+                    eta_secs = if avg_bytes_per_sec > 0.0 {
+                        (remaining_bytes as f64) / avg_bytes_per_sec
+                    } else {
+                        f64::INFINITY
+                    };
+                }
+
+                let eta_str = if eta_secs.is_finite() {
+                    let total_secs = eta_secs.ceil().clamp(0.0, u64::MAX as f64) as u64;
+                    let h = total_secs / 3600;
+                    let m = (total_secs % 3600) / 60;
+                    let s = total_secs % 60;
+                    format!("{h:02}:{m:02}:{s:02}")
+                } else {
+                    "--:--:--".to_string()
+                };
+
                 info!(
-                    "Snapshot download progress {}: {:.1}% ({}/{}) at {:.1} MiB/s",
-                    progress_name, pct, bytes, expected_size_bytes, mib_per_sec
+                    "Snapshot download progress {}: {:.1}% ({}/{}) at {:.1} MiB/s (ETA {})",
+                    progress_name, pct, bytes, expected_size_bytes, mib_per_sec, eta_str
                 );
 
                 last_bytes = bytes;
