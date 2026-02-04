@@ -2372,10 +2372,87 @@ impl<'a> ProcessBlockStore<'a> {
                 let _ = Builder::new()
                     .name("solRptLdgrStat".to_string())
                     .spawn(move || {
+                        const LOG_INTERVAL: Duration = Duration::from_secs(5);
+                        const PROGRESS_BAR_WIDTH: usize = 20;
+
+                        let progress_start = Instant::now();
+                        let start_slot = bank_forks.read().unwrap().working_bank().slot();
+                        let mut last_slot = start_slot;
+                        let mut last_at = Instant::now();
+                        let mut next_log = last_at + LOG_INTERVAL;
                         while !exit.load(Ordering::Relaxed) {
                             let slot = bank_forks.read().unwrap().working_bank().slot();
                             *start_progress.write().unwrap() =
                                 ValidatorStartProgress::ProcessingLedger { slot, max_slot };
+
+                            let now = Instant::now();
+                            if now >= next_log {
+                                let total_slots = max_slot.saturating_sub(start_slot);
+                                let processed_slots = slot
+                                    .saturating_sub(start_slot)
+                                    .min(total_slots);
+                                let remaining_slots = total_slots.saturating_sub(processed_slots);
+
+                                let pct = if total_slots > 0 {
+                                    (processed_slots as f64) / (total_slots as f64) * 100.0
+                                } else {
+                                    100.0
+                                }
+                                .clamp(0.0, 100.0);
+
+                                let delta_slots = slot.saturating_sub(last_slot);
+                                let dt = now.duration_since(last_at).as_secs_f64().max(0.001);
+                                let slots_per_sec = (delta_slots as f64) / dt;
+
+                                let mut eta_secs = if slots_per_sec > 0.0 {
+                                    (remaining_slots as f64) / slots_per_sec
+                                } else {
+                                    f64::INFINITY
+                                };
+                                if !eta_secs.is_finite() || eta_secs < 0.0 {
+                                    let elapsed = progress_start.elapsed().as_secs_f64().max(0.001);
+                                    let avg_slots_per_sec = (processed_slots as f64) / elapsed;
+                                    eta_secs = if avg_slots_per_sec > 0.0 {
+                                        (remaining_slots as f64) / avg_slots_per_sec
+                                    } else {
+                                        f64::INFINITY
+                                    };
+                                }
+
+                                let eta_str = if eta_secs.is_finite() {
+                                    let total_secs =
+                                        eta_secs.ceil().clamp(0.0, u64::MAX as f64) as u64;
+                                    let h = total_secs / 3600;
+                                    let m = (total_secs % 3600) / 60;
+                                    let s = total_secs % 60;
+                                    format!("{h:02}:{m:02}:{s:02}")
+                                } else {
+                                    "--:--:--".to_string()
+                                };
+
+                                let filled = ((pct / 100.0) * (PROGRESS_BAR_WIDTH as f64))
+                                    .floor()
+                                    .clamp(0.0, PROGRESS_BAR_WIDTH as f64) as usize;
+                                let progress_bar = format!(
+                                    "{}{}",
+                                    "#".repeat(filled),
+                                    "-".repeat(PROGRESS_BAR_WIDTH.saturating_sub(filled))
+                                );
+
+                                info!(
+                                    "Ledger restore progress: [{}] {:.1}% (slot {}/{}) at {:.1} slots/s (ETA {})",
+                                    progress_bar,
+                                    pct,
+                                    slot,
+                                    max_slot,
+                                    slots_per_sec,
+                                    eta_str
+                                );
+
+                                last_slot = slot;
+                                last_at = now;
+                                next_log = now + LOG_INTERVAL;
+                            }
                             sleep(Duration::from_secs(2));
                         }
                     })
