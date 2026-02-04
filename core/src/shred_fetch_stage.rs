@@ -199,7 +199,8 @@ impl ShredFetchStage {
                     // is later discarded (e.g., because the slot is already rooted). Avoid copying
                     // packet bytes unless needed by publishing.
                     if let Some(shred_bytes) = packet.as_ref().data(..) {
-                        if let Some(shred_id) = solana_ledger::shred::layout::get_shred_id(shred_bytes)
+                        if let Some(shred_id) =
+                            solana_ledger::shred::layout::get_shred_id(shred_bytes)
                         {
                             handle.note_race_observation(shred_id, packet.meta().addr);
                         }
@@ -207,6 +208,7 @@ impl ShredFetchStage {
                 }
 
                 if let Some(bytes) = packet_payload_bytes(packet.as_ref()) {
+                    let slot = solana_ledger::shred::layout::get_slot(bytes.as_ref());
 
                     // In `--solanacdn-only` mode, POPs may inject raw shreds directly to the TVU
                     // socket (bypassing PushShredBatch). Those shreds are sourced from POP IPs
@@ -219,11 +221,19 @@ impl ShredFetchStage {
                             && !packet.meta().addr.is_loopback()
                             && h.should_ignore_src_ip(packet.meta().addr)
                     }) {
-                        let slot = solana_ledger::shred::layout::get_slot(bytes.as_ref());
                         solanacdn
                             .as_ref()
                             .expect("is_some_and implies Some")
                             .note_pop_delivered_shred_with_slot(bytes.len(), slot);
+                    }
+
+                    if solanacdn.as_ref().is_some_and(|h| {
+                        h.is_connected() && !discarded && h.should_ignore_src_ip(packet.meta().addr)
+                    }) {
+                        solanacdn
+                            .as_ref()
+                            .expect("is_some_and implies Some")
+                            .note_solanacdn_accepted_shred_with_slot(slot);
                     }
 
                     if let Some(handle) = solanacdn_publish {

@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
@@ -14,34 +14,36 @@ use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 use ed25519_dalek_v2::{Signer as DalekSigner, SigningKey, VerifyingKey};
 use quinn::Endpoint;
-use serde::{Deserialize, Serialize};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 
+use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
 use solana_ledger::blockstore::Blockstore;
 use solana_ledger::shred::ShredId as LedgerShredId;
-use solana_sha256_hasher as sha256_hasher;
 use solana_message::{Message, VersionedMessage};
 use solana_pubkey::Pubkey;
+use solana_sha256_hasher as sha256_hasher;
 use solana_signer::Signer;
-use solana_transaction::{Transaction, versioned::VersionedTransaction};
-use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_transaction::{versioned::VersionedTransaction, Transaction};
 
-use solanacdn_protocol::crypto::{PubkeyBytes, SignatureBytes, random_nonce_16};
-use solanacdn_protocol::frame::{DEFAULT_MAX_FRAME_BYTES, FrameError, decode_envelope, encode_envelope};
+use solanacdn_protocol::crypto::{random_nonce_16, PubkeyBytes, SignatureBytes};
+use solanacdn_protocol::frame::{
+    decode_envelope, encode_envelope, FrameError, DEFAULT_MAX_FRAME_BYTES,
+};
 use solanacdn_protocol::messages::{
-    AgentCapabilities, AgentToPop, AuthRefresh, AuthRequest, AuthRequestPayload, AuthWithSessionToken,
-    ControlRequest, ControlResponse, FairBatchCommit, FairBatchCommitPayload, FairBatchReceiptCommit,
-    FairBatchReceiptCommitPayload, Heartbeat, HeartbeatStats, PopToAgent, Shred, ShredBatch, ShredId,
-    ShredKind, StreamKind, VoteDatagram,
+    AgentCapabilities, AgentToPop, AuthRefresh, AuthRequest, AuthRequestPayload,
+    AuthWithSessionToken, ControlRequest, ControlResponse, FairBatchCommit, FairBatchCommitPayload,
+    FairBatchReceiptCommit, FairBatchReceiptCommitPayload, Heartbeat, HeartbeatStats, PopToAgent,
+    Shred, ShredBatch, ShredId, ShredKind, StreamKind, VoteDatagram,
 };
 
 static GLOBAL: ArcSwapOption<SolanaCdnHandle> = ArcSwapOption::const_empty();
@@ -277,10 +279,7 @@ fn build_fair_ledger_commit_memo_txs(
     }
 
     let chunk_size = FAIR_LEDGER_COMMIT_MAX_SIGS_PER_CHUNK.max(1);
-    let chunk_total = tx_sigs
-        .len()
-        .div_ceil(chunk_size)
-        .min(u16::MAX as usize) as u16;
+    let chunk_total = tx_sigs.len().div_ceil(chunk_size).min(u16::MAX as usize) as u16;
 
     let leader_time_ms = now_ms();
     let leader_pubkey = auth.validator_pubkey;
@@ -361,7 +360,11 @@ fn fair_merkle_root(sigs: &[[u8; 64]]) -> [u8; 32] {
         let mut i = 0usize;
         while i < level.len() {
             let left = level[i];
-            let right = if i + 1 < level.len() { level[i + 1] } else { left };
+            let right = if i + 1 < level.len() {
+                level[i + 1]
+            } else {
+                left
+            };
             next.push(fair_merkle_node_hash(&left, &right));
             i = i.saturating_add(2);
         }
@@ -602,8 +605,8 @@ struct RaceSample {
 
 const RACE_LEAD_BUCKETS_MS: [u64; 12] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000];
 const RACE_DELTA_BUCKETS_MS: [i64; 25] = [
-    -5_000, -2_000, -1_000, -500, -200, -100, -50, -20, -10, -5, -2, -1, 0, 1, 2, 5, 10, 20,
-    50, 100, 200, 500, 1_000, 2_000, 5_000,
+    -5_000, -2_000, -1_000, -500, -200, -100, -50, -20, -10, -5, -2, -1, 0, 1, 2, 5, 10, 20, 50,
+    100, 200, 500, 1_000, 2_000, 5_000,
 ];
 
 #[derive(Clone, Debug)]
@@ -692,7 +695,12 @@ impl RaceHistogram {
         }
     }
 
-    fn observe_delta(&mut self, delta_ms: i64, solanacdn_endpoint: Option<SocketAddr>, event_ms: u64) {
+    fn observe_delta(
+        &mut self,
+        delta_ms: i64,
+        solanacdn_endpoint: Option<SocketAddr>,
+        event_ms: u64,
+    ) {
         self.delta.observe(delta_ms);
 
         let hour_utc = ((event_ms / 1000) / 3600) % 24;
@@ -1005,6 +1013,9 @@ pub struct SolanaCdnStatus {
     pub last_shred_slot: Option<u64>,
     pub last_shred_timestamp_ms: Option<u64>,
     pub last_shred_age_ms: Option<u64>,
+    pub last_accepted_shred_slot: Option<u64>,
+    pub last_accepted_shred_timestamp_ms: Option<u64>,
+    pub last_accepted_shred_age_ms: Option<u64>,
     pub tvu_shred_ingest_mode: TvuShredIngestMode,
     pub tvu_shred_stale: Option<bool>,
     pub tvu_shred_stale_for_ms: Option<u64>,
@@ -1032,6 +1043,9 @@ pub struct SolanaCdnHandle {
     last_solanacdn_shred_rx_ms: AtomicU64,
     last_solanacdn_shred_slot: AtomicU64,
     last_solanacdn_shred_slot_valid: AtomicBool,
+    last_solanacdn_shred_accepted_ms: AtomicU64,
+    last_solanacdn_shred_accepted_slot: AtomicU64,
+    last_solanacdn_shred_accepted_slot_valid: AtomicBool,
     tunneled_vote_packets: AtomicU64,
     rx_vote_packets: AtomicU64,
     rx_tx_packets: AtomicU64,
@@ -1085,6 +1099,9 @@ impl SolanaCdnHandle {
             last_solanacdn_shred_rx_ms: AtomicU64::new(0),
             last_solanacdn_shred_slot: AtomicU64::new(0),
             last_solanacdn_shred_slot_valid: AtomicBool::new(false),
+            last_solanacdn_shred_accepted_ms: AtomicU64::new(0),
+            last_solanacdn_shred_accepted_slot: AtomicU64::new(0),
+            last_solanacdn_shred_accepted_slot_valid: AtomicBool::new(false),
             tunneled_vote_packets: AtomicU64::new(0),
             rx_vote_packets: AtomicU64::new(0),
             rx_tx_packets: AtomicU64::new(0),
@@ -1101,7 +1118,7 @@ impl SolanaCdnHandle {
             fair_equivocations: AtomicU64::new(0),
             fair_votes_withheld: AtomicU64::new(0),
             tx_fair_slashing_enforce_override: AtomicU8::new(
-                TxFairSlashingEnforceOverride::Inherit as u8
+                TxFairSlashingEnforceOverride::Inherit as u8,
             ),
             fair_ledger_audit_checked: AtomicU64::new(0),
             fair_ledger_audit_failed: AtomicU64::new(0),
@@ -1224,7 +1241,8 @@ impl SolanaCdnHandle {
     }
 
     pub fn tx_fair_slashing_enforce_override(&self) -> Option<bool> {
-        self.tx_fair_slashing_enforce_override_state().as_option_bool()
+        self.tx_fair_slashing_enforce_override_state()
+            .as_option_bool()
     }
 
     pub fn tx_fair_slashing_enforce_enabled(&self) -> bool {
@@ -1265,13 +1283,7 @@ impl SolanaCdnHandle {
         true
     }
 
-    fn mark_fair_slashed(
-        &self,
-        leader: PubkeyBytes,
-        slot: u64,
-        order_ix: u64,
-        now: u64,
-    ) {
+    fn mark_fair_slashed(&self, leader: PubkeyBytes, slot: u64, order_ix: u64, now: u64) {
         let key = FairSlashedKey { leader, slot };
         let already = self.fair_slashing_is_slashed_key(&key, now);
         let entry = FairSlashedEntry {
@@ -1333,12 +1345,7 @@ impl SolanaCdnHandle {
                 if expired {
                     self.fair_order_witnesses.remove(&key);
                 } else if existing_tx_sig != tx_sig.0 {
-                    self.mark_fair_slashed(
-                        leader,
-                        slot,
-                        order_ix,
-                        now,
-                    );
+                    self.mark_fair_slashed(leader, slot, order_ix, now);
                     // Once a leader/slot is slashed, extra bookkeeping isn't required.
                     break;
                 }
@@ -1354,7 +1361,12 @@ impl SolanaCdnHandle {
         }
     }
 
-    fn audit_fair_ledger_commits_for_slot(&self, blockstore: &Blockstore, leader: &Pubkey, slot: u64) {
+    fn audit_fair_ledger_commits_for_slot(
+        &self,
+        blockstore: &Blockstore,
+        leader: &Pubkey,
+        slot: u64,
+    ) {
         if !self.cfg.tx_fair_slashing {
             return;
         }
@@ -1367,7 +1379,9 @@ impl SolanaCdnHandle {
             .fetch_add(1, Ordering::Relaxed);
 
         let ok = match blockstore.get_slot_entries(slot, 0) {
-            Ok(entries) => self.audit_fair_ledger_commits_in_entries(entries.as_slice(), leader, slot),
+            Ok(entries) => {
+                self.audit_fair_ledger_commits_in_entries(entries.as_slice(), leader, slot)
+            }
             Err(_) => true,
         };
 
@@ -1403,14 +1417,21 @@ impl SolanaCdnHandle {
 
         for entry in entries {
             for tx in entry.transactions.iter() {
-                if let Some(sig0) = tx.signatures.get(0).and_then(|s| s.as_ref().try_into().ok())
+                if let Some(sig0) = tx
+                    .signatures
+                    .get(0)
+                    .and_then(|s| s.as_ref().try_into().ok())
                 {
                     slot_tx_sigs.push(sig0);
                 }
 
                 let (account_keys, instructions) = match &tx.message {
-                    VersionedMessage::Legacy(msg) => (msg.account_keys.as_slice(), msg.instructions.as_slice()),
-                    VersionedMessage::V0(msg) => (msg.account_keys.as_slice(), msg.instructions.as_slice()),
+                    VersionedMessage::Legacy(msg) => {
+                        (msg.account_keys.as_slice(), msg.instructions.as_slice())
+                    }
+                    VersionedMessage::V0(msg) => {
+                        (msg.account_keys.as_slice(), msg.instructions.as_slice())
+                    }
                 };
 
                 for ix in instructions {
@@ -1447,11 +1468,20 @@ impl SolanaCdnHandle {
                     }
 
                     let batch_id = chunk.payload.batch_id;
-                    batch_first_pos.entry(batch_id).or_insert(slot_tx_sigs.len());
+                    batch_first_pos
+                        .entry(batch_id)
+                        .or_insert(slot_tx_sigs.len());
 
-                    if let Some(prev_total) = batch_chunk_total.insert(batch_id, chunk.payload.chunk_total) {
+                    if let Some(prev_total) =
+                        batch_chunk_total.insert(batch_id, chunk.payload.chunk_total)
+                    {
                         if prev_total != chunk.payload.chunk_total {
-                            self.mark_fair_slashed(expected_leader, slot, chunk.payload.order_start, now_ms());
+                            self.mark_fair_slashed(
+                                expected_leader,
+                                slot,
+                                chunk.payload.order_start,
+                                now_ms(),
+                            );
                             return false;
                         }
                     }
@@ -1459,17 +1489,18 @@ impl SolanaCdnHandle {
                     let key = (batch_id, chunk.payload.chunk_index);
                     if let Some(existing_sig) = chunk_commit_sigs.get(&key) {
                         if existing_sig != &chunk.signature.0 {
-                            self.mark_fair_slashed(expected_leader, slot, chunk.payload.order_start, now_ms());
+                            self.mark_fair_slashed(
+                                expected_leader,
+                                slot,
+                                chunk.payload.order_start,
+                                now_ms(),
+                            );
                             return false;
                         }
                     } else {
                         chunk_commit_sigs.insert(key, chunk.signature.0);
-                        let sigs: Vec<[u8; 64]> = chunk
-                            .payload
-                            .tx_sigs
-                            .into_iter()
-                            .map(|sig| sig.0)
-                            .collect();
+                        let sigs: Vec<[u8; 64]> =
+                            chunk.payload.tx_sigs.into_iter().map(|sig| sig.0).collect();
                         chunk_sigs.insert(key, sigs);
                     }
                 }
@@ -1586,7 +1617,11 @@ impl SolanaCdnHandle {
         );
     }
 
-    pub fn note_race_observation_from_pop(&self, shred_id: LedgerShredId, pop_endpoint: SocketAddr) {
+    pub fn note_race_observation_from_pop(
+        &self,
+        shred_id: LedgerShredId,
+        pop_endpoint: SocketAddr,
+    ) {
         if !self.cfg.race_enabled {
             return;
         }
@@ -1654,7 +1689,7 @@ impl SolanaCdnHandle {
             return true;
         }
         if self.cfg.tvu_shred_ingest_mode == TvuShredIngestMode::SolanaCdnPreferred
-            && !self.is_solanacdn_shred_rx_fresh_at(now_ms())
+            && !self.is_solanacdn_shred_accepted_fresh_at(now_ms())
         {
             return true;
         }
@@ -1663,6 +1698,16 @@ impl SolanaCdnHandle {
 
     fn is_solanacdn_shred_rx_fresh_at(&self, now_ms: u64) -> bool {
         let last = self.last_solanacdn_shred_rx_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        now_ms.saturating_sub(last) <= self.cfg.tvu_shred_hybrid_stale_ms.max(250)
+    }
+
+    fn is_solanacdn_shred_accepted_fresh_at(&self, now_ms: u64) -> bool {
+        let last = self
+            .last_solanacdn_shred_accepted_ms
+            .load(Ordering::Relaxed);
         if last == 0 {
             return false;
         }
@@ -1704,15 +1749,17 @@ impl SolanaCdnHandle {
         uplink: Option<Arc<SessionUplink>>,
     ) {
         self.publisher_uplink.store(uplink);
-        self.connected
-            .store(self.publisher_uplink.load_full().is_some(), Ordering::Relaxed);
+        self.connected.store(
+            self.publisher_uplink.load_full().is_some(),
+            Ordering::Relaxed,
+        );
 
         let publisher_str = publisher.map(|p| p.to_string());
         let current = self.publisher_endpoint.load_full().map(|p| (*p).clone());
         if current != publisher_str {
-            self.publisher_switches_total.fetch_add(1, Ordering::Relaxed);
-            self.publisher_endpoint
-                .store(publisher_str.map(Arc::new));
+            self.publisher_switches_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.publisher_endpoint.store(publisher_str.map(Arc::new));
         }
     }
 
@@ -1732,6 +1779,30 @@ impl SolanaCdnHandle {
             let mut current = self.last_solanacdn_shred_slot.load(Ordering::Relaxed);
             while slot > current {
                 match self.last_solanacdn_shred_slot.compare_exchange(
+                    current,
+                    slot,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => current = next,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn note_solanacdn_accepted_shred_with_slot(&self, slot: Option<u64>) {
+        self.last_solanacdn_shred_accepted_ms
+            .store(now_ms(), Ordering::Relaxed);
+
+        if let Some(slot) = slot {
+            self.last_solanacdn_shred_accepted_slot_valid
+                .store(true, Ordering::Relaxed);
+            let mut current = self
+                .last_solanacdn_shred_accepted_slot
+                .load(Ordering::Relaxed);
+            while slot > current {
+                match self.last_solanacdn_shred_accepted_slot.compare_exchange(
                     current,
                     slot,
                     Ordering::Relaxed,
@@ -1814,7 +1885,10 @@ impl SolanaCdnHandle {
                 state.rx_shred_payloads_per_sec = 0.0;
                 state.tunneled_vote_packets_per_sec = 0.0;
             }
-            (state.rx_shred_payloads_per_sec, state.tunneled_vote_packets_per_sec)
+            (
+                state.rx_shred_payloads_per_sec,
+                state.tunneled_vote_packets_per_sec,
+            )
         };
 
         let last_shred_timestamp_ms = {
@@ -1828,10 +1902,27 @@ impl SolanaCdnHandle {
             .load(Ordering::Relaxed)
             .then_some(self.last_solanacdn_shred_slot.load(Ordering::Relaxed));
 
-        let tvu_shred_stale_for_ms = last_shred_age_ms;
+        let last_accepted_shred_timestamp_ms = {
+            let v = self
+                .last_solanacdn_shred_accepted_ms
+                .load(Ordering::Relaxed);
+            (v != 0).then_some(v)
+        };
+        let last_accepted_shred_age_ms =
+            last_accepted_shred_timestamp_ms.map(|v| now.saturating_sub(v));
+
+        let last_accepted_shred_slot = self
+            .last_solanacdn_shred_accepted_slot_valid
+            .load(Ordering::Relaxed)
+            .then_some(
+                self.last_solanacdn_shred_accepted_slot
+                    .load(Ordering::Relaxed),
+            );
+
+        let tvu_shred_stale_for_ms = last_accepted_shred_age_ms;
         let tvu_shred_stale = match self.cfg.tvu_shred_ingest_mode {
             TvuShredIngestMode::SolanaCdnPreferred => {
-                Some(!self.is_solanacdn_shred_rx_fresh_at(now))
+                Some(!self.is_solanacdn_shred_accepted_fresh_at(now))
             }
             _ => None,
         };
@@ -1880,6 +1971,9 @@ impl SolanaCdnHandle {
             last_shred_slot,
             last_shred_timestamp_ms,
             last_shred_age_ms,
+            last_accepted_shred_slot,
+            last_accepted_shred_timestamp_ms,
+            last_accepted_shred_age_ms,
             tvu_shred_ingest_mode: self.cfg.tvu_shred_ingest_mode,
             tvu_shred_stale,
             tvu_shred_stale_for_ms,
@@ -1950,7 +2044,10 @@ impl SolanaCdnHandle {
         let Some(uplink) = self.publisher_uplink.load_full() else {
             return false;
         };
-        match uplink.tx.try_send(UplinkMsg::Vote(VotePublish { dst, payload })) {
+        match uplink
+            .tx
+            .try_send(UplinkMsg::Vote(VotePublish { dst, payload }))
+        {
             Ok(()) => true,
             Err(_) => {
                 self.dropped_vote_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -2105,10 +2202,15 @@ pub fn init(
 
     if cfg.pop_endpoints.is_empty()
         && cfg.control_endpoint.is_none()
-        && cfg.pipe_api_token.as_deref().is_none_or(|s| s.trim().is_empty())
+        && cfg
+            .pipe_api_token
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
         && first_env(&["SOLANACDN_AGENT_API_TOKEN", "PIPE_API_KEY"]).is_none()
     {
-        warn!("solanacdn: no POP endpoints, control endpoint, or API token configured; skipping init");
+        warn!(
+            "solanacdn: no POP endpoints, control endpoint, or API token configured; skipping init"
+        );
         return;
     }
 
@@ -2333,7 +2435,9 @@ fn load_default_root_cert_store() -> Result<RootCertStore, SolanaCdnError> {
         if valid == 0 {
             warn!("solanacdn: no native root certs loaded; falling back to webpki-roots");
         }
-        roots.roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        roots
+            .roots
+            .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     }
 
     if roots.roots.is_empty() {
@@ -2596,10 +2700,15 @@ struct PipeApiSessionTokenResponse {
     expires_in: i64,
 }
 
-fn build_pipe_api_http_client(cfg: &PipeApiClientConfig) -> Result<reqwest::Client, SolanaCdnError> {
+fn build_pipe_api_http_client(
+    cfg: &PipeApiClientConfig,
+) -> Result<reqwest::Client, SolanaCdnError> {
     let mut builder = reqwest::Client::builder()
         .timeout(cfg.timeout.max(Duration::from_millis(250)))
-        .user_agent(format!("agave-validator-solanacdn/{}", env!("CARGO_PKG_VERSION")));
+        .user_agent(format!(
+            "agave-validator-solanacdn/{}",
+            env!("CARGO_PKG_VERSION")
+        ));
 
     if cfg.tls_insecure_skip_verify {
         builder = builder
@@ -2624,7 +2733,9 @@ fn build_pipe_api_http_client(cfg: &PipeApiClientConfig) -> Result<reqwest::Clie
         }
     }
 
-    builder.build().map_err(|e| SolanaCdnError::Tls(e.to_string()))
+    builder
+        .build()
+        .map_err(|e| SolanaCdnError::Tls(e.to_string()))
 }
 
 async fn pipe_api_verify(
@@ -2811,9 +2922,8 @@ fn spawn_pipe_pop_session_token_refresher(
                     Ok(parsed) => {
                         let expires_in_secs = (parsed.expires_in.max(1) as u64).clamp(5, 3600);
                         let refresh_in_secs = (expires_in_secs / 2).clamp(5, expires_in_secs);
-                        current_expires_at = Some(
-                            std::time::Instant::now() + Duration::from_secs(expires_in_secs),
-                        );
+                        current_expires_at =
+                            Some(std::time::Instant::now() + Duration::from_secs(expires_in_secs));
 
                         token_tx.send_replace(Some(parsed.session_token));
                         tokio::time::sleep(Duration::from_secs(refresh_in_secs)).await;
@@ -2821,9 +2931,7 @@ fn spawn_pipe_pop_session_token_refresher(
                     Err(e) => {
                         warn!("solanacdn: Pipe API pop session token refresh failed: {e}");
 
-                        if current_expires_at
-                            .is_some_and(|t| t <= std::time::Instant::now())
-                        {
+                        if current_expires_at.is_some_and(|t| t <= std::time::Instant::now()) {
                             token_tx.send_replace(None);
                         }
 
@@ -3037,10 +3145,7 @@ fn build_pipe_ingest_body(
                     break;
                 }
                 consumed_race_samples = (consumed_race_samples / 2).max(1);
-                if let Some(arr) = body
-                    .get_mut("race_samples")
-                    .and_then(|v| v.as_array_mut())
-                {
+                if let Some(arr) = body.get_mut("race_samples").and_then(|v| v.as_array_mut()) {
                     arr.truncate(consumed_race_samples);
                 }
             }
@@ -3188,16 +3293,19 @@ async fn write_len_prefixed<W: AsyncWrite + Unpin>(
     writer: &mut W,
     payload: &[u8],
 ) -> Result<(), SolanaCdnError> {
-    let len: u32 = payload.len().try_into().map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large")
-    })?;
+    let len: u32 = payload
+        .len()
+        .try_into()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame too large"))?;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
 }
 
-async fn read_len_prefixed<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, SolanaCdnError> {
+async fn read_len_prefixed<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Vec<u8>, SolanaCdnError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -3317,9 +3425,17 @@ impl ShredBatchDeduper {
 
 #[derive(Debug)]
 enum SessionEvent {
-    Connected { endpoint: SocketAddr, udp_enabled: bool },
-    Disconnected { endpoint: SocketAddr },
-    RttSample { endpoint: SocketAddr, rtt_ms: u64 },
+    Connected {
+        endpoint: SocketAddr,
+        udp_enabled: bool,
+    },
+    Disconnected {
+        endpoint: SocketAddr,
+    },
+    RttSample {
+        endpoint: SocketAddr,
+        rtt_ms: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3340,7 +3456,9 @@ struct ControlTlsClient {
     server_name: ServerName<'static>,
 }
 
-fn make_control_tls_client(cfg: &SolanaCdnConfig) -> Result<Option<ControlTlsClient>, SolanaCdnError> {
+fn make_control_tls_client(
+    cfg: &SolanaCdnConfig,
+) -> Result<Option<ControlTlsClient>, SolanaCdnError> {
     if cfg.control_endpoint.is_none() {
         return Ok(None);
     }
@@ -3376,9 +3494,7 @@ async fn fetch_pops_from_control(
 ) -> Result<Vec<SocketAddr>, SolanaCdnError> {
     let stream = TcpStream::connect(control_endpoint).await?;
     if let Err(e) = stream.set_nodelay(true) {
-        debug!(
-            "solanacdn: failed to set TCP_NODELAY for control {control_endpoint}: {e}"
-        );
+        debug!("solanacdn: failed to set TCP_NODELAY for control {control_endpoint}: {e}");
     }
 
     match tls {
@@ -3413,7 +3529,9 @@ where
     let bytes = read_len_prefixed(&mut reader).await?;
     let resp: ControlResponse = decode_envelope(&bytes)?;
     match resp {
-        ControlResponse::PopList(list) => Ok(list.pops.into_iter().map(|p| p.public_addr).collect()),
+        ControlResponse::PopList(list) => {
+            Ok(list.pops.into_iter().map(|p| p.public_addr).collect())
+        }
         ControlResponse::Error(err) => Err(SolanaCdnError::AuthFailed(format!(
             "control error: {}: {}",
             err.code, err.message
@@ -3480,21 +3598,27 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     };
     let mut out = String::new();
 
-    out.push_str("# HELP solanacdn_connected Whether SolanaCDN has an active publisher session (0/1)\n");
+    out.push_str(
+        "# HELP solanacdn_connected Whether SolanaCDN has an active publisher session (0/1)\n",
+    );
     out.push_str("# TYPE solanacdn_connected gauge\n");
     out.push_str(&format!(
         "solanacdn_connected {}\n",
         if status.connected { 1 } else { 0 }
     ));
 
-    out.push_str("# HELP solanacdn_publisher_switches_total Number of times the publisher POP changed\n");
+    out.push_str(
+        "# HELP solanacdn_publisher_switches_total Number of times the publisher POP changed\n",
+    );
     out.push_str("# TYPE solanacdn_publisher_switches_total counter\n");
     out.push_str(&format!(
         "solanacdn_publisher_switches_total {}\n",
         status.publisher_switches_total
     ));
 
-    out.push_str("# HELP solanacdn_publisher_present Whether a publisher endpoint is selected (0/1)\n");
+    out.push_str(
+        "# HELP solanacdn_publisher_present Whether a publisher endpoint is selected (0/1)\n",
+    );
     out.push_str("# TYPE solanacdn_publisher_present gauge\n");
     out.push_str(&format!(
         "solanacdn_publisher_present {}\n",
@@ -3514,7 +3638,10 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str("# TYPE solanacdn_pop_connected gauge\n");
     for ep in &status.connected_pops {
         let ep = prometheus_escape_label_value(ep);
-        out.push_str(&format!("solanacdn_pop_connected{{endpoint=\"{}\"}} 1\n", ep));
+        out.push_str(&format!(
+            "solanacdn_pop_connected{{endpoint=\"{}\"}} 1\n",
+            ep
+        ));
     }
 
     out.push_str("# HELP solanacdn_rx_shred_bytes_total Total shred bytes received from POPs\n");
@@ -3524,7 +3651,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.rx_shred_bytes_total
     ));
 
-    out.push_str("# HELP solanacdn_rx_shred_payloads_total Total shred payloads received from POPs\n");
+    out.push_str(
+        "# HELP solanacdn_rx_shred_payloads_total Total shred payloads received from POPs\n",
+    );
     out.push_str("# TYPE solanacdn_rx_shred_payloads_total counter\n");
     out.push_str(&format!(
         "solanacdn_rx_shred_payloads_total {}\n",
@@ -3538,7 +3667,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.rx_shred_payloads_per_sec
     ));
 
-    out.push_str("# HELP solanacdn_tunneled_vote_packets_total Total vote packets tunneled to POPs\n");
+    out.push_str(
+        "# HELP solanacdn_tunneled_vote_packets_total Total vote packets tunneled to POPs\n",
+    );
     out.push_str("# TYPE solanacdn_tunneled_vote_packets_total counter\n");
     out.push_str(&format!(
         "solanacdn_tunneled_vote_packets_total {}\n",
@@ -3594,7 +3725,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.tx_relay_dropped_fair_mode_total
     ));
 
-    out.push_str("# HELP solanacdn_fair_priority_lookups_total Total fair priority lookup attempts\n");
+    out.push_str(
+        "# HELP solanacdn_fair_priority_lookups_total Total fair priority lookup attempts\n",
+    );
     out.push_str("# TYPE solanacdn_fair_priority_lookups_total counter\n");
     out.push_str(&format!(
         "solanacdn_fair_priority_lookups_total {}\n",
@@ -3619,7 +3752,11 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str("# TYPE solanacdn_tx_fair_slashing_enforce_enabled gauge\n");
     out.push_str(&format!(
         "solanacdn_tx_fair_slashing_enforce_enabled {}\n",
-        if status.tx_fair_slashing_enforce { 1 } else { 0 }
+        if status.tx_fair_slashing_enforce {
+            1
+        } else {
+            0
+        }
     ));
 
     out.push_str("# HELP solanacdn_tx_fair_slashing_enforce_configured Whether fair slashing vote withholding is configured at startup (0/1)\n");
@@ -3645,7 +3782,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         enforce_override_state.label()
     ));
 
-    out.push_str("# HELP solanacdn_fair_commits_rx_total Number of fair ordering commit messages received\n");
+    out.push_str(
+        "# HELP solanacdn_fair_commits_rx_total Number of fair ordering commit messages received\n",
+    );
     out.push_str("# TYPE solanacdn_fair_commits_rx_total counter\n");
     out.push_str(&format!(
         "solanacdn_fair_commits_rx_total {}\n",
@@ -3715,7 +3854,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.fair_slashed_leaders_len
     ));
 
-    out.push_str("# HELP solanacdn_fair_ledger_audited_slots_entries Number of cached audited slots\n");
+    out.push_str(
+        "# HELP solanacdn_fair_ledger_audited_slots_entries Number of cached audited slots\n",
+    );
     out.push_str("# TYPE solanacdn_fair_ledger_audited_slots_entries gauge\n");
     out.push_str(&format!(
         "solanacdn_fair_ledger_audited_slots_entries {}\n",
@@ -3736,16 +3877,37 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         ));
     }
 
-    out.push_str("# HELP solanacdn_race_enabled Whether SolanaCDN race measurement is enabled (0/1)\n");
+    if let Some(slot) = status.last_accepted_shred_slot {
+        out.push_str("# HELP solanacdn_last_accepted_shred_slot Last Solana slot observed from SolanaCDN shreds accepted into the validator pipeline\n");
+        out.push_str("# TYPE solanacdn_last_accepted_shred_slot gauge\n");
+        out.push_str(&format!("solanacdn_last_accepted_shred_slot {}\n", slot));
+    }
+    if let Some(age_ms) = status.last_accepted_shred_age_ms {
+        out.push_str("# HELP solanacdn_last_accepted_shred_age_seconds Age of last SolanaCDN shred accepted into the validator pipeline\n");
+        out.push_str("# TYPE solanacdn_last_accepted_shred_age_seconds gauge\n");
+        out.push_str(&format!(
+            "solanacdn_last_accepted_shred_age_seconds {}\n",
+            (age_ms as f64) / 1000.0
+        ));
+    }
+
+    out.push_str(
+        "# HELP solanacdn_race_enabled Whether SolanaCDN race measurement is enabled (0/1)\n",
+    );
     out.push_str("# TYPE solanacdn_race_enabled gauge\n");
     out.push_str(&format!(
         "solanacdn_race_enabled {}\n",
         if race.enabled { 1 } else { 0 }
     ));
 
-    out.push_str("# HELP solanacdn_race_sample_bits Deterministic sampling bits (1/(2^bits) shreds)\n");
+    out.push_str(
+        "# HELP solanacdn_race_sample_bits Deterministic sampling bits (1/(2^bits) shreds)\n",
+    );
     out.push_str("# TYPE solanacdn_race_sample_bits gauge\n");
-    out.push_str(&format!("solanacdn_race_sample_bits {}\n", race.sample_bits));
+    out.push_str(&format!(
+        "solanacdn_race_sample_bits {}\n",
+        race.sample_bits
+    ));
 
     out.push_str("# HELP solanacdn_race_window_seconds Race matching window seconds\n");
     out.push_str("# TYPE solanacdn_race_window_seconds gauge\n");
@@ -3754,7 +3916,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         (race.window_ms as f64) / 1000.0
     ));
 
-    out.push_str("# HELP solanacdn_race_inflight Number of sampled shreds awaiting the other source\n");
+    out.push_str(
+        "# HELP solanacdn_race_inflight Number of sampled shreds awaiting the other source\n",
+    );
     out.push_str("# TYPE solanacdn_race_inflight gauge\n");
     out.push_str(&format!("solanacdn_race_inflight {}\n", race.inflight));
 
@@ -3765,7 +3929,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         race.pairs_total
     ));
 
-    out.push_str("# HELP solanacdn_race_wins_total Number of observed pairs where a source arrived first\n");
+    out.push_str(
+        "# HELP solanacdn_race_wins_total Number of observed pairs where a source arrived first\n",
+    );
     out.push_str("# TYPE solanacdn_race_wins_total counter\n");
     out.push_str(&format!(
         "solanacdn_race_wins_total{{winner=\"solanacdn\"}} {}\n",
@@ -3780,7 +3946,9 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str("# TYPE solanacdn_race_ties_total counter\n");
     out.push_str(&format!("solanacdn_race_ties_total {}\n", race.ties_total));
 
-    out.push_str("# HELP solanacdn_race_lead_seconds Lead time where winner arrived before loser\n");
+    out.push_str(
+        "# HELP solanacdn_race_lead_seconds Lead time where winner arrived before loser\n",
+    );
     out.push_str("# TYPE solanacdn_race_lead_seconds histogram\n");
     if let Some(hist) = race.histogram {
         for (winner, buckets) in hist.lead_bucket_counts_by_winner {
@@ -3840,14 +4008,8 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
                 .map(|(_, v)| *v)
                 .unwrap_or(0);
             for (q_label, q) in [("0.50", 0.50), ("0.95", 0.95), ("0.99", 0.99)] {
-                let value = histogram_quantile_seconds(
-                    q,
-                    0,
-                    &lead_bounds_ms,
-                    &buckets[..],
-                    count,
-                )
-                .unwrap_or(0.0);
+                let value = histogram_quantile_seconds(q, 0, &lead_bounds_ms, &buckets[..], count)
+                    .unwrap_or(0.0);
                 out.push_str(&format!(
                     "solanacdn_race_lead_seconds_quantile{{winner=\"{}\",quantile=\"{}\"}} {:.6}\n",
                     winner_label, q_label, value
@@ -4011,7 +4173,12 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out
 }
 
-async fn write_http_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+async fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) {
     let headers = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -4138,7 +4305,9 @@ async fn run(
             cfg.pipe_api_base_url = v;
         }
     }
-    if cfg.pipe_api_base_url.trim().is_empty() || cfg.pipe_api_base_url.trim() == "https://api.pipedev.network" {
+    if cfg.pipe_api_base_url.trim().is_empty()
+        || cfg.pipe_api_base_url.trim() == "https://api.pipedev.network"
+    {
         if let Some(v) = read_env_file_value("/etc/solanacdn/agent.env", "SOLANACDN_AGENT_API_BASE")
         {
             cfg.pipe_api_base_url = v;
@@ -4146,10 +4315,18 @@ async fn run(
     }
     cfg.pipe_api_base_url = normalize_base_url(&cfg.pipe_api_base_url);
 
-    if cfg.pipe_api_token.as_deref().is_none_or(|s| s.trim().is_empty()) {
+    if cfg
+        .pipe_api_token
+        .as_deref()
+        .is_none_or(|s| s.trim().is_empty())
+    {
         cfg.pipe_api_token = first_env(&["SOLANACDN_AGENT_API_TOKEN", "PIPE_API_KEY"]);
     }
-    if cfg.pipe_api_token.as_deref().is_none_or(|s| s.trim().is_empty()) {
+    if cfg
+        .pipe_api_token
+        .as_deref()
+        .is_none_or(|s| s.trim().is_empty())
+    {
         cfg.pipe_api_token =
             read_env_file_value("/etc/solanacdn/agent.env", "SOLANACDN_AGENT_API_TOKEN");
     }
@@ -4352,14 +4529,24 @@ async fn manage_pop_sessions(
                 let publisher = *publisher_tx.borrow();
                 let mut pops: Vec<SocketAddr> = connected.keys().copied().collect();
                 pops.sort();
+                let status = handle.status_snapshot();
                 info!(
-                    "solanacdn: status publisher={:?} connected_pops={} pops={:?} published_shred_batches_total={} pushed_shred_batches_total={} tunneled_vote_packets_total={} rx_vote_packets_total={} rx_tx_packets_total={}",
+                    "solanacdn: status publisher={:?} connected_pops={} pops={:?} tvu_shred_ingest_mode={:?} tvu_shred_stale={:?} tvu_shred_stale_for_ms={:?} last_shred_slot={:?} last_shred_age_ms={:?} last_accepted_shred_slot={:?} last_accepted_shred_age_ms={:?} rx_shred_payloads_total={} rx_shred_payloads_per_sec={:.1} published_shred_batches_total={} pushed_shred_batches_total={} tunneled_vote_packets_total={} rx_vote_packets_total={} rx_tx_packets_total={}",
                     publisher,
                     pops.len(),
                     pops,
+                    status.tvu_shred_ingest_mode,
+                    status.tvu_shred_stale,
+                    status.tvu_shred_stale_for_ms,
+                    status.last_shred_slot,
+                    status.last_shred_age_ms,
+                    status.last_accepted_shred_slot,
+                    status.last_accepted_shred_age_ms,
+                    status.rx_shred_payloads_total,
+                    status.rx_shred_payloads_per_sec,
                     handle.published_shred_batches.load(Ordering::Relaxed),
                     handle.pushed_shred_batches.load(Ordering::Relaxed),
-                    handle.tunneled_vote_packets.load(Ordering::Relaxed),
+                    status.tunneled_vote_packets_total,
                     handle.rx_vote_packets.load(Ordering::Relaxed),
                     handle.rx_tx_packets.load(Ordering::Relaxed),
                 );
@@ -4457,8 +4644,13 @@ async fn manage_pop_sessions(
         }
 
         // Update publisher uplink on the global handle.
-        let uplink = new_publisher
-            .and_then(|ep| sessions.get(&ep).map(|s| Arc::new(SessionUplink { tx: s.uplink.clone() })));
+        let uplink = new_publisher.and_then(|ep| {
+            sessions.get(&ep).map(|s| {
+                Arc::new(SessionUplink {
+                    tx: s.uplink.clone(),
+                })
+            })
+        });
         handle.set_publisher_uplink(new_publisher, uplink);
     }
 
@@ -4734,7 +4926,10 @@ async fn run_pop_session(
 
     handle.note_pop_endpoints(&[endpoint]);
 
-    let _ = session_events_tx.send(SessionEvent::Connected { endpoint, udp_enabled });
+    let _ = session_events_tx.send(SessionEvent::Connected {
+        endpoint,
+        udp_enabled,
+    });
 
     let udp_token = auth_ok.udp_token;
     let pop_shreds_addr = SocketAddr::new(endpoint.ip(), auth_ok.udp_shreds_port);
@@ -4775,11 +4970,7 @@ async fn run_pop_session(
         .open_bi()
         .await
         .map_err(|e| SolanaCdnError::QuicConnect(format!("open_bi(votes): {e}")))?;
-    write_agent_msg(
-        &mut votes_send,
-        &AgentToPop::StreamHello(StreamKind::Votes),
-    )
-    .await?;
+    write_agent_msg(&mut votes_send, &AgentToPop::StreamHello(StreamKind::Votes)).await?;
 
     let udp_inject_tpu = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     udp_inject_tpu.connect(inject_tpu).await?;
@@ -4835,7 +5026,9 @@ async fn run_pop_session(
                 }
                 last_sent = Some(token.clone());
                 if ctrl_out_tx
-                    .send(AgentToPop::AuthRefresh(AuthRefresh { session_token: token }))
+                    .send(AgentToPop::AuthRefresh(AuthRefresh {
+                        session_token: token,
+                    }))
                     .await
                     .is_err()
                 {
@@ -5107,8 +5300,7 @@ async fn run_pop_session(
                             }
                             std::collections::hash_map::Entry::Vacant(entry) => {
                                 let dec =
-                                    match solanacdn_protocol::fec::RaptorqDecoder::new(chunk.oti)
-                                    {
+                                    match solanacdn_protocol::fec::RaptorqDecoder::new(chunk.oti) {
                                         Ok(v) => v,
                                         Err(_) => continue,
                                     };
@@ -5354,9 +5546,7 @@ async fn handle_pop_msg(
             if !shred_deduper.insert_if_new(batch.batch_id) {
                 return;
             }
-            handle
-                .pushed_shred_batches
-                .fetch_add(1, Ordering::Relaxed);
+            handle.pushed_shred_batches.fetch_add(1, Ordering::Relaxed);
             let mut rx_bytes: usize = 0;
             let mut rx_shreds: u64 = 0;
             let mut max_slot: Option<u64> = None;
@@ -5486,10 +5676,13 @@ async fn handle_pop_msg(
                 for tx in txs.iter() {
                     if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                         handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
-                        handle.tx_fair_batch_injected.fetch_add(1, Ordering::Relaxed);
+                        handle
+                            .tx_fair_batch_injected
+                            .fetch_add(1, Ordering::Relaxed);
                     } else {
                         handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
-                        handle.tx_fair_batch_inject_failed
+                        handle
+                            .tx_fair_batch_inject_failed
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -5528,9 +5721,7 @@ async fn handle_pop_msg(
                                 commit.receipt_commit = Some(receipt_commit);
                             }
                         }
-                        let _ = ctrl_out_tx
-                            .send(AgentToPop::FairBatchCommit(commit))
-                            .await;
+                        let _ = ctrl_out_tx.send(AgentToPop::FairBatchCommit(commit)).await;
                     }
                     Err(e) => {
                         debug!("solanacdn: failed to sign fair batch commit: {e}");
@@ -5543,10 +5734,13 @@ async fn handle_pop_msg(
             for tx in txs.iter() {
                 if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                     handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
-                    handle.tx_fair_batch_injected.fetch_add(1, Ordering::Relaxed);
+                    handle
+                        .tx_fair_batch_injected
+                        .fetch_add(1, Ordering::Relaxed);
                 } else {
                     handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
-                    handle.tx_fair_batch_inject_failed
+                    handle
+                        .tx_fair_batch_inject_failed
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -5557,9 +5751,7 @@ async fn handle_pop_msg(
                 return;
             }
             if let Err(e) = commit.verify() {
-                handle
-                    .fair_commits_invalid
-                    .fetch_add(1, Ordering::Relaxed);
+                handle.fair_commits_invalid.fetch_add(1, Ordering::Relaxed);
                 debug!("solanacdn: invalid fair commit from {endpoint}: {e}");
                 return;
             }
@@ -5720,8 +5912,14 @@ mod tests {
         assert!(handle.should_ingest_tvu_shred(pop_ip));
         assert!(handle.should_ingest_tvu_shred(p2p_ip));
 
-        // Once we observe POP shreds recently, gate P2P again.
+        // Observing POP delivery is not enough. Shreds must be accepted into the validator
+        // pipeline (pass discard checks) for SolanaCDN to be considered healthy.
         handle.note_pop_delivered_shred_with_slot(123, Some(10));
+        assert!(handle.should_ingest_tvu_shred(pop_ip));
+        assert!(handle.should_ingest_tvu_shred(p2p_ip));
+
+        // Once we accept SolanaCDN shreds recently, gate P2P again.
+        handle.note_solanacdn_accepted_shred_with_slot(Some(10));
         assert!(handle.should_ingest_tvu_shred(pop_ip));
         assert!(!handle.should_ingest_tvu_shred(p2p_ip));
     }
@@ -5778,10 +5976,7 @@ mod tests {
             ),
             recent_blockhash,
         );
-        let sig_a: [u8; 64] = tx_a.signatures[0]
-            .as_ref()
-            .try_into()
-            .expect("sig bytes");
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
 
         let tx_b_signer = Keypair::new();
         let tx_b = Transaction::new(
@@ -5792,10 +5987,7 @@ mod tests {
             ),
             recent_blockhash,
         );
-        let sig_b: [u8; 64] = tx_b.signatures[0]
-            .as_ref()
-            .try_into()
-            .expect("sig bytes");
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
 
         let commit_txs = build_fair_ledger_commit_memo_txs(
             &auth,
@@ -5886,6 +6078,7 @@ mod tests {
         let handle = SolanaCdnHandle::new(cfg);
 
         handle.note_pop_delivered_shred_with_slot(1234, Some(42));
+        handle.note_solanacdn_accepted_shred_with_slot(Some(42));
         let text = format_prometheus_metrics(&handle);
 
         assert!(text.contains("solanacdn_connected "));
@@ -5917,6 +6110,8 @@ mod tests {
         assert!(text.contains("solanacdn_fair_ledger_audited_slots_entries "));
         assert!(text.contains("solanacdn_last_shred_slot 42"));
         assert!(text.contains("solanacdn_last_shred_age_seconds "));
+        assert!(text.contains("solanacdn_last_accepted_shred_slot 42"));
+        assert!(text.contains("solanacdn_last_accepted_shred_age_seconds "));
         assert!(text.contains("solanacdn_race_enabled "));
         assert!(text.contains("solanacdn_race_pairs_total "));
         assert!(text.contains("solanacdn_race_wins_total{winner=\"solanacdn\"}"));
@@ -6300,10 +6495,7 @@ mod tests {
             let mut got_register_validator_ports = false;
             let mut got_subscribe = false;
 
-            while agent_shreds_port.is_none()
-                || !got_register_validator_ports
-                || !got_subscribe
-            {
+            while agent_shreds_port.is_none() || !got_register_validator_ports || !got_subscribe {
                 match read_agent_msg(&mut ctrl_recv).await {
                     AgentToPop::RegisterUdpPorts { shreds_port, .. } => {
                         agent_shreds_port = Some(shreds_port);
@@ -6327,11 +6519,8 @@ mod tests {
 
             // Best-effort drain of the shreds/votes StreamHello messages.
             for _ in 0..2 {
-                if let Ok(Ok((mut _send, mut recv))) = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    conn.accept_bi(),
-                )
-                .await
+                if let Ok(Ok((mut _send, mut recv))) =
+                    tokio::time::timeout(Duration::from_secs(1), conn.accept_bi()).await
                 {
                     let _ = read_agent_msg(&mut recv).await;
                 }
@@ -6464,7 +6653,10 @@ mod tests {
 
             while !got_register_udp_ports || !got_register_validator_ports || !got_subscribe {
                 match read_agent_msg(&mut ctrl_recv).await {
-                    AgentToPop::RegisterUdpPorts { shreds_port, votes_port } => {
+                    AgentToPop::RegisterUdpPorts {
+                        shreds_port,
+                        votes_port,
+                    } => {
                         assert_ne!(shreds_port, 0);
                         assert_ne!(votes_port, 0);
                         got_register_udp_ports = true;
@@ -6488,11 +6680,8 @@ mod tests {
 
             // Best-effort drain of the shreds/votes StreamHello messages.
             for _ in 0..2 {
-                if let Ok(Ok((mut _send, mut recv))) = tokio::time::timeout(
-                    Duration::from_secs(1),
-                    conn.accept_bi(),
-                )
-                .await
+                if let Ok(Ok((mut _send, mut recv))) =
+                    tokio::time::timeout(Duration::from_secs(1), conn.accept_bi()).await
                 {
                     let _ = read_agent_msg(&mut recv).await;
                 }
@@ -6501,13 +6690,11 @@ mod tests {
             let _ = ready_tx.send(());
 
             let mut buf = [0u8; 2048];
-            let (len, _peer) = tokio::time::timeout(
-                Duration::from_secs(5),
-                pop_udp_votes.recv_from(&mut buf),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+            let (len, _peer) =
+                tokio::time::timeout(Duration::from_secs(5), pop_udp_votes.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
             let bytes = &buf[..len];
             let (token, msg): ([u8; solanacdn_protocol::udp::UDP_TOKEN_LEN], AgentToPop) =
                 solanacdn_protocol::udp::decode_udp_datagram(bytes).unwrap();
@@ -6629,11 +6816,8 @@ mod tests {
             .await;
 
             for _ in 0..2 {
-                if let Ok(Ok((mut _send, mut recv))) = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    conn.accept_bi(),
-                )
-                .await
+                if let Ok(Ok((mut _send, mut recv))) =
+                    tokio::time::timeout(Duration::from_secs(2), conn.accept_bi()).await
                 {
                     let _ = tokio::time::timeout(Duration::from_secs(2), read_agent_msg(&mut recv))
                         .await;
@@ -6641,8 +6825,11 @@ mod tests {
             }
 
             while !pop_done_server.load(Ordering::Relaxed) {
-                match tokio::time::timeout(Duration::from_millis(50), read_len_prefixed(&mut ctrl_recv))
-                    .await
+                match tokio::time::timeout(
+                    Duration::from_millis(50),
+                    read_len_prefixed(&mut ctrl_recv),
+                )
+                .await
                 {
                     Ok(Ok(bytes)) => {
                         let _ = decode_envelope::<AgentToPop>(&bytes);
@@ -6740,9 +6927,17 @@ mod tests {
 
         let run_exit = Arc::clone(&exit);
         let run_task = tokio::spawn(async move {
-            run(cfg, identity_keypair, run_exit, handle, inject_tpu, inject_tvu, inject_gossip)
-                .await
-                .unwrap();
+            run(
+                cfg,
+                identity_keypair,
+                run_exit,
+                handle,
+                inject_tpu,
+                inject_tvu,
+                inject_gossip,
+            )
+            .await
+            .unwrap();
         });
 
         let start = tokio::time::Instant::now();

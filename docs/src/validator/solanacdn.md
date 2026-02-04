@@ -29,7 +29,8 @@ If you have a Pipe API key, you can enable SolanaCDN without specifying POP endp
 - Set `PIPE_API_KEY` (or `SOLANACDN_AGENT_API_TOKEN`) in the environment.
 - Run the validator with your normal args, plus:
   - `--solanacdn-api-token <TOKEN>` (optional if using env)
-  - (optional) `--solanacdn-only` to prefer SolanaCDN shreds when connected
+  - (optional) `--solanacdn-only` to ingest only SolanaCDN-sourced shreds when connected (fallback to P2P when disconnected)
+  - (optional) `--solanacdn-hybrid` to prefer SolanaCDN shreds when healthy, but fall back to P2P if SolanaCDN stalls while connected (`--solanacdn-hybrid-stale-ms` controls the stall threshold)
 
 The validator verifies the API key via `POST /v1/solanacdn-agent/verify` and uses the returned POP list.
 
@@ -90,6 +91,7 @@ To restore the startup configuration:
 
 - Metrics + status: `--solanacdn-metrics-addr HOST:PORT` exposes Prometheus at `/metrics` and JSON status at `/solanacdn/status`.
 - Admin RPC: `solanaCdnStatus` returns the same `SolanaCdnStatus` JSON (includes fair/slashing counters and enable flags).
+- In `--solanacdn-hybrid` mode, `tvu_shred_stale` / `tvu_shred_stale_for_ms` reflect time since the last shred accepted into the validator pipeline (compare with `last_shred_*` to diagnose delivery vs discard).
 - Race metrics (SolanaCDN vs gossip): enabled by default; disable with `--solanacdn-race=false`. Tune via `--solanacdn-race-sample-bits` and `--solanacdn-race-window-ms` (compatible with `--solanacdn-only` / `--solanacdn-hybrid`; does not change shred ingest mode).
 - Fair Prometheus counters include fair-batch tx receive/inject totals (`solanacdn_tx_fair_batch_received_total`, `solanacdn_tx_fair_batch_injected_total`) and fair-priority lookups/hits (`solanacdn_fair_priority_lookups_total`, `solanacdn_fair_priority_hits_total`).
 - Transaction hygiene counters include dedup drops (`solanacdn_tx_deduped_packets_total`) and relay drops in fair mode (`solanacdn_tx_relay_dropped_fair_mode_total`).
