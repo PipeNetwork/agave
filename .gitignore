@@ -1,5 +1,7 @@
 farf/
 target/
+.cargo-target-solanacdn/
+.tmp_target/
 /solana-release/
 /solana-release.tar.bz2
 /solana-metrics/
