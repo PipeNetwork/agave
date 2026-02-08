@@ -1060,4 +1060,322 @@ mod tests {
             .collect_vec();
         assert_eq!(message_hashes, vec![&tx1_hash]);
     }
+
+    #[test]
+    fn test_schedule_consume_fair_ordering_priority_override_reverses_order() {
+        let (mut test_frame, mut scheduler_controller) =
+            create_test_frame(1, |receiver, bank_forks| {
+                TransactionViewReceiveAndBuffer::new(receiver, bank_forks, true)
+            });
+        let TestFrame {
+            bank,
+            mint_keypair,
+            shared_leader_state,
+            banking_packet_sender,
+            consume_work_receivers,
+            ..
+        } = &mut test_frame;
+
+        shared_leader_state.store(Arc::new(LeaderState::new(
+            Some(bank.clone()),
+            bank.tick_height(),
+            None,
+            None,
+        )));
+
+        // Create 3 txs with increasing fee priority: 1000, 2000, 3000.
+        // Without fair ordering the expected order would be tx3, tx2, tx1.
+        let tx1 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            1000,
+            bank.last_blockhash(),
+        );
+        let tx2 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            2000,
+            bank.last_blockhash(),
+        );
+        let tx3 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            3000,
+            bank.last_blockhash(),
+        );
+        let tx1_hash = tx1.message().hash();
+        let tx2_hash = tx2.message().hash();
+        let tx3_hash = tx3.message().hash();
+
+        // Fair priorities reverse the fee-based order:
+        //   tx1 (fee=1000) gets highest fair priority
+        //   tx2 (fee=2000) gets middle fair priority
+        //   tx3 (fee=3000) gets lowest fair priority
+        let sig1: [u8; 64] = tx1.signatures[0].as_ref().try_into().unwrap();
+        let sig2: [u8; 64] = tx2.signatures[0].as_ref().try_into().unwrap();
+        let sig3: [u8; 64] = tx3.signatures[0].as_ref().try_into().unwrap();
+        crate::solanacdn::insert_fair_priority(sig1, u64::MAX - 1);
+        crate::solanacdn::insert_fair_priority(sig2, u64::MAX - 2);
+        crate::solanacdn::insert_fair_priority(sig3, u64::MAX - 3);
+
+        let expected = vec![&tx1_hash, &tx2_hash, &tx3_hash];
+
+        let txs = vec![tx1, tx2, tx3];
+        banking_packet_sender
+            .send(to_banking_packet_batch(&txs))
+            .unwrap();
+
+        test_receive_then_schedule(&mut scheduler_controller);
+        let consume_work = consume_work_receivers[0].try_recv().unwrap();
+        assert_eq!(consume_work.ids.len(), 3);
+        let message_hashes = consume_work
+            .transactions
+            .iter()
+            .map(|tx| tx.message_hash())
+            .collect_vec();
+        assert_eq!(message_hashes, expected);
+
+        // cleanup fair priorities
+        crate::solanacdn::fair_priorities().remove(&sig1);
+        crate::solanacdn::fair_priorities().remove(&sig2);
+        crate::solanacdn::fair_priorities().remove(&sig3);
+    }
+
+    #[test]
+    fn test_schedule_consume_fair_ordering_partial_override() {
+        let (mut test_frame, mut scheduler_controller) =
+            create_test_frame(1, |receiver, bank_forks| {
+                TransactionViewReceiveAndBuffer::new(receiver, bank_forks, true)
+            });
+        let TestFrame {
+            bank,
+            mint_keypair,
+            shared_leader_state,
+            banking_packet_sender,
+            consume_work_receivers,
+            ..
+        } = &mut test_frame;
+
+        shared_leader_state.store(Arc::new(LeaderState::new(
+            Some(bank.clone()),
+            bank.tick_height(),
+            None,
+            None,
+        )));
+
+        // tx1 fee=1000, tx2 fee=2000, tx3 fee=3000
+        // Only tx1 gets a fair priority override (highest).
+        // tx2 and tx3 keep fee-based ordering among themselves.
+        let tx1 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            1000,
+            bank.last_blockhash(),
+        );
+        let tx2 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            2000,
+            bank.last_blockhash(),
+        );
+        let tx3 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            3000,
+            bank.last_blockhash(),
+        );
+        let tx1_hash = tx1.message().hash();
+        let tx2_hash = tx2.message().hash();
+        let tx3_hash = tx3.message().hash();
+
+        // Only tx1 gets a fair priority that puts it at the top.
+        let sig1: [u8; 64] = tx1.signatures[0].as_ref().try_into().unwrap();
+        crate::solanacdn::insert_fair_priority(sig1, u64::MAX - 1);
+
+        // Expected: tx1 first (fair override), then tx3, tx2 (fee-based order).
+        let expected = vec![&tx1_hash, &tx3_hash, &tx2_hash];
+
+        let txs = vec![tx1, tx2, tx3];
+        banking_packet_sender
+            .send(to_banking_packet_batch(&txs))
+            .unwrap();
+
+        test_receive_then_schedule(&mut scheduler_controller);
+        let consume_work = consume_work_receivers[0].try_recv().unwrap();
+        assert_eq!(consume_work.ids.len(), 3);
+        let message_hashes = consume_work
+            .transactions
+            .iter()
+            .map(|tx| tx.message_hash())
+            .collect_vec();
+        assert_eq!(message_hashes, expected);
+
+        // cleanup
+        crate::solanacdn::fair_priorities().remove(&sig1);
+    }
+
+    #[test]
+    fn test_schedule_consume_fair_ordering_with_conflicts() {
+        let (mut test_frame, mut scheduler_controller) =
+            create_test_frame(1, |receiver, bank_forks| {
+                TransactionViewReceiveAndBuffer::new(receiver, bank_forks, true)
+            });
+        let TestFrame {
+            bank,
+            mint_keypair,
+            shared_leader_state,
+            banking_packet_sender,
+            consume_work_receivers,
+            ..
+        } = &mut test_frame;
+
+        shared_leader_state.store(Arc::new(LeaderState::new(
+            Some(bank.clone()),
+            bank.tick_height(),
+            None,
+            None,
+        )));
+
+        // Two txs that conflict (same destination account).
+        let dest = Pubkey::new_unique();
+        let tx1 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &dest,
+            1,
+            1000,
+            bank.last_blockhash(),
+        );
+        let tx2 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &dest,
+            1,
+            2000,
+            bank.last_blockhash(),
+        );
+        let tx1_hash = tx1.message().hash();
+        let tx2_hash = tx2.message().hash();
+
+        // Fair priorities: tx1 higher than tx2.
+        let sig1: [u8; 64] = tx1.signatures[0].as_ref().try_into().unwrap();
+        let sig2: [u8; 64] = tx2.signatures[0].as_ref().try_into().unwrap();
+        crate::solanacdn::insert_fair_priority(sig1, u64::MAX - 1);
+        crate::solanacdn::insert_fair_priority(sig2, u64::MAX - 2);
+
+        let txs = vec![tx1, tx2];
+        banking_packet_sender
+            .send(to_banking_packet_batch(&txs))
+            .unwrap();
+
+        // Conflicting txs should be in separate batches, ordered by fair priority.
+        test_receive_then_schedule(&mut scheduler_controller);
+        let consume_works = (0..2)
+            .map(|_| consume_work_receivers[0].try_recv().unwrap())
+            .collect_vec();
+
+        let num_txs_per_batch = consume_works
+            .iter()
+            .map(|cw| cw.ids.len())
+            .collect_vec();
+        let message_hashes = consume_works
+            .iter()
+            .flat_map(|cw| cw.transactions.iter().map(|tx| tx.message_hash()))
+            .collect_vec();
+        assert_eq!(num_txs_per_batch, vec![1, 1]);
+        assert_eq!(message_hashes, vec![&tx1_hash, &tx2_hash]);
+
+        // cleanup
+        crate::solanacdn::fair_priorities().remove(&sig1);
+        crate::solanacdn::fair_priorities().remove(&sig2);
+    }
+
+    #[test]
+    fn test_schedule_consume_fair_ordering_disabled_ignores_fair_priority() {
+        // Create scheduler with fair_ordering disabled (the default).
+        let (mut test_frame, mut scheduler_controller) =
+            create_test_frame(1, test_create_transaction_view_receive_and_buffer);
+        let TestFrame {
+            bank,
+            mint_keypair,
+            shared_leader_state,
+            banking_packet_sender,
+            consume_work_receivers,
+            ..
+        } = &mut test_frame;
+
+        shared_leader_state.store(Arc::new(LeaderState::new(
+            Some(bank.clone()),
+            bank.tick_height(),
+            None,
+            None,
+        )));
+
+        let tx1 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            1000,
+            bank.last_blockhash(),
+        );
+        let tx2 = create_and_fund_prioritized_transfer(
+            bank,
+            mint_keypair,
+            &Keypair::new(),
+            &Pubkey::new_unique(),
+            1,
+            2000,
+            bank.last_blockhash(),
+        );
+        let tx1_hash = tx1.message().hash();
+        let tx2_hash = tx2.message().hash();
+
+        // Insert fair priorities that would reverse the order if enabled.
+        let sig1: [u8; 64] = tx1.signatures[0].as_ref().try_into().unwrap();
+        let sig2: [u8; 64] = tx2.signatures[0].as_ref().try_into().unwrap();
+        crate::solanacdn::insert_fair_priority(sig1, u64::MAX - 1);
+        crate::solanacdn::insert_fair_priority(sig2, u64::MAX - 2);
+
+        let txs = vec![tx1, tx2];
+        banking_packet_sender
+            .send(to_banking_packet_batch(&txs))
+            .unwrap();
+
+        test_receive_then_schedule(&mut scheduler_controller);
+        let consume_work = consume_work_receivers[0].try_recv().unwrap();
+        assert_eq!(consume_work.ids.len(), 2);
+        let message_hashes = consume_work
+            .transactions
+            .iter()
+            .map(|tx| tx.message_hash())
+            .collect_vec();
+        // Fee-based order: tx2 (higher fee) first, then tx1.
+        assert_eq!(message_hashes, vec![&tx2_hash, &tx1_hash]);
+
+        // cleanup
+        crate::solanacdn::fair_priorities().remove(&sig1);
+        crate::solanacdn::fair_priorities().remove(&sig2);
+    }
 }

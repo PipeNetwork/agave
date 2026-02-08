@@ -125,9 +125,9 @@ impl TxFairSlashingEnforceOverride {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct FairPriorityEntry {
-    priority: u64,
-    expires_at_ms: u64,
+pub(crate) struct FairPriorityEntry {
+    pub(crate) priority: u64,
+    pub(crate) expires_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,7 +218,7 @@ static FAIR_BATCH_DROPPED_INVALID_WIRE_TX_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAIR_BATCH_DROPPED_TOO_MANY_TXS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
-fn fair_priorities() -> &'static DashMap<[u8; 64], FairPriorityEntry> {
+pub(crate) fn fair_priorities() -> &'static DashMap<[u8; 64], FairPriorityEntry> {
     FAIR_PRIORITIES.get_or_init(DashMap::new)
 }
 
@@ -6889,6 +6889,272 @@ mod tests {
         assert_eq!(status.race_last_winner.as_deref(), Some("solanacdn"));
         assert_eq!(status.race_last_lead_ms, Some(100));
         assert_eq!(status.race_last_shred_slot, Some(100));
+    }
+
+    #[test]
+    fn fair_priority_insert_and_lookup() {
+        let sig: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xF1;
+            s[1] = 0x01;
+            s
+        };
+        insert_fair_priority(sig, 42);
+        assert_eq!(fair_priority_for_tx_signature(&sig), Some(42));
+
+        let unknown: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xF1;
+            s[1] = 0x02;
+            s
+        };
+        assert_eq!(fair_priority_for_tx_signature(&unknown), None);
+
+        // cleanup
+        fair_priorities().remove(&sig);
+    }
+
+    #[test]
+    fn fair_priority_expires_after_ttl() {
+        let sig: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xF2;
+            s[1] = 0x01;
+            s
+        };
+        // Insert with an already-expired timestamp directly into the map.
+        fair_priorities().insert(
+            sig,
+            FairPriorityEntry {
+                priority: 99,
+                expires_at_ms: 1, // expired long ago
+            },
+        );
+
+        // Lookup should detect the expiry and return None.
+        assert_eq!(fair_priority_for_tx_signature(&sig), None);
+
+        // The expired entry should have been removed from the map.
+        assert!(!fair_priorities().contains_key(&sig));
+    }
+
+    #[test]
+    fn fair_priority_prune_removes_expired() {
+        let map = fair_priorities();
+
+        let mut live_sigs: Vec<[u8; 64]> = Vec::new();
+        let mut expired_sigs: Vec<[u8; 64]> = Vec::new();
+
+        for i in 0u8..5 {
+            let mut sig = [0u8; 64];
+            sig[0] = 0xF3;
+            sig[1] = i;
+            map.insert(
+                sig,
+                FairPriorityEntry {
+                    priority: i as u64,
+                    expires_at_ms: 1000, // will be expired at now=2000
+                },
+            );
+            expired_sigs.push(sig);
+        }
+        for i in 5u8..10 {
+            let mut sig = [0u8; 64];
+            sig[0] = 0xF3;
+            sig[1] = i;
+            map.insert(
+                sig,
+                FairPriorityEntry {
+                    priority: i as u64,
+                    expires_at_ms: 9999, // still live at now=2000
+                },
+            );
+            live_sigs.push(sig);
+        }
+
+        prune_expired_fair_priorities(map, 2000);
+
+        for sig in &expired_sigs {
+            assert!(!map.contains_key(sig), "expired entry should be pruned");
+        }
+        for sig in &live_sigs {
+            assert!(map.contains_key(sig), "live entry should remain");
+        }
+
+        // cleanup
+        for sig in &live_sigs {
+            map.remove(sig);
+        }
+    }
+
+    #[test]
+    fn fair_priority_overflow_clears_map() {
+        let map = fair_priorities();
+
+        // Insert FAIR_PRIORITY_MAX_ENTRIES + 1 entries so the map is over capacity.
+        let mut overflow_sigs: Vec<[u8; 64]> = Vec::new();
+        for i in 0..=(FAIR_PRIORITY_MAX_ENTRIES as u64) {
+            let mut sig = [0u8; 64];
+            sig[0] = 0xF4;
+            // spread the index across bytes to avoid collisions
+            sig[1..9].copy_from_slice(&i.to_le_bytes());
+            map.insert(
+                sig,
+                FairPriorityEntry {
+                    priority: i,
+                    expires_at_ms: now_ms().saturating_add(60_000),
+                },
+            );
+            overflow_sigs.push(sig);
+        }
+        assert!(map.len() > FAIR_PRIORITY_MAX_ENTRIES);
+
+        // Inserting via insert_fair_priority should trigger overflow → clear.
+        let trigger_sig: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xF4;
+            s[63] = 0xFF;
+            s
+        };
+        insert_fair_priority(trigger_sig, 777);
+
+        // The map was cleared and only the new entry exists.
+        assert!(map.len() <= 1, "map should be cleared on overflow, len={}", map.len());
+        assert_eq!(
+            map.get(&trigger_sig).map(|e| e.priority),
+            Some(777),
+            "newly inserted entry must exist"
+        );
+
+        // cleanup
+        map.remove(&trigger_sig);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_batch_deduplicates_signatures() {
+        let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_ordering = true;
+        cfg.tx_fair_slashing = false;
+        let handle = SolanaCdnHandle::new(cfg.clone());
+
+        let auth = AuthContext::new(Arc::new(Keypair::new())).unwrap();
+
+        let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<AgentToPop>(8);
+        let (_publisher_tx, mut publisher_rx) = watch::channel::<Option<SocketAddr>>(None);
+        let shred_deduper = ShredBatchDeduper::new(64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let last_hb_sent_ms = AtomicU64::new(0);
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let udp_inject_tpu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tpu.connect(sink_addr).await.unwrap();
+        let udp_inject_tvu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tvu.connect(sink_addr).await.unwrap();
+        let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_gossip.connect(sink_addr).await.unwrap();
+
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+
+        let tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let bytes = bincode::serialize(&VersionedTransaction::from(tx)).unwrap();
+        let fair_tx = fair_tx_from_wire_bytes(bytes);
+
+        // Send the same tx 3 times in one batch — only 1 should be accepted.
+        let batch = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-dedup-test".to_string(),
+            batch_id: 99,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs: vec![fair_tx.clone(), fair_tx.clone(), fair_tx],
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch),
+        )
+        .await;
+
+        let commit = match tokio::time::timeout(Duration::from_secs(10), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        assert_eq!(
+            commit.payload.tx_sigs.len(),
+            1,
+            "duplicate sigs within a batch should be deduped"
+        );
+    }
+
+    #[test]
+    fn fair_merkle_root_deterministic() {
+        let sig_a: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xAA;
+            s
+        };
+        let sig_b: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xBB;
+            s
+        };
+
+        let root1 = fair_merkle_root(&[sig_a, sig_b]);
+        let root2 = fair_merkle_root(&[sig_a, sig_b]);
+        assert_eq!(root1, root2, "same inputs must produce same root");
+
+        let root3 = fair_merkle_root(&[sig_b, sig_a]);
+        assert_ne!(root1, root3, "different order must produce different root");
+
+        let root4 = fair_merkle_root(&[sig_a]);
+        assert_ne!(root1, root4, "different inputs must produce different root");
+    }
+
+    #[test]
+    fn fair_merkle_root_single_and_empty() {
+        // Empty input returns zero hash.
+        let empty = fair_merkle_root(&[]);
+        assert_eq!(empty, [0u8; 32]);
+
+        // Single sig returns a deterministic non-zero hash.
+        let sig: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xCC;
+            s
+        };
+        let single = fair_merkle_root(&[sig]);
+        assert_ne!(single, [0u8; 32], "single-element root should not be zero");
+
+        // Repeatable.
+        let single2 = fair_merkle_root(&[sig]);
+        assert_eq!(single, single2);
     }
 
     #[test]
