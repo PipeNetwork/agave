@@ -30,6 +30,7 @@ use solana_keypair::Keypair;
 use solana_ledger::blockstore::Blockstore;
 use solana_ledger::shred::ShredId as LedgerShredId;
 use solana_message::{Message, VersionedMessage};
+use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
 use solana_sha256_hasher as sha256_hasher;
 use solana_signer::Signer;
@@ -56,6 +57,11 @@ const FAIR_PRIORITY_TTL_MS: u64 = 30_000;
 const FAIR_PRIORITY_MAX_ENTRIES: usize = 500_000;
 const FAIR_PRIORITY_PRUNE_LIMIT: usize = 50_000;
 const FAIR_PRIORITY_PRUNE_INTERVAL_MS: u64 = 1_000;
+
+// Defense-in-depth: bound per-message FairBatch processing costs (CPU for tx verification and
+// memory for buffering wire payloads). POPs can split batches if needed.
+const FAIR_BATCH_MAX_TXS: usize = 512;
+const FAIR_BATCH_MAX_TOTAL_BYTES: usize = 256 * PACKET_DATA_SIZE;
 
 const TX_DEDUP_TTL_MS: u64 = 2_000;
 const RELAY_TX_ID_DEDUP_MAX_ENTRIES: usize = 500_000;
@@ -205,6 +211,12 @@ static FAIR_PRIORITIES: OnceLock<DashMap<[u8; 64], FairPriorityEntry>> = OnceLoc
 static FAIR_PRIORITY_LOOKUPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAIR_PRIORITY_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FAIR_PRIORITY_LAST_PRUNE_MS: AtomicU64 = AtomicU64::new(0);
+static FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAIR_BATCH_DROPPED_DUP_SIG_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAIR_BATCH_DROPPED_PAYLOAD_TOO_LARGE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAIR_BATCH_DROPPED_INVALID_WIRE_TX_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAIR_BATCH_DROPPED_TOO_MANY_TXS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn fair_priorities() -> &'static DashMap<[u8; 64], FairPriorityEntry> {
     FAIR_PRIORITIES.get_or_init(DashMap::new)
@@ -261,9 +273,51 @@ pub(crate) fn insert_fair_priority(sig: [u8; 64], priority: u64) {
     );
 }
 
-fn recent_blockhash_from_wire_tx(payload: &[u8]) -> Option<solana_hash::Hash> {
+fn verified_recent_blockhash_from_wire_tx(payload: &[u8]) -> Option<solana_hash::Hash> {
     let tx: VersionedTransaction = bincode::deserialize(payload).ok()?;
+    tx.sanitize().ok()?;
+
+    let message_bytes = tx.message.serialize();
+    for (sig, pubkey) in tx
+        .signatures
+        .iter()
+        .zip(tx.message.static_account_keys().iter())
+    {
+        let verifying_key = VerifyingKey::try_from(pubkey.as_ref()).ok()?;
+        let signature = ed25519_dalek_v2::Signature::try_from(sig.as_ref()).ok()?;
+        verifying_key.verify_strict(&message_bytes, &signature).ok()?;
+    }
+
     Some(*tx.message.recent_blockhash())
+}
+
+fn try_first_signature_bytes_from_wire_tx(payload: &[u8]) -> Option<[u8; 64]> {
+    let (sig_count, consumed) = parse_shortvec_len(payload)?;
+    if sig_count == 0 {
+        return None;
+    }
+    let start = consumed;
+    let end = start.checked_add(64)?;
+    if payload.len() < end {
+        return None;
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&payload[start..end]);
+    Some(sig)
+}
+
+fn parse_shortvec_len(input: &[u8]) -> Option<(usize, usize)> {
+    // Solana shortvec: 7-bit groups, MSB is continuation.
+    let mut value: usize = 0;
+    let mut shift: u32 = 0;
+    for (idx, byte) in input.iter().copied().take(3).enumerate() {
+        value |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, idx + 1));
+        }
+        shift = shift.saturating_add(7);
+    }
+    None
 }
 
 fn build_fair_ledger_commit_memo_txs(
@@ -323,6 +377,13 @@ fn build_fair_ledger_commit_memo_txs(
         let message = Message::new(&[cu_price, memo_ix], Some(&auth.identity_keypair.pubkey()));
         let signers = vec![auth.identity_keypair.as_ref()];
         let tx = Transaction::new(&signers, message, recent_blockhash);
+        if let Some(sig) = tx
+            .signatures
+            .get(0)
+            .and_then(|s| s.as_ref().try_into().ok())
+        {
+            insert_fair_priority(sig, u64::MAX);
+        }
         if let Ok(tx_bytes) = bincode::serialize(&tx) {
             out.push(tx_bytes);
         }
@@ -1000,6 +1061,7 @@ pub struct SolanaCdnStatus {
     pub fair_votes_withheld_total: u64,
     pub fair_ledger_audit_checked_total: u64,
     pub fair_ledger_audit_failed_total: u64,
+    pub fair_ledger_audit_get_slot_entries_failed_total: u64,
     pub fair_ledger_commits_seen_total: u64,
     pub fair_ledger_commits_invalid_total: u64,
     pub fair_order_witnesses_len: u64,
@@ -1064,6 +1126,7 @@ pub struct SolanaCdnHandle {
     tx_fair_slashing_enforce_override: AtomicU8,
     fair_ledger_audit_checked: AtomicU64,
     fair_ledger_audit_failed: AtomicU64,
+    fair_ledger_audit_get_slot_entries_failed: AtomicU64,
     fair_ledger_commits_seen: AtomicU64,
     fair_ledger_commits_invalid: AtomicU64,
     fair_ledger_audited_slots: DashMap<u64, bool>,
@@ -1122,6 +1185,7 @@ impl SolanaCdnHandle {
             ),
             fair_ledger_audit_checked: AtomicU64::new(0),
             fair_ledger_audit_failed: AtomicU64::new(0),
+            fair_ledger_audit_get_slot_entries_failed: AtomicU64::new(0),
             fair_ledger_commits_seen: AtomicU64::new(0),
             fair_ledger_commits_invalid: AtomicU64::new(0),
             fair_ledger_audited_slots: DashMap::new(),
@@ -1175,9 +1239,15 @@ impl SolanaCdnHandle {
             }
             self.recent_tx_sigs.remove(&sig);
         }
+        false
+    }
+
+    fn note_dedup_tx_sig(&self, sig: [u8; 64], now: u64) {
+        if self.recent_tx_sigs.len() > TX_SIG_DEDUP_MAX_ENTRIES {
+            self.recent_tx_sigs.clear();
+        }
         self.recent_tx_sigs
             .insert(sig, now.saturating_add(TX_DEDUP_TTL_MS));
-        false
     }
 
     pub fn is_connected(&self) -> bool {
@@ -1378,12 +1448,16 @@ impl SolanaCdnHandle {
         self.fair_ledger_audit_checked
             .fetch_add(1, Ordering::Relaxed);
 
-        let ok = match blockstore.get_slot_entries(slot, 0) {
-            Ok(entries) => {
-                self.audit_fair_ledger_commits_in_entries(entries.as_slice(), leader, slot)
+        let entries = match blockstore.get_slot_entries(slot, 0) {
+            Ok(entries) => entries,
+            Err(_) => {
+                self.fair_ledger_audit_get_slot_entries_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
             }
-            Err(_) => true,
         };
+
+        let ok = self.audit_fair_ledger_commits_in_entries(entries.as_slice(), leader, slot);
 
         if self.fair_ledger_audited_slots.len() > 100_000 {
             self.fair_ledger_audited_slots.clear();
@@ -1410,7 +1484,7 @@ impl SolanaCdnHandle {
         let memo_program_id = FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID;
 
         let mut slot_tx_sigs: Vec<[u8; 64]> = Vec::new();
-        let mut batch_first_pos: HashMap<u128, usize> = HashMap::new();
+        let mut batch_order_start: HashMap<u128, u64> = HashMap::new();
         let mut batch_chunk_total: HashMap<u128, u16> = HashMap::new();
         let mut chunk_sigs: HashMap<(u128, u16), Vec<[u8; 64]>> = HashMap::new();
         let mut chunk_commit_sigs: HashMap<(u128, u16), [u8; 64]> = HashMap::new();
@@ -1468,9 +1542,19 @@ impl SolanaCdnHandle {
                     }
 
                     let batch_id = chunk.payload.batch_id;
-                    batch_first_pos
-                        .entry(batch_id)
-                        .or_insert(slot_tx_sigs.len());
+                    if let Some(prev_order_start) =
+                        batch_order_start.insert(batch_id, chunk.payload.order_start)
+                    {
+                        if prev_order_start != chunk.payload.order_start {
+                            self.mark_fair_slashed(
+                                expected_leader,
+                                slot,
+                                chunk.payload.order_start,
+                                now_ms(),
+                            );
+                            return false;
+                        }
+                    }
 
                     if let Some(prev_total) =
                         batch_chunk_total.insert(batch_id, chunk.payload.chunk_total)
@@ -1507,25 +1591,25 @@ impl SolanaCdnHandle {
             }
         }
 
-        if batch_first_pos.is_empty() {
+        if batch_order_start.is_empty() {
             return true;
         }
 
-        let mut ordered_batches: Vec<(usize, u128)> = batch_first_pos
+        let mut ordered_batches: Vec<(u64, u128)> = batch_order_start
             .into_iter()
-            .map(|(batch_id, pos)| (pos, batch_id))
+            .map(|(batch_id, order_start)| (order_start, batch_id))
             .collect();
-        ordered_batches.sort_by_key(|(pos, _)| *pos);
+        ordered_batches.sort_by_key(|(order_start, batch_id)| (*order_start, *batch_id));
 
         let mut expected: Vec<[u8; 64]> = Vec::new();
-        for (_pos, batch_id) in ordered_batches {
+        for (order_start, batch_id) in ordered_batches {
             let Some(chunk_total) = batch_chunk_total.get(&batch_id).copied() else {
                 continue;
             };
             for chunk_index in 0..chunk_total {
                 let key = (batch_id, chunk_index);
                 let Some(sigs) = chunk_sigs.get(&key) else {
-                    self.mark_fair_slashed(expected_leader, slot, 0, now_ms());
+                    self.mark_fair_slashed(expected_leader, slot, order_start, now_ms());
                     return false;
                 };
                 expected.extend_from_slice(sigs);
@@ -1555,11 +1639,6 @@ impl SolanaCdnHandle {
             if cursor >= expected.len() {
                 break;
             }
-        }
-
-        if cursor != expected.len() {
-            self.mark_fair_slashed(expected_leader, slot, cursor as u64, now_ms());
-            return false;
         }
 
         true
@@ -1696,6 +1775,7 @@ impl SolanaCdnHandle {
         self.should_ignore_src_ip(src_ip)
     }
 
+    #[allow(dead_code)]
     fn is_solanacdn_shred_rx_fresh_at(&self, now_ms: u64) -> bool {
         let last = self.last_solanacdn_shred_rx_ms.load(Ordering::Relaxed);
         if last == 0 {
@@ -1840,6 +1920,9 @@ impl SolanaCdnHandle {
         let fair_ledger_audit_checked_total =
             self.fair_ledger_audit_checked.load(Ordering::Relaxed);
         let fair_ledger_audit_failed_total = self.fair_ledger_audit_failed.load(Ordering::Relaxed);
+        let fair_ledger_audit_get_slot_entries_failed_total = self
+            .fair_ledger_audit_get_slot_entries_failed
+            .load(Ordering::Relaxed);
         let fair_ledger_commits_seen_total = self.fair_ledger_commits_seen.load(Ordering::Relaxed);
         let fair_ledger_commits_invalid_total =
             self.fair_ledger_commits_invalid.load(Ordering::Relaxed);
@@ -1958,6 +2041,7 @@ impl SolanaCdnHandle {
             fair_votes_withheld_total,
             fair_ledger_audit_checked_total,
             fair_ledger_audit_failed_total,
+            fair_ledger_audit_get_slot_entries_failed_total,
             fair_ledger_commits_seen_total,
             fair_ledger_commits_invalid_total,
             fair_order_witnesses_len,
@@ -2128,6 +2212,7 @@ impl SolanaCdnHandle {
             "fair_votes_withheld_total": self.fair_votes_withheld.load(Ordering::Relaxed) as i64,
             "fair_ledger_audit_checked_total": self.fair_ledger_audit_checked.load(Ordering::Relaxed) as i64,
             "fair_ledger_audit_failed_total": self.fair_ledger_audit_failed.load(Ordering::Relaxed) as i64,
+            "fair_ledger_audit_get_slot_entries_failed_total": self.fair_ledger_audit_get_slot_entries_failed.load(Ordering::Relaxed) as i64,
             "fair_ledger_commits_seen_total": self.fair_ledger_commits_seen.load(Ordering::Relaxed) as i64,
             "fair_ledger_commits_invalid_total": self.fair_ledger_commits_invalid.load(Ordering::Relaxed) as i64,
             "uplink_dropped_shred_batches_total": self.dropped_shred_payloads.load(Ordering::Relaxed) as i64,
@@ -3711,6 +3796,48 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.tx_fair_batch_inject_failed_total
     ));
 
+    out.push_str("# HELP solanacdn_fair_batch_dropped_sig_mismatch_total Number of fair-batch transactions dropped because FairTx.sig did not match (or could not be parsed from) the wire transaction payload\n");
+    out.push_str("# TYPE solanacdn_fair_batch_dropped_sig_mismatch_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_batch_dropped_sig_mismatch_total {}\n",
+        FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP solanacdn_fair_batch_dropped_duplicate_sig_total Number of fair-batch transactions dropped because they duplicated a signature already present in the same batch\n");
+    out.push_str("# TYPE solanacdn_fair_batch_dropped_duplicate_sig_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_batch_dropped_duplicate_sig_total {}\n",
+        FAIR_BATCH_DROPPED_DUP_SIG_TOTAL.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP solanacdn_fair_batch_dropped_payload_too_large_total Number of fair-batch transactions dropped because their payload was larger than PACKET_DATA_SIZE\n");
+    out.push_str("# TYPE solanacdn_fair_batch_dropped_payload_too_large_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_batch_dropped_payload_too_large_total {}\n",
+        FAIR_BATCH_DROPPED_PAYLOAD_TOO_LARGE_TOTAL.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP solanacdn_fair_batch_dropped_invalid_wire_tx_total Number of fair-batch transactions dropped because they failed bincode deserialization, sanitization, or signature verification\n");
+    out.push_str("# TYPE solanacdn_fair_batch_dropped_invalid_wire_tx_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_batch_dropped_invalid_wire_tx_total {}\n",
+        FAIR_BATCH_DROPPED_INVALID_WIRE_TX_TOTAL.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP solanacdn_fair_batch_dropped_too_many_txs_total Number of fair-batch transactions dropped because the batch exceeded the transaction count cap\n");
+    out.push_str("# TYPE solanacdn_fair_batch_dropped_too_many_txs_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_batch_dropped_too_many_txs_total {}\n",
+        FAIR_BATCH_DROPPED_TOO_MANY_TXS_TOTAL.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP solanacdn_fair_batch_dropped_total_bytes_exceeded_total Number of fair-batch transactions dropped because the batch exceeded the total payload bytes cap\n");
+    out.push_str("# TYPE solanacdn_fair_batch_dropped_total_bytes_exceeded_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_batch_dropped_total_bytes_exceeded_total {}\n",
+        FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL.load(Ordering::Relaxed)
+    ));
+
     out.push_str("# HELP solanacdn_tx_deduped_packets_total Total SolanaCDN transaction packets dropped due to deduplication\n");
     out.push_str("# TYPE solanacdn_tx_deduped_packets_total counter\n");
     out.push_str(&format!(
@@ -3824,6 +3951,13 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str(&format!(
         "solanacdn_fair_ledger_audit_failed_total {}\n",
         status.fair_ledger_audit_failed_total
+    ));
+
+    out.push_str("# HELP solanacdn_fair_ledger_audit_get_slot_entries_failed_total Number of slots where the fair ordering audit could not read entries from blockstore\n");
+    out.push_str("# TYPE solanacdn_fair_ledger_audit_get_slot_entries_failed_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_ledger_audit_get_slot_entries_failed_total {}\n",
+        status.fair_ledger_audit_get_slot_entries_failed_total
     ));
 
     out.push_str("# HELP solanacdn_fair_ledger_commits_seen_total Number of fair ordering ledger commit chunks observed\n");
@@ -5606,58 +5740,155 @@ async fn handle_pop_msg(
                 created_at_ms: _,
                 batch_ms: _,
                 target_slot,
-                txs,
+                txs: incoming_txs,
             } = batch;
 
-            if txs.is_empty() {
+            if incoming_txs.is_empty() {
                 return;
             }
 
             handle
                 .rx_tx_packets
-                .fetch_add(txs.len() as u64, Ordering::Relaxed);
+                .fetch_add(incoming_txs.len() as u64, Ordering::Relaxed);
             handle
                 .tx_fair_batch_received
-                .fetch_add(txs.len() as u64, Ordering::Relaxed);
+                .fetch_add(incoming_txs.len() as u64, Ordering::Relaxed);
 
-            let now = now_ms();
-            let original_len = txs.len();
-            let txs: Vec<solanacdn_protocol::messages::FairTx> = txs
-                .into_iter()
-                .filter(|tx| !handle.should_dedup_tx_sig(tx.sig.0, now))
-                .collect();
-            let deduped = original_len.saturating_sub(txs.len());
-            if deduped > 0 {
-                handle
-                    .tx_deduped_packets
-                    .fetch_add(deduped as u64, Ordering::Relaxed);
+            let dropped_due_to_too_many = incoming_txs.len().saturating_sub(FAIR_BATCH_MAX_TXS);
+            if dropped_due_to_too_many > 0 {
+                FAIR_BATCH_DROPPED_TOO_MANY_TXS_TOTAL.fetch_add(
+                    dropped_due_to_too_many as u64,
+                    Ordering::Relaxed,
+                );
+                debug!(
+                    "solanacdn: FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; dropping {dropped_due_to_too_many} txs (over cap={FAIR_BATCH_MAX_TXS})"
+                );
             }
+
+            let mut seen: HashSet<[u8; 64]> =
+                HashSet::with_capacity(incoming_txs.len().min(FAIR_BATCH_MAX_TXS));
+            let mut txs: Vec<solanacdn_protocol::messages::FairTx> =
+                Vec::with_capacity(incoming_txs.len().min(FAIR_BATCH_MAX_TXS));
+            let mut total_bytes: usize = 0;
+            let mut bytes_cap_reached = false;
+            let mut dropped_due_to_bytes: u64 = 0;
+
+            for tx in incoming_txs.into_iter().take(FAIR_BATCH_MAX_TXS) {
+                if bytes_cap_reached {
+                    dropped_due_to_bytes = dropped_due_to_bytes.saturating_add(1);
+                    continue;
+                }
+                if tx.payload.len() > PACKET_DATA_SIZE {
+                    FAIR_BATCH_DROPPED_PAYLOAD_TOO_LARGE_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "solanacdn: dropping FairTx from FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; payload too large (len={}, max={PACKET_DATA_SIZE})",
+                        tx.payload.len()
+                    );
+                    continue;
+                }
+                let Some(sig_from_payload) =
+                    try_first_signature_bytes_from_wire_tx(tx.payload.as_slice())
+                else {
+                    FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "solanacdn: dropping FairTx from FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; unable to parse tx signature from payload"
+                    );
+                    continue;
+                };
+                if sig_from_payload != tx.sig.0 {
+                    FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "solanacdn: dropping FairTx from FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; FairTx.sig does not match tx payload"
+                    );
+                    continue;
+                }
+                if !seen.insert(tx.sig.0) {
+                    FAIR_BATCH_DROPPED_DUP_SIG_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        "solanacdn: dropping FairTx from FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; duplicate tx signature in batch"
+                    );
+                    continue;
+                }
+
+                let next_total_bytes = total_bytes.saturating_add(tx.payload.len());
+                if next_total_bytes > FAIR_BATCH_MAX_TOTAL_BYTES {
+                    bytes_cap_reached = true;
+                    dropped_due_to_bytes = dropped_due_to_bytes.saturating_add(1);
+                    continue;
+                }
+                total_bytes = next_total_bytes;
+                txs.push(tx);
+            }
+
+            if dropped_due_to_bytes > 0 {
+                FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL
+                    .fetch_add(dropped_due_to_bytes, Ordering::Relaxed);
+                debug!(
+                    "solanacdn: FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; dropping {dropped_due_to_bytes} txs (over total_bytes cap={FAIR_BATCH_MAX_TOTAL_BYTES})"
+                );
+            }
+
             if txs.is_empty() {
                 return;
             }
 
-            let mut sigs: Vec<solanacdn_protocol::crypto::SignatureBytes> =
-                Vec::with_capacity(txs.len());
+            let now = now_ms();
 
             if cfg.tx_fair_ordering {
-                let order_start = handle
-                    .tx_fair_order_next
-                    .fetch_add(txs.len() as u64, Ordering::Relaxed);
-
+                // Allocate ordering indices only for transactions that are actually inject-able.
+                let mut recent_blockhash: Option<solana_hash::Hash> = None;
+                let mut sigs: Vec<solanacdn_protocol::crypto::SignatureBytes> =
+                    Vec::with_capacity(txs.len());
                 let mut sig_bytes: Vec<[u8; 64]> = Vec::with_capacity(txs.len());
-                for (idx, tx) in txs.iter().enumerate() {
-                    let order_ix = order_start.wrapping_add(idx as u64);
-                    let priority = u64::MAX.wrapping_sub(order_ix);
-                    insert_fair_priority(tx.sig.0, priority);
+                let mut verified_txs: Vec<solanacdn_protocol::messages::FairTx> =
+                    Vec::with_capacity(txs.len());
+                let mut deduped: u64 = 0;
+
+                for tx in txs.into_iter() {
+                    if handle.should_dedup_tx_sig(tx.sig.0, now) {
+                        deduped = deduped.saturating_add(1);
+                        continue;
+                    }
+                    let Some(blockhash) =
+                        verified_recent_blockhash_from_wire_tx(tx.payload.as_slice())
+                    else {
+                        FAIR_BATCH_DROPPED_INVALID_WIRE_TX_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            "solanacdn: dropping FairTx from FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; failed deserialization/sanitization/sigverify"
+                        );
+                        continue;
+                    };
+                    handle.note_dedup_tx_sig(tx.sig.0, now);
+                    recent_blockhash.get_or_insert(blockhash);
                     sigs.push(tx.sig);
                     sig_bytes.push(tx.sig.0);
+                    verified_txs.push(tx);
+                }
+
+                if deduped > 0 {
+                    handle
+                        .tx_deduped_packets
+                        .fetch_add(deduped, Ordering::Relaxed);
+                }
+
+                if verified_txs.is_empty() {
+                    return;
+                }
+
+                let order_start = handle.tx_fair_order_next.fetch_add(
+                    verified_txs.len() as u64,
+                    Ordering::Relaxed,
+                );
+
+                for (idx, tx) in verified_txs.iter().enumerate() {
+                    let order_ix = order_start.wrapping_add(idx as u64);
+                    let priority = u64::MAX.wrapping_sub(order_ix).saturating_sub(1);
+                    insert_fair_priority(tx.sig.0, priority);
                 }
 
                 if cfg.tx_fair_slashing {
                     if let Some(slot) = target_slot {
-                        if let Some(recent_blockhash) =
-                            recent_blockhash_from_wire_tx(txs[0].payload.as_slice())
-                        {
+                        if let Some(recent_blockhash) = recent_blockhash {
                             let commit_txs = build_fair_ledger_commit_memo_txs(
                                 auth,
                                 recent_blockhash,
@@ -5673,7 +5904,7 @@ async fn handle_pop_msg(
                     }
                 }
 
-                for tx in txs.iter() {
+                for tx in verified_txs.iter() {
                     if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                         handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
                         handle
@@ -5731,7 +5962,13 @@ async fn handle_pop_msg(
             }
 
             // Not in fair mode: best-effort inject without ordering commit.
+            let mut deduped: u64 = 0;
             for tx in txs.iter() {
+                if handle.should_dedup_tx_sig(tx.sig.0, now) {
+                    deduped = deduped.saturating_add(1);
+                    continue;
+                }
+                handle.note_dedup_tx_sig(tx.sig.0, now);
                 if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                     handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
                     handle
@@ -5743,6 +5980,11 @@ async fn handle_pop_msg(
                         .tx_fair_batch_inject_failed
                         .fetch_add(1, Ordering::Relaxed);
                 }
+            }
+            if deduped > 0 {
+                handle
+                    .tx_deduped_packets
+                    .fetch_add(deduped, Ordering::Relaxed);
             }
         }
         PopToAgent::FairBatchCommit(commit) => {
@@ -6023,6 +6265,155 @@ mod tests {
     }
 
     #[test]
+    fn fair_ledger_audit_orders_batches_by_order_start_not_memo_position() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let slot = 42;
+
+        let batch_a_id = 7u128;
+        let batch_b_id = 8u128;
+        let order_start_a = 0u64;
+        let order_start_b = 2u64;
+
+        let tx_a_signer_1 = Keypair::new();
+        let tx_a_1 = Transaction::new(
+            &[&tx_a_signer_1],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer_1.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a_1: [u8; 64] = tx_a_1.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_a_signer_2 = Keypair::new();
+        let tx_a_2 = Transaction::new(
+            &[&tx_a_signer_2],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_a_signer_2.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a_2: [u8; 64] = tx_a_2.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b_1 = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(3)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b_1: [u8; 64] = tx_b_1.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let commit_a_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_a_id,
+            order_start_a,
+            &[sig_a_1, sig_a_2],
+        );
+        assert_eq!(commit_a_txs.len(), 1);
+        let commit_a: Transaction = bincode::deserialize(&commit_a_txs[0]).expect("commit tx");
+
+        let commit_b_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_b_id,
+            order_start_b,
+            &[sig_b_1],
+        );
+        assert_eq!(commit_b_txs.len(), 1);
+        let commit_b: Transaction = bincode::deserialize(&commit_b_txs[0]).expect("commit tx");
+
+        // Commit-memo tx ordering in the ledger is not guaranteed. The audit should order batches
+        // by the signed `order_start`, not by the memo-tx position within the slot.
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![
+                commit_b.into(),
+                commit_a.into(),
+                tx_a_1.into(),
+                tx_a_2.into(),
+                tx_b_1.into(),
+            ],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+        assert!(handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 0);
+    }
+
+    #[test]
+    fn fair_ledger_audit_allows_missing_tail_without_overtake() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let slot = 42;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            &[sig_a, sig_b],
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into(), tx_a.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+        assert!(handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 0);
+    }
+
+    #[test]
     fn fair_commit_equivocation_marks_slashed() {
         let leader_identity = Arc::new(Keypair::new());
         let leader = leader_identity.pubkey();
@@ -6073,6 +6464,328 @@ mod tests {
     }
 
     #[test]
+    fn try_first_signature_bytes_from_wire_tx_parses_legacy_tx() {
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+        let tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let vtx = VersionedTransaction::from(tx);
+        let expected: [u8; 64] = vtx.signatures[0].as_ref().try_into().expect("sig bytes");
+        let bytes = bincode::serialize(&vtx).expect("serialize");
+        let sig = try_first_signature_bytes_from_wire_tx(bytes.as_slice()).expect("sig");
+        assert_eq!(sig, expected);
+    }
+
+    #[test]
+    fn verified_recent_blockhash_from_wire_tx_rejects_bad_signature() {
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+        let tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let vtx = VersionedTransaction::from(tx);
+        let mut bytes = bincode::serialize(&vtx).expect("serialize");
+
+        assert_eq!(
+            verified_recent_blockhash_from_wire_tx(bytes.as_slice()).as_ref(),
+            Some(&recent_blockhash)
+        );
+
+        let (_sig_count, consumed) = parse_shortvec_len(bytes.as_slice()).expect("sig vec len");
+        bytes[consumed] ^= 0x01;
+        assert!(verified_recent_blockhash_from_wire_tx(bytes.as_slice()).is_none());
+    }
+
+    fn fair_tx_from_wire_bytes(bytes: Vec<u8>) -> solanacdn_protocol::messages::FairTx {
+        let sig = try_first_signature_bytes_from_wire_tx(bytes.as_slice()).expect("sig bytes");
+        solanacdn_protocol::messages::FairTx {
+            sig: SignatureBytes(sig),
+            payload: bytes,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_batch_order_start_advances_only_for_verified_txs() {
+        let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_ordering = true;
+        cfg.tx_fair_slashing = false;
+        let handle = SolanaCdnHandle::new(cfg.clone());
+
+        let auth = AuthContext::new(Arc::new(Keypair::new())).unwrap();
+
+        let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<AgentToPop>(8);
+        let (_publisher_tx, mut publisher_rx) = watch::channel::<Option<SocketAddr>>(None);
+        let shred_deduper = ShredBatchDeduper::new(64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let last_hb_sent_ms = AtomicU64::new(0);
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let udp_inject_tpu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tpu.connect(sink_addr).await.unwrap();
+        let udp_inject_tvu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tvu.connect(sink_addr).await.unwrap();
+        let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_gossip.connect(sink_addr).await.unwrap();
+
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+
+        let tx_1 = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let bytes_1 = bincode::serialize(&VersionedTransaction::from(tx_1)).unwrap();
+
+        let tx_2 = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let bytes_2 = bincode::serialize(&VersionedTransaction::from(tx_2)).unwrap();
+
+        let tx_3 = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(3)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let mut bytes_3 = bincode::serialize(&VersionedTransaction::from(tx_3)).unwrap();
+        let (_sig_count, consumed) = parse_shortvec_len(bytes_3.as_slice()).expect("sig vec len");
+        bytes_3[consumed] ^= 0x01;
+
+        let batch_1 = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-test-1".to_string(),
+            batch_id: 1,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs: vec![
+                fair_tx_from_wire_bytes(bytes_1),
+                fair_tx_from_wire_bytes(bytes_2),
+                fair_tx_from_wire_bytes(bytes_3),
+            ],
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch_1),
+        )
+        .await;
+
+        let commit_1 = match tokio::time::timeout(Duration::from_secs(2), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        assert_eq!(commit_1.payload.order_start, 0);
+        assert_eq!(commit_1.payload.tx_sigs.len(), 2);
+
+        let tx_4 = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(4)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let bytes_4 = bincode::serialize(&VersionedTransaction::from(tx_4)).unwrap();
+
+        let batch_2 = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-test-1".to_string(),
+            batch_id: 2,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs: vec![fair_tx_from_wire_bytes(bytes_4)],
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch_2),
+        )
+        .await;
+
+        let commit_2 = match tokio::time::timeout(Duration::from_secs(2), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        assert_eq!(commit_2.payload.order_start, 2);
+        assert_eq!(commit_2.payload.tx_sigs.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_batch_enforces_tx_count_cap() {
+        let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_ordering = true;
+        cfg.tx_fair_slashing = false;
+        let handle = SolanaCdnHandle::new(cfg.clone());
+
+        let auth = AuthContext::new(Arc::new(Keypair::new())).unwrap();
+
+        let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<AgentToPop>(8);
+        let (_publisher_tx, mut publisher_rx) = watch::channel::<Option<SocketAddr>>(None);
+        let shred_deduper = ShredBatchDeduper::new(64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let last_hb_sent_ms = AtomicU64::new(0);
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let udp_inject_tpu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tpu.connect(sink_addr).await.unwrap();
+        let udp_inject_tvu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tvu.connect(sink_addr).await.unwrap();
+        let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_gossip.connect(sink_addr).await.unwrap();
+
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+
+        let txs: Vec<solanacdn_protocol::messages::FairTx> = (0..(FAIR_BATCH_MAX_TXS + 1))
+            .map(|i| {
+                let tx = Transaction::new(
+                    &[&signer],
+                    Message::new(
+                        &[ComputeBudgetInstruction::set_compute_unit_limit((i + 1) as u32)],
+                        Some(&signer.pubkey()),
+                    ),
+                    recent_blockhash,
+                );
+                let bytes = bincode::serialize(&VersionedTransaction::from(tx)).unwrap();
+                fair_tx_from_wire_bytes(bytes)
+            })
+            .collect();
+
+        let batch = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-test-1".to_string(),
+            batch_id: 1,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs,
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch),
+        )
+        .await;
+
+        let commit = match tokio::time::timeout(Duration::from_secs(10), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        assert_eq!(commit.payload.order_start, 0);
+        assert_eq!(commit.payload.tx_sigs.len(), FAIR_BATCH_MAX_TXS);
+    }
+
+    #[test]
+    fn fair_ledger_audit_does_not_cache_on_blockstore_read_errors() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        let ledger_path = tempfile::TempDir::new().unwrap();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        let slot = 123;
+        blockstore.set_dead_slot(slot).unwrap();
+
+        handle.audit_fair_ledger_commits_for_slot(&blockstore, &leader, slot);
+        assert_eq!(
+            handle
+                .status_snapshot()
+                .fair_ledger_audit_get_slot_entries_failed_total,
+            1
+        );
+        assert_eq!(handle.status_snapshot().fair_ledger_audited_slots_len, 0);
+
+        // Not cached => can retry.
+        handle.audit_fair_ledger_commits_for_slot(&blockstore, &leader, slot);
+        assert_eq!(
+            handle
+                .status_snapshot()
+                .fair_ledger_audit_get_slot_entries_failed_total,
+            2
+        );
+        assert_eq!(handle.status_snapshot().fair_ledger_audited_slots_len, 0);
+    }
+
+    #[test]
     fn prometheus_metrics_includes_core_status_fields() {
         let cfg = SolanaCdnConfig::default();
         let handle = SolanaCdnHandle::new(cfg);
@@ -6089,6 +6802,14 @@ mod tests {
         assert!(text.contains("solanacdn_tx_fair_batch_received_total "));
         assert!(text.contains("solanacdn_tx_fair_batch_injected_total "));
         assert!(text.contains("solanacdn_tx_fair_batch_inject_failed_total "));
+        assert!(text.contains("solanacdn_fair_batch_dropped_sig_mismatch_total "));
+        assert!(text.contains("solanacdn_fair_batch_dropped_duplicate_sig_total "));
+        assert!(text.contains("solanacdn_fair_batch_dropped_payload_too_large_total "));
+        assert!(text.contains("solanacdn_fair_batch_dropped_invalid_wire_tx_total "));
+        assert!(text.contains("solanacdn_fair_batch_dropped_too_many_txs_total "));
+        assert!(text.contains(
+            "solanacdn_fair_batch_dropped_total_bytes_exceeded_total "
+        ));
         assert!(text.contains("solanacdn_tx_deduped_packets_total "));
         assert!(text.contains("solanacdn_tx_relay_dropped_fair_mode_total "));
         assert!(text.contains("solanacdn_fair_priority_lookups_total "));
@@ -6103,6 +6824,9 @@ mod tests {
         assert!(text.contains("solanacdn_fair_votes_withheld_total "));
         assert!(text.contains("solanacdn_fair_ledger_audit_checked_total "));
         assert!(text.contains("solanacdn_fair_ledger_audit_failed_total "));
+        assert!(text.contains(
+            "solanacdn_fair_ledger_audit_get_slot_entries_failed_total "
+        ));
         assert!(text.contains("solanacdn_fair_ledger_commits_seen_total "));
         assert!(text.contains("solanacdn_fair_ledger_commits_invalid_total "));
         assert!(text.contains("solanacdn_fair_order_witnesses_entries "));
