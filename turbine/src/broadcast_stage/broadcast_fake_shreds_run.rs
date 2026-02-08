@@ -44,6 +44,7 @@ impl BroadcastRun for BroadcastFakeShredsRun {
             receiver,
             &mut self.carryover_entry,
             &mut ProcessShredsStats::default(),
+            broadcast_utils::ENTRY_COALESCE_DURATION,
         )?;
         let bank = receive_results.bank;
         let last_tick_height = receive_results.last_tick_height;

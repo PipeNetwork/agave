@@ -383,6 +383,7 @@ pub struct ValidatorConfig {
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
     pub solanacdn: Option<crate::solanacdn::SolanaCdnConfig>,
+    pub fast_shreds: Option<solana_turbine::broadcast_stage::FastShredsConfig>,
 }
 
 impl ValidatorConfig {
@@ -466,6 +467,7 @@ impl ValidatorConfig {
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
             solanacdn: None,
+            fast_shreds: None,
         }
     }
 
@@ -1770,6 +1772,7 @@ impl Validator {
             entry_notification_sender,
             blockstore.clone(),
             &config.broadcast_stage_type,
+            config.fast_shreds.clone(),
             xdp_sender,
             exit,
             node.info.shred_version(),

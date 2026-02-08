@@ -826,6 +826,7 @@ impl BankingSimulator {
             shred_version,
             sender,
             None,
+            None, // fast_shreds
         );
 
         info!("Start banking stage!...");

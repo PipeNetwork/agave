@@ -17,7 +17,7 @@ use {
     wincode::serialized_size,
 };
 
-const ENTRY_COALESCE_DURATION: Duration = Duration::from_millis(50);
+pub(super) const ENTRY_COALESCE_DURATION: Duration = Duration::from_millis(50);
 
 pub(super) struct ReceiveResults {
     pub entries: Vec<Entry>,
@@ -66,6 +66,7 @@ pub(super) fn recv_slot_entries(
     receiver: &Receiver<WorkingBankEntry>,
     carryover_entry: &mut Option<WorkingBankEntry>,
     process_stats: &mut ProcessShredsStats,
+    coalesce_duration: Duration,
 ) -> Result<ReceiveResults> {
     let recv_start = Instant::now();
 
@@ -120,7 +121,7 @@ pub(super) fn recv_slot_entries(
         process_stats,
     ) {
         let Ok((try_bank, (entry, tick_height))) =
-            receiver.recv_deadline(coalesce_start + ENTRY_COALESCE_DURATION)
+            receiver.recv_deadline(coalesce_start + coalesce_duration)
         else {
             process_stats.coalesce_exited_rcv_timeout += 1;
             break;
@@ -236,7 +237,7 @@ mod tests {
 
         let mut res_entries = vec![];
         let mut last_tick_height = 0;
-        while let Ok(result) = recv_slot_entries(&r, &mut None, &mut ProcessShredsStats::default())
+        while let Ok(result) = recv_slot_entries(&r, &mut None, &mut ProcessShredsStats::default(), ENTRY_COALESCE_DURATION)
         {
             assert_eq!(result.bank.slot(), bank1.slot());
             last_tick_height = result.last_tick_height;
@@ -279,7 +280,7 @@ mod tests {
         let mut res_entries = vec![];
         let mut last_tick_height = 0;
         let mut bank_slot = 0;
-        while let Ok(result) = recv_slot_entries(&r, &mut None, &mut ProcessShredsStats::default())
+        while let Ok(result) = recv_slot_entries(&r, &mut None, &mut ProcessShredsStats::default(), ENTRY_COALESCE_DURATION)
         {
             bank_slot = result.bank.slot();
             last_tick_height = result.last_tick_height;

@@ -265,6 +265,16 @@ impl ClusterNodes<BroadcastStage> {
         let index = self.weighted_shuffle.first(&mut rng)?;
         self.nodes[index].contact_info()
     }
+
+    pub(crate) fn get_broadcast_peers(&self, shred: &ShredId, count: usize) -> Vec<&ContactInfo> {
+        let mut rng = TurbineRng::new_seeded(&self.pubkey, shred, self.use_cha_cha_8);
+        self.weighted_shuffle
+            .clone()
+            .shuffle(&mut rng)
+            .take(count)
+            .filter_map(|index| self.nodes[index].contact_info())
+            .collect()
+    }
 }
 
 impl ClusterNodes<RetransmitStage> {

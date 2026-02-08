@@ -38,6 +38,7 @@ pub struct StandardBroadcastRun {
     num_batches: usize,
     cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
     reed_solomon_cache: Arc<ReedSolomonCache>,
+    fast_shreds: Option<FastShredsConfig>,
 }
 
 #[derive(Debug)]
@@ -46,7 +47,7 @@ enum BroadcastError {
 }
 
 impl StandardBroadcastRun {
-    pub(super) fn new(shred_version: u16) -> Self {
+    pub(super) fn new(shred_version: u16, fast_shreds: Option<FastShredsConfig>) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
@@ -68,6 +69,7 @@ impl StandardBroadcastRun {
             num_batches: 0,
             cluster_nodes_cache,
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
+            fast_shreds,
         }
     }
 
@@ -312,8 +314,28 @@ impl StandardBroadcastRun {
 
         let shreds = Arc::new(shreds);
         debug_assert!(shreds.iter().all(|shred| shred.slot() == bank.slot()));
-        socket_sender.send((shreds.clone(), batch_info.clone()))?;
-        blockstore_sender.send((shreds, batch_info))?;
+        if self
+            .fast_shreds
+            .as_ref()
+            .is_some_and(|c| c.prioritize_data_shreds)
+        {
+            let (data, coding): (Vec<_>, Vec<_>) =
+                shreds.iter().cloned().partition(|s| s.is_data());
+            // Send data shreds first — validators that receive all data don't need coding
+            if !data.is_empty() {
+                let data = Arc::new(data);
+                socket_sender.send((data.clone(), batch_info.clone()))?;
+                blockstore_sender.send((data, batch_info.clone()))?;
+            }
+            if !coding.is_empty() {
+                let coding = Arc::new(coding);
+                socket_sender.send((coding.clone(), batch_info.clone()))?;
+                blockstore_sender.send((coding, batch_info))?;
+            }
+        } else {
+            socket_sender.send((shreds.clone(), batch_info.clone()))?;
+            blockstore_sender.send((shreds, batch_info))?;
+        }
 
         coding_send_time.stop();
 
@@ -389,6 +411,11 @@ impl StandardBroadcastRun {
 
         transmit_stats.num_shreds = shreds.len();
 
+        let leader_fanout = self
+            .fast_shreds
+            .as_ref()
+            .map(|c| c.leader_fanout)
+            .filter(|&n| n > 0);
         broadcast_shreds(
             sock,
             &shreds,
@@ -399,6 +426,7 @@ impl StandardBroadcastRun {
             bank_forks,
             cluster_info.socket_addr_space(),
             quic_endpoint_sender,
+            leader_fanout,
         )?;
         transmit_time.stop();
 
@@ -443,10 +471,16 @@ impl BroadcastRun for StandardBroadcastRun {
         blockstore_sender: &Sender<(Arc<Vec<Shred>>, Option<BroadcastShredBatchInfo>)>,
     ) -> Result<()> {
         let mut process_stats = ProcessShredsStats::default();
+        let coalesce = self
+            .fast_shreds
+            .as_ref()
+            .map(|c| c.coalesce_duration)
+            .unwrap_or(broadcast_utils::ENTRY_COALESCE_DURATION);
         let receive_results = broadcast_utils::recv_slot_entries(
             receiver,
             &mut self.carryover_entry,
             &mut process_stats,
+            coalesce,
         )?;
         // TODO: Confirm that last chunk of coding shreds
         // will not be lost or delayed for too long.
@@ -553,7 +587,7 @@ mod test {
     #[test]
     fn test_interrupted_slot_last_shred() {
         let keypair = Arc::new(Keypair::new());
-        let mut run = StandardBroadcastRun::new(0);
+        let mut run = StandardBroadcastRun::new(0, None);
         assert!(run.completed);
 
         // Set up the slot to be interrupted
@@ -602,7 +636,7 @@ mod test {
         };
 
         // Step 1: Make an incomplete transmission for slot 0
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(0, None);
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -727,7 +761,7 @@ mod test {
         let (bsend, brecv) = unbounded();
         let (ssend, _srecv) = unbounded();
         let mut last_tick_height = 0;
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(0, None);
         let mut process_ticks = |num_ticks| {
             let ticks = create_ticks(num_ticks, 0, genesis_config.hash());
             last_tick_height += (ticks.len() - 1) as u64;
@@ -788,7 +822,7 @@ mod test {
             last_tick_height: ticks.len() as u64,
         };
 
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0);
+        let mut standard_broadcast_run = StandardBroadcastRun::new(0, None);
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -807,7 +841,7 @@ mod test {
     fn entries_to_shreds_max() {
         agave_logger::setup();
         let keypair = Keypair::new();
-        let mut bs = StandardBroadcastRun::new(0);
+        let mut bs = StandardBroadcastRun::new(0, None);
         bs.slot = 1;
         bs.parent = 0;
         let entries = create_ticks(10_000, 1, solana_hash::Hash::default());

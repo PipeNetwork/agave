@@ -132,6 +132,7 @@ impl Tpu {
         entry_notification_sender: Option<EntryNotifierSender>,
         blockstore: Arc<Blockstore>,
         broadcast_type: &BroadcastStageType,
+        fast_shreds: Option<solana_turbine::broadcast_stage::FastShredsConfig>,
         xdp_sender: Option<XdpSender>,
         exit: Arc<AtomicBool>,
         shred_version: u16,
@@ -381,6 +382,7 @@ impl Tpu {
             shred_version,
             turbine_quic_endpoint_sender,
             xdp_sender,
+            fast_shreds,
         );
 
         let mut key_notifiers = key_notifiers.write().unwrap();

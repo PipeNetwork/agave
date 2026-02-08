@@ -114,6 +114,13 @@ pub enum BroadcastStageType {
     BroadcastDuplicates(BroadcastDuplicatesConfig),
 }
 
+#[derive(Clone, Debug)]
+pub struct FastShredsConfig {
+    pub coalesce_duration: Duration,
+    pub leader_fanout: usize,
+    pub prioritize_data_shreds: bool,
+}
+
 impl BroadcastStageType {
     #[allow(clippy::too_many_arguments)]
     pub fn new_broadcast_stage(
@@ -128,6 +135,7 @@ impl BroadcastStageType {
         shred_version: u16,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         xdp_sender: Option<XdpSender>,
+        fast_shreds: Option<FastShredsConfig>,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
@@ -139,7 +147,7 @@ impl BroadcastStageType {
                 blockstore,
                 bank_forks,
                 quic_endpoint_sender,
-                StandardBroadcastRun::new(shred_version),
+                StandardBroadcastRun::new(shred_version, fast_shreds),
                 xdp_sender,
             ),
 
@@ -496,6 +504,7 @@ pub fn broadcast_shreds(
     bank_forks: &RwLock<BankForks>,
     socket_addr_space: &SocketAddrSpace,
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+    leader_fanout: Option<usize>,
 ) -> Result<()> {
     let mut result = Ok(());
     // Compute destinations & transmission protocols for each of the shreds to be sent
@@ -512,7 +521,7 @@ pub fn broadcast_shreds(
             let cluster_nodes =
                 cluster_nodes_cache.get(slot, &root_bank, &working_bank, cluster_info);
             update_peer_stats(&cluster_nodes, last_datapoint_submit);
-            shreds.filter_map(move |shred| {
+            shreds.flat_map(move |shred| {
                 // Best-effort: publish leader-produced shreds to SolanaCDN (if enabled).
                 // This is independent of whether the shred has an on-chain broadcast peer.
                 let payload = shred.payload();
@@ -520,16 +529,31 @@ pub fn broadcast_shreds(
 
                 let key = shred.id();
                 let protocol = cluster_nodes::get_broadcast_protocol(&key);
-                cluster_nodes
-                    .get_broadcast_peer(&key)?
-                    .tvu(protocol)
-                    .filter(|addr| socket_addr_space.check(addr))
-                    .map(|addr| {
-                        (match protocol {
-                            Protocol::QUIC => Either::Right,
-                            Protocol::UDP => Either::Left,
-                        })((payload, addr))
-                    })
+                let peers: Vec<_> = if let Some(count) = leader_fanout {
+                    cluster_nodes
+                        .get_broadcast_peers(&key, count)
+                        .into_iter()
+                        .filter_map(|ci| {
+                            ci.tvu(protocol)
+                                .filter(|addr| socket_addr_space.check(addr))
+                        })
+                        .collect()
+                } else {
+                    cluster_nodes
+                        .get_broadcast_peer(&key)
+                        .and_then(|ci| {
+                            ci.tvu(protocol)
+                                .filter(|addr| socket_addr_space.check(addr))
+                        })
+                        .into_iter()
+                        .collect()
+                };
+                peers.into_iter().map(move |addr| {
+                    (match protocol {
+                        Protocol::QUIC => Either::Right,
+                        Protocol::UDP => Either::Left,
+                    })((payload, addr))
+                })
             })
         })
         .partition_map(std::convert::identity);
@@ -775,7 +799,7 @@ pub mod test {
             blockstore.clone(),
             bank_forks,
             quic_endpoint_sender,
-            StandardBroadcastRun::new(0),
+            StandardBroadcastRun::new(0, None),
             None,
         );
 

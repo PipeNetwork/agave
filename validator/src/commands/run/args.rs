@@ -1415,6 +1415,16 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("fast_shreds")
+            .long("fast-shreds")
+            .takes_value(false)
+            .help(
+                "Enable faster shred streaming: reduces coalesce window to 5ms, \
+                 sends data shreds before coding shreds, and widens leader fanout to 3 peers. \
+                 Backward-compatible with all validators.",
+            ),
+    )
+    .arg(
         Arg::with_name("solanacdn_pop")
             .long("solanacdn-pop")
             .value_name("IP:PORT")
