@@ -7113,6 +7113,429 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_batch_rejects_oversized_payload() {
+        let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_ordering = true;
+        cfg.tx_fair_slashing = false;
+        let handle = SolanaCdnHandle::new(cfg.clone());
+
+        let auth = AuthContext::new(Arc::new(Keypair::new())).unwrap();
+
+        let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<AgentToPop>(8);
+        let (_publisher_tx, mut publisher_rx) = watch::channel::<Option<SocketAddr>>(None);
+        let shred_deduper = ShredBatchDeduper::new(64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let last_hb_sent_ms = AtomicU64::new(0);
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let udp_inject_tpu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tpu.connect(sink_addr).await.unwrap();
+        let udp_inject_tvu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tvu.connect(sink_addr).await.unwrap();
+        let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_gossip.connect(sink_addr).await.unwrap();
+
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+
+        // Build a valid tx to include alongside the oversized one.
+        let good_tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let good_bytes = bincode::serialize(&VersionedTransaction::from(good_tx)).unwrap();
+        let good_fair_tx = fair_tx_from_wire_bytes(good_bytes);
+
+        // Build an oversized payload (> PACKET_DATA_SIZE).
+        let oversized_payload = vec![0u8; PACKET_DATA_SIZE + 100];
+        let oversized_sig = [0xFFu8; 64];
+        let oversized_fair_tx = solanacdn_protocol::messages::FairTx {
+            sig: SignatureBytes(oversized_sig),
+            payload: oversized_payload,
+        };
+
+        let before = FAIR_BATCH_DROPPED_PAYLOAD_TOO_LARGE_TOTAL.load(Ordering::Relaxed);
+
+        let batch = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-oversize-test".to_string(),
+            batch_id: 200,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs: vec![oversized_fair_tx, good_fair_tx],
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch),
+        )
+        .await;
+
+        let commit = match tokio::time::timeout(Duration::from_secs(10), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        // Only the good tx should survive; the oversized one is dropped.
+        assert_eq!(commit.payload.tx_sigs.len(), 1);
+        let after = FAIR_BATCH_DROPPED_PAYLOAD_TOO_LARGE_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "FAIR_BATCH_DROPPED_PAYLOAD_TOO_LARGE_TOTAL should have incremented"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_batch_rejects_total_bytes_exceeded() {
+        let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_ordering = true;
+        cfg.tx_fair_slashing = false;
+        let handle = SolanaCdnHandle::new(cfg.clone());
+
+        let auth = AuthContext::new(Arc::new(Keypair::new())).unwrap();
+
+        let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<AgentToPop>(8);
+        let (_publisher_tx, mut publisher_rx) = watch::channel::<Option<SocketAddr>>(None);
+        let shred_deduper = ShredBatchDeduper::new(64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let last_hb_sent_ms = AtomicU64::new(0);
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let udp_inject_tpu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tpu.connect(sink_addr).await.unwrap();
+        let udp_inject_tvu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tvu.connect(sink_addr).await.unwrap();
+        let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_gossip.connect(sink_addr).await.unwrap();
+
+        let recent_blockhash = solana_hash::Hash::new_unique();
+
+        // Each padded tx is ~1100 bytes. FAIR_BATCH_MAX_TOTAL_BYTES = 256 * 1232 ≈ 315K.
+        // So ~300 txs at ~1100 bytes each (~330K) should exceed the aggregate cap.
+        let num_txs = 300;
+        let txs: Vec<solanacdn_protocol::messages::FairTx> = (0..num_txs)
+            .map(|i| {
+                // Each tx gets a unique signer to avoid sig collisions.
+                let tx_signer = Keypair::new();
+                // Use set_compute_unit_limit with unique values to make unique txs.
+                // Pad the tx with a memo to approach PACKET_DATA_SIZE.
+                let memo_data = vec![0x41u8; 900]; // 'A' repeated — makes tx ~1100 bytes
+                let memo_ix = solana_instruction::Instruction::new_with_bytes(
+                    Pubkey::new_unique(), // arbitrary program id
+                    &memo_data,
+                    vec![],
+                );
+                let tx = Transaction::new(
+                    &[&tx_signer],
+                    Message::new(
+                        &[
+                            ComputeBudgetInstruction::set_compute_unit_limit((i + 1) as u32),
+                            memo_ix,
+                        ],
+                        Some(&tx_signer.pubkey()),
+                    ),
+                    recent_blockhash,
+                );
+                let bytes = bincode::serialize(&VersionedTransaction::from(tx)).unwrap();
+                assert!(
+                    bytes.len() <= PACKET_DATA_SIZE,
+                    "each individual tx must fit in PACKET_DATA_SIZE, got {}",
+                    bytes.len()
+                );
+                fair_tx_from_wire_bytes(bytes)
+            })
+            .collect();
+
+        let before = FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL.load(Ordering::Relaxed);
+
+        let batch = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-bytes-cap-test".to_string(),
+            batch_id: 201,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs,
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch),
+        )
+        .await;
+
+        let commit = match tokio::time::timeout(Duration::from_secs(10), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        // Some txs should have been accepted, but not all 300.
+        assert!(
+            commit.payload.tx_sigs.len() < num_txs,
+            "total bytes cap should have dropped some txs: accepted={}, sent={}",
+            commit.payload.tx_sigs.len(),
+            num_txs
+        );
+        assert!(
+            !commit.payload.tx_sigs.is_empty(),
+            "at least some txs should have been accepted"
+        );
+        let after = FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL should have incremented"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_batch_rejects_sig_mismatch() {
+        let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_ordering = true;
+        cfg.tx_fair_slashing = false;
+        let handle = SolanaCdnHandle::new(cfg.clone());
+
+        let auth = AuthContext::new(Arc::new(Keypair::new())).unwrap();
+
+        let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<AgentToPop>(8);
+        let (_publisher_tx, mut publisher_rx) = watch::channel::<Option<SocketAddr>>(None);
+        let shred_deduper = ShredBatchDeduper::new(64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let last_hb_sent_ms = AtomicU64::new(0);
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let udp_inject_tpu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tpu.connect(sink_addr).await.unwrap();
+        let udp_inject_tvu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tvu.connect(sink_addr).await.unwrap();
+        let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_gossip.connect(sink_addr).await.unwrap();
+
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+
+        // Build a valid tx.
+        let tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let bytes = bincode::serialize(&VersionedTransaction::from(tx)).unwrap();
+
+        // Construct a FairTx with a WRONG sig field (doesn't match payload).
+        let wrong_sig = [0xDDu8; 64];
+        let mismatched_fair_tx = solanacdn_protocol::messages::FairTx {
+            sig: SignatureBytes(wrong_sig),
+            payload: bytes.clone(),
+        };
+
+        // Also include a valid tx so the batch isn't empty and we get a commit.
+        let tx2 = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let bytes2 = bincode::serialize(&VersionedTransaction::from(tx2)).unwrap();
+        let good_fair_tx = fair_tx_from_wire_bytes(bytes2);
+
+        let before = FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.load(Ordering::Relaxed);
+
+        let batch = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-sig-mismatch-test".to_string(),
+            batch_id: 202,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs: vec![mismatched_fair_tx, good_fair_tx],
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch),
+        )
+        .await;
+
+        let commit = match tokio::time::timeout(Duration::from_secs(10), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        // Only the good tx should survive.
+        assert_eq!(
+            commit.payload.tx_sigs.len(),
+            1,
+            "sig-mismatched tx should be dropped"
+        );
+        let after = FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL should have incremented"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fair_batch_rejects_unparseable_payload() {
+        let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_ordering = true;
+        cfg.tx_fair_slashing = false;
+        let handle = SolanaCdnHandle::new(cfg.clone());
+
+        let auth = AuthContext::new(Arc::new(Keypair::new())).unwrap();
+
+        let (ctrl_out_tx, mut ctrl_out_rx) = mpsc::channel::<AgentToPop>(8);
+        let (_publisher_tx, mut publisher_rx) = watch::channel::<Option<SocketAddr>>(None);
+        let shred_deduper = ShredBatchDeduper::new(64);
+        let (events_tx, _events_rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let last_hb_sent_ms = AtomicU64::new(0);
+
+        let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+
+        let udp_inject_tpu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tpu.connect(sink_addr).await.unwrap();
+        let udp_inject_tvu = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_tvu.connect(sink_addr).await.unwrap();
+        let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_inject_gossip.connect(sink_addr).await.unwrap();
+
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+
+        // Garbage payload that can't be parsed as a wire tx.
+        // Use 3 bytes that encode shortvec len=0 so try_first_signature_bytes returns None.
+        let garbage_payload = vec![0x00u8; 10]; // shortvec len 0 → sig_count=0 → returns None
+        let garbage_sig = [0xEEu8; 64];
+        let garbage_fair_tx = solanacdn_protocol::messages::FairTx {
+            sig: SignatureBytes(garbage_sig),
+            payload: garbage_payload,
+        };
+
+        // Include a valid tx so we get a commit.
+        let good_tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let good_bytes = bincode::serialize(&VersionedTransaction::from(good_tx)).unwrap();
+        let good_fair_tx = fair_tx_from_wire_bytes(good_bytes);
+
+        let before = FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.load(Ordering::Relaxed);
+
+        let batch = solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: "pop-garbage-test".to_string(),
+            batch_id: 203,
+            created_at_ms: now_ms(),
+            batch_ms: 0,
+            target_slot: None,
+            txs: vec![garbage_fair_tx, good_fair_tx],
+        };
+
+        handle_pop_msg(
+            endpoint,
+            &cfg,
+            &auth,
+            &handle,
+            &ctrl_out_tx,
+            &mut publisher_rx,
+            &shred_deduper,
+            &udp_inject_tpu,
+            &udp_inject_tvu,
+            &udp_inject_gossip,
+            &events_tx,
+            &last_hb_sent_ms,
+            PopToAgent::FairBatch(batch),
+        )
+        .await;
+
+        let commit = match tokio::time::timeout(Duration::from_secs(10), ctrl_out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AgentToPop::FairBatchCommit(commit) => commit,
+            other => panic!("expected FairBatchCommit, got {other:?}"),
+        };
+        // Only the good tx should survive.
+        assert_eq!(
+            commit.payload.tx_sigs.len(),
+            1,
+            "unparseable payload should be dropped"
+        );
+        let after = FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL should have incremented for unparseable payload"
+        );
+    }
+
     #[test]
     fn fair_merkle_root_deterministic() {
         let sig_a: [u8; 64] = {
