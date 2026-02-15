@@ -85,6 +85,9 @@ pub enum Error {
     RecvTimeout(#[from] crossbeam_channel::RecvTimeoutError),
     #[error("Xdp channel full")]
     XdpChannelFull,
+    #[cfg(feature = "dpdk")]
+    #[error("Dpdk channel full")]
+    DpdkChannelFull,
     #[error("Send")]
     Send,
     #[error(transparent)]
@@ -128,6 +131,7 @@ impl BroadcastStageType {
         shred_version: u16,
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         xdp_sender: Option<XdpSender>,
+        dpdk_sender: Option<crate::DpdkUdpSender>,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
@@ -141,6 +145,7 @@ impl BroadcastStageType {
                 quic_endpoint_sender,
                 StandardBroadcastRun::new(shred_version),
                 xdp_sender,
+                dpdk_sender,
             ),
 
             BroadcastStageType::FailEntryVerification => BroadcastStage::new(
@@ -154,6 +159,7 @@ impl BroadcastStageType {
                 quic_endpoint_sender,
                 FailEntryVerificationBroadcastRun::new(shred_version),
                 xdp_sender,
+                dpdk_sender,
             ),
 
             BroadcastStageType::BroadcastFakeShreds => BroadcastStage::new(
@@ -167,6 +173,7 @@ impl BroadcastStageType {
                 quic_endpoint_sender,
                 BroadcastFakeShredsRun::new(0, shred_version),
                 xdp_sender,
+                dpdk_sender,
             ),
 
             BroadcastStageType::BroadcastDuplicates(config) => BroadcastStage::new(
@@ -180,6 +187,7 @@ impl BroadcastStageType {
                 quic_endpoint_sender,
                 BroadcastDuplicatesRun::new(shred_version, config.clone()),
                 xdp_sender,
+                dpdk_sender,
             ),
         }
     }
@@ -298,7 +306,10 @@ impl BroadcastStage {
         quic_endpoint_sender: AsyncSender<(SocketAddr, Bytes)>,
         mut broadcast_stage_run: impl BroadcastRun + Send + 'static + Clone,
         xdp_sender: Option<XdpSender>,
+        dpdk_sender: Option<crate::DpdkUdpSender>,
     ) -> Self {
+        let _ = &dpdk_sender;
+
         let (socket_sender, socket_receiver) = unbounded();
         let (blockstore_sender, blockstore_receiver) = unbounded();
         let bs_run = broadcast_stage_run.clone();
@@ -357,13 +368,29 @@ impl BroadcastStage {
             let bank_forks = bank_forks.clone();
             let quic_endpoint_sender = quic_endpoint_sender.clone();
             let xdp_sender = xdp_sender.clone();
+            #[cfg(feature = "dpdk")]
+            let dpdk_sender = dpdk_sender.clone();
             let run_transmit = move || loop {
-                let sock_variant = match xdp_sender.as_ref() {
-                    Some(xdp) => BroadcastSocket::Xdp(xdp),
-                    None => {
+                let sock_variant = {
+                    #[cfg(feature = "dpdk")]
+                    if let Some(dpdk) = dpdk_sender.as_ref() {
+                        BroadcastSocket::Dpdk(dpdk)
+                    } else if let Some(xdp) = xdp_sender.as_ref() {
+                        BroadcastSocket::Xdp(xdp)
+                    } else {
                         let active_index = cluster_info.bind_ip_addrs().active_index();
                         let active_socket = &group[active_index];
                         BroadcastSocket::Udp(active_socket)
+                    }
+
+                    #[cfg(not(feature = "dpdk"))]
+                    match xdp_sender.as_ref() {
+                        Some(xdp) => BroadcastSocket::Xdp(xdp),
+                        None => {
+                            let active_index = cluster_info.bind_ip_addrs().active_index();
+                            let active_socket = &group[active_index];
+                            BroadcastSocket::Udp(active_socket)
+                        }
                     }
                 };
                 let res = bs_transmit.transmit(
@@ -482,6 +509,8 @@ fn update_peer_stats(
 pub enum BroadcastSocket<'a> {
     Udp(&'a UdpSocket),
     Xdp(&'a XdpSender),
+    #[cfg(feature = "dpdk")]
+    Dpdk(&'a crate::DpdkUdpSender),
 }
 
 /// Broadcasts shreds from the leader (i.e. this node) to the root of the
@@ -555,6 +584,21 @@ pub fn broadcast_shreds(
             }
             send_xdp_time.stop();
             transmit_stats.send_xdp_elapsed += send_xdp_time.as_us();
+        }
+        #[cfg(feature = "dpdk")]
+        BroadcastSocket::Dpdk(s) => {
+            let mut send_dpdk_time = Measure::start("send_dpdk");
+            for (payload, addr) in packets {
+                let SocketAddr::V4(addr) = addr else {
+                    continue;
+                };
+                if s.try_send_to(addr, payload.bytes.clone()).is_err() {
+                    transmit_stats.dropped_packets_dpdk += 1;
+                    result = Err(Error::DpdkChannelFull);
+                }
+            }
+            send_dpdk_time.stop();
+            transmit_stats.send_dpdk_elapsed += send_dpdk_time.as_us();
         }
     }
 
@@ -771,6 +815,7 @@ pub mod test {
             bank_forks,
             quic_endpoint_sender,
             StandardBroadcastRun::new(0),
+            None,
             None,
         );
 

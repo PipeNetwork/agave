@@ -26,6 +26,7 @@ use {
     },
     bytes::Bytes,
     crossbeam_channel::{bounded, unbounded, Receiver},
+    quinn::AsyncUdpSocket,
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
@@ -50,14 +51,17 @@ use {
     },
     solana_streamer::{
         quic::{
-            spawn_server_with_cancel, spawn_simple_qos_server_with_cancel,
-            SimpleQosQuicStreamerConfig, SpawnServerResult, SwQosQuicStreamerConfig,
+            spawn_server_with_abstract_socket_with_cancel, spawn_server_with_cancel,
+            spawn_simple_qos_server_with_abstract_socket_with_cancel,
+            spawn_simple_qos_server_with_cancel, SimpleQosQuicStreamerConfig, SpawnServerResult,
+            SwQosQuicStreamerConfig,
         },
-        streamer::StakedNodes,
+        streamer::{PacketBatchReceiver, PacketBatchSender, StakedNodes},
     },
     solana_turbine::{
         broadcast_stage::{BroadcastStage, BroadcastStageType},
         xdp::XdpSender,
+        DpdkUdpSender,
     },
     std::{
         collections::HashMap,
@@ -79,9 +83,25 @@ pub struct TpuSockets {
     pub transactions_quic: Vec<UdpSocket>,
     pub transactions_forwards_quic: Vec<UdpSocket>,
     pub vote_quic: Vec<UdpSocket>,
+    pub dpdk_quic: Option<TpuDpdkQuicSockets>,
     /// Client-side socket for the forwarding votes.
     pub vote_forwarding_client: UdpSocket,
     pub vortexor_receivers: Option<Vec<UdpSocket>>,
+}
+
+pub struct TpuDpdkQuicSockets {
+    pub transactions: Vec<Arc<dyn AsyncUdpSocket>>,
+    pub transaction_forwards: Vec<Arc<dyn AsyncUdpSocket>>,
+    pub vote: Vec<Arc<dyn AsyncUdpSocket>>,
+}
+
+pub struct TpuIngressChannels {
+    pub packet_sender: PacketBatchSender,
+    pub packet_receiver: PacketBatchReceiver,
+    pub vote_packet_sender: PacketBatchSender,
+    pub vote_packet_receiver: PacketBatchReceiver,
+    pub forwarded_packet_sender: PacketBatchSender,
+    pub forwarded_packet_receiver: PacketBatchReceiver,
 }
 
 /// The `SigVerifier` enum is used to determine whether to use a local or remote signature verifier.
@@ -127,12 +147,14 @@ impl Tpu {
         entry_receiver: Receiver<WorkingBankEntry>,
         retransmit_slots_receiver: Receiver<Slot>,
         sockets: TpuSockets,
+        ingress: TpuIngressChannels,
         subscriptions: Option<Arc<RpcSubscriptions>>,
         transaction_status_sender: Option<TransactionStatusSender>,
         entry_notification_sender: Option<EntryNotifierSender>,
         blockstore: Arc<Blockstore>,
         broadcast_type: &BroadcastStageType,
         xdp_sender: Option<XdpSender>,
+        dpdk_sender: Option<DpdkUdpSender>,
         exit: Arc<AtomicBool>,
         shred_version: u16,
         vote_tracker: Arc<VoteTracker>,
@@ -172,13 +194,44 @@ impl Tpu {
             transactions_quic: transactions_quic_sockets,
             transactions_forwards_quic: transactions_forwards_quic_sockets,
             vote_quic: tpu_vote_quic_sockets,
+            dpdk_quic,
             vote_forwarding_client: vote_forwarding_client_socket,
             vortexor_receivers,
         } = sockets;
 
-        let (packet_sender, packet_receiver) = unbounded();
-        let (vote_packet_sender, vote_packet_receiver) = unbounded();
-        let (forwarded_packet_sender, forwarded_packet_receiver) = unbounded();
+        let (
+            dpdk_transactions_quic_sockets,
+            dpdk_transactions_forwards_quic_sockets,
+            dpdk_vote_quic_sockets,
+        ) = if let Some(dpdk_quic) = dpdk_quic {
+            (
+                Some(dpdk_quic.transactions),
+                Some(dpdk_quic.transaction_forwards),
+                Some(dpdk_quic.vote),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        let TpuIngressChannels {
+            packet_sender,
+            packet_receiver,
+            vote_packet_sender,
+            vote_packet_receiver,
+            forwarded_packet_sender,
+            forwarded_packet_receiver,
+        } = ingress;
+
+        let use_kernel_udp_receivers = dpdk_sender.is_none();
+        let transactions_sockets = use_kernel_udp_receivers
+            .then_some(transactions_sockets)
+            .unwrap_or_default();
+        let tpu_forwards_sockets = use_kernel_udp_receivers
+            .then_some(tpu_forwards_sockets)
+            .unwrap_or_default();
+        let tpu_vote_sockets = use_kernel_udp_receivers
+            .then_some(tpu_vote_sockets)
+            .unwrap_or_default();
         let fetch_stage = FetchStage::new_with_sender(
             transactions_sockets,
             tpu_forwards_sockets,
@@ -191,7 +244,7 @@ impl Tpu {
             poh_recorder,
             None, // coalesce
             Some(bank_forks.read().unwrap().get_vote_only_mode_signal()),
-            tpu_enable_udp,
+            tpu_enable_udp && use_kernel_udp_receivers,
         );
 
         let staked_nodes_updater_service = StakedNodesUpdaterService::new(
@@ -215,17 +268,31 @@ impl Tpu {
             endpoints: _,
             thread: tpu_vote_quic_t,
             key_updater: vote_streamer_key_updater,
-        } = spawn_simple_qos_server_with_cancel(
-            "solQuicTVo",
-            "quic_streamer_tpu_vote",
-            tpu_vote_quic_sockets,
-            keypair,
-            vote_packet_sender.clone(),
-            staked_nodes.clone(),
-            vote_quic_server_config.quic_streamer_config,
-            vote_quic_server_config.qos_config,
-            cancel.clone(),
-        )
+        } = if let Some(dpdk_vote_quic_sockets) = dpdk_vote_quic_sockets {
+            spawn_simple_qos_server_with_abstract_socket_with_cancel(
+                "solQuicTVo",
+                "quic_streamer_tpu_vote",
+                dpdk_vote_quic_sockets,
+                keypair,
+                vote_packet_sender.clone(),
+                staked_nodes.clone(),
+                vote_quic_server_config.quic_streamer_config,
+                vote_quic_server_config.qos_config,
+                cancel.clone(),
+            )
+        } else {
+            spawn_simple_qos_server_with_cancel(
+                "solQuicTVo",
+                "quic_streamer_tpu_vote",
+                tpu_vote_quic_sockets,
+                keypair,
+                vote_packet_sender.clone(),
+                staked_nodes.clone(),
+                vote_quic_server_config.quic_streamer_config,
+                vote_quic_server_config.qos_config,
+                cancel.clone(),
+            )
+        }
         .unwrap();
 
         let (tpu_quic_t, key_updater) = if vortexor_receivers.is_none() {
@@ -234,17 +301,31 @@ impl Tpu {
                 endpoints: _,
                 thread: tpu_quic_t,
                 key_updater,
-            } = spawn_server_with_cancel(
-                "solQuicTpu",
-                "quic_streamer_tpu",
-                transactions_quic_sockets,
-                keypair,
-                packet_sender,
-                staked_nodes.clone(),
-                tpu_quic_server_config.quic_streamer_config,
-                tpu_quic_server_config.qos_config,
-                cancel.clone(),
-            )
+            } = if let Some(dpdk_transactions_quic_sockets) = dpdk_transactions_quic_sockets {
+                spawn_server_with_abstract_socket_with_cancel(
+                    "solQuicTpu",
+                    "quic_streamer_tpu",
+                    dpdk_transactions_quic_sockets,
+                    keypair,
+                    packet_sender,
+                    staked_nodes.clone(),
+                    tpu_quic_server_config.quic_streamer_config,
+                    tpu_quic_server_config.qos_config,
+                    cancel.clone(),
+                )
+            } else {
+                spawn_server_with_cancel(
+                    "solQuicTpu",
+                    "quic_streamer_tpu",
+                    transactions_quic_sockets,
+                    keypair,
+                    packet_sender,
+                    staked_nodes.clone(),
+                    tpu_quic_server_config.quic_streamer_config,
+                    tpu_quic_server_config.qos_config,
+                    cancel.clone(),
+                )
+            }
             .unwrap();
             (Some(tpu_quic_t), Some(key_updater))
         } else {
@@ -257,17 +338,33 @@ impl Tpu {
                 endpoints: _,
                 thread: tpu_forwards_quic_t,
                 key_updater: forwards_key_updater,
-            } = spawn_server_with_cancel(
-                "solQuicTpuFwd",
-                "quic_streamer_tpu_forwards",
-                transactions_forwards_quic_sockets,
-                keypair,
-                forwarded_packet_sender,
-                staked_nodes.clone(),
-                tpu_fwd_quic_server_config.quic_streamer_config,
-                tpu_fwd_quic_server_config.qos_config,
-                cancel,
-            )
+            } = if let Some(dpdk_transactions_forwards_quic_sockets) =
+                dpdk_transactions_forwards_quic_sockets
+            {
+                spawn_server_with_abstract_socket_with_cancel(
+                    "solQuicTpuFwd",
+                    "quic_streamer_tpu_forwards",
+                    dpdk_transactions_forwards_quic_sockets,
+                    keypair,
+                    forwarded_packet_sender,
+                    staked_nodes.clone(),
+                    tpu_fwd_quic_server_config.quic_streamer_config,
+                    tpu_fwd_quic_server_config.qos_config,
+                    cancel,
+                )
+            } else {
+                spawn_server_with_cancel(
+                    "solQuicTpuFwd",
+                    "quic_streamer_tpu_forwards",
+                    transactions_forwards_quic_sockets,
+                    keypair,
+                    forwarded_packet_sender,
+                    staked_nodes.clone(),
+                    tpu_fwd_quic_server_config.quic_streamer_config,
+                    tpu_fwd_quic_server_config.qos_config,
+                    cancel,
+                )
+            }
             .unwrap();
             (Some(tpu_forwards_quic_t), Some(forwards_key_updater))
         } else {
@@ -381,6 +478,7 @@ impl Tpu {
             shred_version,
             turbine_quic_endpoint_sender,
             xdp_sender,
+            dpdk_sender,
         );
 
         let mut key_notifiers = key_notifiers.write().unwrap();

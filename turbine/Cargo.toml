@@ -11,8 +11,10 @@ edition = { workspace = true }
 
 [features]
 agave-unstable-api = []
+dpdk = ["dep:agave-dpdk", "agave-dpdk/dpdk"]
 
 [dependencies]
+agave-dpdk = { workspace = true, optional = true }
 agave-feature-set = { workspace = true }
 agave-votor = { workspace = true }
 agave-xdp = { workspace = true }

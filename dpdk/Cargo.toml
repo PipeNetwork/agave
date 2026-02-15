@@ -1,0 +1,35 @@
+[package]
+name = "agave-dpdk"
+documentation = "https://docs.rs/agave-dpdk"
+version = { workspace = true }
+authors = { workspace = true }
+description = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+agave-unstable-api = []
+dpdk = ["dep:solana-metrics", "agave-unstable-api"]
+
+[dependencies]
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+quinn = { workspace = true }
+solana-packet = { workspace = true }
+solana-perf = { workspace = true }
+solana-metrics = { workspace = true, optional = true }
+solana-streamer = { workspace = true }
+solana-time-utils = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+pkg-config = { workspace = true }

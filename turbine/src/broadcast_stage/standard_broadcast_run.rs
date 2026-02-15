@@ -382,6 +382,8 @@ impl StandardBroadcastRun {
         trace!("Broadcasting {:?} shreds", shreds.len());
         let mut transmit_stats = TransmitShredsStats {
             is_xdp: matches!(sock, BroadcastSocket::Xdp(_)),
+            #[cfg(feature = "dpdk")]
+            is_dpdk: matches!(sock, BroadcastSocket::Dpdk(_)),
             ..Default::default()
         };
         // Broadcast the shreds

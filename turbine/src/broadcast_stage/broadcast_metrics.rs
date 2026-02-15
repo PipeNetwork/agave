@@ -23,6 +23,9 @@ pub struct TransmitShredsStats {
     pub send_quic_elapsed: u64,
     /// microseconds spent sending packets to xdp endpoint
     pub send_xdp_elapsed: u64,
+    /// microseconds spent sending packets to dpdk endpoint
+    #[cfg(feature = "dpdk")]
+    pub send_dpdk_elapsed: u64,
     /// Time spent figuring out which shreds to send where
     pub shred_select: u64,
     pub num_shreds: usize,
@@ -30,25 +33,66 @@ pub struct TransmitShredsStats {
     pub(crate) dropped_packets_udp: usize,
     pub(crate) dropped_packets_quic: usize,
     pub(crate) dropped_packets_xdp: usize,
+    #[cfg(feature = "dpdk")]
+    pub(crate) dropped_packets_dpdk: usize,
     pub(crate) is_xdp: bool,
+    #[cfg(feature = "dpdk")]
+    pub(crate) is_dpdk: bool,
 }
 
 impl BroadcastStats for TransmitShredsStats {
     fn update(&mut self, new_stats: &TransmitShredsStats) {
         self.is_xdp = new_stats.is_xdp;
+        #[cfg(feature = "dpdk")]
+        {
+            self.is_dpdk = new_stats.is_dpdk;
+        }
         self.transmit_elapsed += new_stats.transmit_elapsed;
         self.send_mmsg_elapsed += new_stats.send_mmsg_elapsed;
         self.send_quic_elapsed += new_stats.send_quic_elapsed;
         self.send_xdp_elapsed += new_stats.send_xdp_elapsed;
+        #[cfg(feature = "dpdk")]
+        {
+            self.send_dpdk_elapsed += new_stats.send_dpdk_elapsed;
+        }
         self.num_shreds += new_stats.num_shreds;
         self.shred_select += new_stats.shred_select;
         self.total_packets += new_stats.total_packets;
         self.dropped_packets_udp += new_stats.dropped_packets_udp;
         self.dropped_packets_quic += new_stats.dropped_packets_quic;
         self.dropped_packets_xdp += new_stats.dropped_packets_xdp;
+        #[cfg(feature = "dpdk")]
+        {
+            self.dropped_packets_dpdk += new_stats.dropped_packets_dpdk;
+        }
     }
     fn report_stats(&mut self, slot: Slot, slot_start: Instant, was_interrupted: bool) {
         if was_interrupted {
+            #[cfg(feature = "dpdk")]
+            datapoint_info!(
+                "broadcast-transmit-shreds-interrupted-stats",
+                "is_xdp" => self.is_xdp.to_string(),
+                "is_dpdk" => self.is_dpdk.to_string(),
+                ("slot", slot as i64, i64),
+                ("transmit_elapsed", self.transmit_elapsed as i64, i64),
+                ("send_mmsg_elapsed", self.send_mmsg_elapsed as i64, i64),
+                ("send_quic_elapsed", self.send_quic_elapsed as i64, i64),
+                ("send_xdp_elapsed", self.send_xdp_elapsed as i64, i64),
+                ("send_dpdk_elapsed", self.send_dpdk_elapsed as i64, i64),
+                ("num_shreds", self.num_shreds as i64, i64),
+                ("shred_select", self.shred_select as i64, i64),
+                ("total_packets", self.total_packets as i64, i64),
+                ("dropped_packets_udp", self.dropped_packets_udp as i64, i64),
+                (
+                    "dropped_packets_quic",
+                    self.dropped_packets_quic as i64,
+                    i64
+                ),
+                ("dropped_packets_xdp", self.dropped_packets_xdp as i64, i64),
+                ("dropped_packets_dpdk", self.dropped_packets_dpdk as i64, i64),
+            );
+
+            #[cfg(not(feature = "dpdk"))]
             datapoint_info!(
                 "broadcast-transmit-shreds-interrupted-stats",
                 "is_xdp" => self.is_xdp.to_string(),
@@ -69,6 +113,38 @@ impl BroadcastStats for TransmitShredsStats {
                 ("dropped_packets_xdp", self.dropped_packets_xdp as i64, i64),
             );
         } else {
+            #[cfg(feature = "dpdk")]
+            datapoint_info!(
+                "broadcast-transmit-shreds-stats",
+                "is_xdp" => self.is_xdp.to_string(),
+                "is_dpdk" => self.is_dpdk.to_string(),
+                ("slot", slot as i64, i64),
+                (
+                    "end_to_end_elapsed",
+                    // `slot_start` signals when the first batch of shreds was
+                    // received, used to measure duration of broadcast
+                    slot_start.elapsed().as_micros() as i64,
+                    i64
+                ),
+                ("transmit_elapsed", self.transmit_elapsed as i64, i64),
+                ("send_mmsg_elapsed", self.send_mmsg_elapsed as i64, i64),
+                ("send_quic_elapsed", self.send_quic_elapsed as i64, i64),
+                ("send_xdp_elapsed", self.send_xdp_elapsed as i64, i64),
+                ("send_dpdk_elapsed", self.send_dpdk_elapsed as i64, i64),
+                ("num_shreds", self.num_shreds as i64, i64),
+                ("shred_select", self.shred_select as i64, i64),
+                ("total_packets", self.total_packets as i64, i64),
+                ("dropped_packets_udp", self.dropped_packets_udp as i64, i64),
+                (
+                    "dropped_packets_quic",
+                    self.dropped_packets_quic as i64,
+                    i64
+                ),
+                ("dropped_packets_xdp", self.dropped_packets_xdp as i64, i64),
+                ("dropped_packets_dpdk", self.dropped_packets_dpdk as i64, i64),
+            );
+
+            #[cfg(not(feature = "dpdk"))]
             datapoint_info!(
                 "broadcast-transmit-shreds-stats",
                 "is_xdp" => self.is_xdp.to_string(),
@@ -244,6 +320,7 @@ mod test {
                 dropped_packets_quic: 9,
                 dropped_packets_xdp: 10,
                 is_xdp: false,
+                ..Default::default()
             },
             &Some(BroadcastShredBatchInfo {
                 slot: 0,
@@ -281,6 +358,7 @@ mod test {
                 dropped_packets_quic: 19,
                 dropped_packets_xdp: 20,
                 is_xdp: false,
+                ..Default::default()
             },
             &None,
         );
@@ -315,6 +393,7 @@ mod test {
                 dropped_packets_quic: 1,
                 dropped_packets_xdp: 1,
                 is_xdp: false,
+                ..Default::default()
             },
             &Some(BroadcastShredBatchInfo {
                 slot: 0,

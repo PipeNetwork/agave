@@ -47,7 +47,8 @@ use {
         vote_sender_types::ReplayVoteSender,
     },
     solana_streamer::evicting_sender::EvictingSender,
-    solana_turbine::{retransmit_stage::RetransmitStage, xdp::XdpSender},
+    solana_streamer::streamer::{PacketBatchReceiver, StreamerReceiveStats},
+    solana_turbine::{retransmit_stage::RetransmitStage, xdp::XdpSender, DpdkUdpSender},
     std::{
         collections::HashSet,
         net::{SocketAddr, UdpSocket},
@@ -101,6 +102,8 @@ pub struct TvuConfig {
     pub replay_transactions_threads: NonZeroUsize,
     pub shred_sigverify_threads: NonZeroUsize,
     pub xdp_sender: Option<XdpSender>,
+    pub dpdk_sender: Option<DpdkUdpSender>,
+    pub dpdk_shred_fetch_receiver: Option<(PacketBatchReceiver, Arc<StreamerReceiveStats>)>,
 }
 
 impl Default for TvuConfig {
@@ -115,6 +118,8 @@ impl Default for TvuConfig {
             replay_transactions_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             shred_sigverify_threads: NonZeroUsize::new(1).expect("1 is non-zero"),
             xdp_sender: None,
+            dpdk_sender: None,
+            dpdk_shred_fetch_receiver: None,
         }
     }
 }
@@ -192,6 +197,7 @@ impl Tvu {
         let fetch_sockets: Vec<Arc<UdpSocket>> = fetch_sockets.into_iter().map(Arc::new).collect();
         let fetch_stage = ShredFetchStage::new(
             fetch_sockets,
+            tvu_config.dpdk_shred_fetch_receiver,
             turbine_quic_endpoint_receiver,
             repair_response_quic_receiver,
             repair_socket.clone(),
@@ -230,6 +236,7 @@ impl Tvu {
             rpc_subscriptions.clone(),
             slot_status_notifier.clone(),
             tvu_config.xdp_sender,
+            tvu_config.dpdk_sender,
             // votor_event_sender is Alpenglow specific sender, it is None if Alpenglow is not enabled.
             None,
         );

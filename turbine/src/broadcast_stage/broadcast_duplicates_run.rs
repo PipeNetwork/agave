@@ -396,13 +396,26 @@ impl BroadcastRun for BroadcastDuplicatesRun {
             .flatten()
             .collect();
 
-        let sock = match sock {
-            BroadcastSocket::Udp(sock) => sock,
+        match sock {
+            BroadcastSocket::Udp(sock) => {
+                batch_send(sock, packets).map_err(|SendPktsError::IoError(err, _)| Error::Io(err))
+            }
             BroadcastSocket::Xdp(_) => {
                 panic!("Xdp not supported for duplicate shreds run");
             }
-        };
-        batch_send(sock, packets).map_err(|SendPktsError::IoError(err, _)| Error::Io(err))
+            #[cfg(feature = "dpdk")]
+            BroadcastSocket::Dpdk(sock) => {
+                for (payload, addr) in packets {
+                    let SocketAddr::V4(addr) = addr else {
+                        continue;
+                    };
+                    if sock.try_send_to(addr, payload.bytes.clone()).is_err() {
+                        return Err(Error::DpdkChannelFull);
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {

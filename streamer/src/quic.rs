@@ -12,7 +12,7 @@ use {
     pem::Pem,
     quinn::{
         crypto::rustls::{NoInitialCipherSuite, QuicServerConfig},
-        Endpoint, IdleTimeout, ServerConfig, VarInt,
+        AsyncUdpSocket, Endpoint, IdleTimeout, ServerConfig, VarInt,
     },
     rustls::KeyLogFile,
     solana_keypair::Keypair,
@@ -839,6 +839,54 @@ where
     })
 }
 
+/// Generic function to spawn a QUIC server with any QoS implementation using abstract UDP sockets
+fn spawn_server_with_cancel_generic_abstract_socket<Q, C>(
+    thread_name: &'static str,
+    metrics_name: &'static str,
+    stats: Arc<StreamerStats>,
+    sockets: impl IntoIterator<Item = Arc<dyn AsyncUdpSocket>>,
+    keypair: &Keypair,
+    packet_sender: Sender<PacketBatch>,
+    quic_server_params: QuicStreamerConfig,
+    qos: Arc<Q>,
+    cancel: CancellationToken,
+) -> Result<SpawnServerResult, QuicServerError>
+where
+    Q: QosController<C> + Send + Sync + 'static,
+    C: ConnectionContext + Send + Sync + 'static,
+{
+    let runtime = rt(format!("{thread_name}Rt"), quic_server_params.num_threads);
+    let result = {
+        let _guard = runtime.enter();
+        crate::nonblocking::quic::spawn_server_with_abstract_socket_with_cancel_and_qos(
+            metrics_name,
+            stats,
+            sockets,
+            keypair,
+            packet_sender,
+            quic_server_params,
+            qos,
+            cancel,
+        )
+    }?;
+    let handle = thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            if let Err(e) = runtime.block_on(result.thread) {
+                warn!("error from runtime.block_on: {e:?}");
+            }
+        })
+        .unwrap();
+    let updater = EndpointKeyUpdater {
+        endpoints: result.endpoints.clone(),
+    };
+    Ok(SpawnServerResult {
+        endpoints: result.endpoints,
+        thread: handle,
+        key_updater: Arc::new(updater),
+    })
+}
+
 /// Spawns a tokio runtime and a streamer instance inside it.
 pub fn spawn_server_with_cancel(
     thread_name: &'static str,
@@ -862,6 +910,41 @@ pub fn spawn_server_with_cancel(
         cancel.clone(),
     ));
     spawn_server_with_cancel_generic(
+        thread_name,
+        metrics_name,
+        stats,
+        sockets,
+        keypair,
+        packet_sender,
+        quic_server_params,
+        swqos,
+        cancel,
+    )
+}
+
+/// Spawns a tokio runtime and a streamer instance inside it using abstract UDP sockets.
+pub fn spawn_server_with_abstract_socket_with_cancel(
+    thread_name: &'static str,
+    metrics_name: &'static str,
+    sockets: impl IntoIterator<Item = Arc<dyn AsyncUdpSocket>>,
+    keypair: &Keypair,
+    packet_sender: Sender<PacketBatch>,
+    staked_nodes: Arc<RwLock<StakedNodes>>,
+    quic_server_params: QuicStreamerConfig,
+    qos_config: SwQosConfig,
+    cancel: CancellationToken,
+) -> Result<SpawnServerResult, QuicServerError> {
+    let stats = Arc::<StreamerStats>::default();
+    let swqos = Arc::new(SwQos::new(
+        qos_config,
+        quic_server_params.max_staked_connections,
+        quic_server_params.max_unstaked_connections,
+        quic_server_params.max_connections_per_peer,
+        stats.clone(),
+        staked_nodes,
+        cancel.clone(),
+    ));
+    spawn_server_with_cancel_generic_abstract_socket(
         thread_name,
         metrics_name,
         stats,
@@ -898,6 +981,42 @@ pub fn spawn_simple_qos_server_with_cancel(
     ));
 
     spawn_server_with_cancel_generic(
+        thread_name,
+        metrics_name,
+        stats,
+        sockets,
+        keypair,
+        packet_sender,
+        quic_server_params,
+        simple_qos,
+        cancel,
+    )
+}
+
+/// Spawns a tokio runtime and a streamer instance inside it using abstract UDP sockets.
+pub fn spawn_simple_qos_server_with_abstract_socket_with_cancel(
+    thread_name: &'static str,
+    metrics_name: &'static str,
+    sockets: impl IntoIterator<Item = Arc<dyn AsyncUdpSocket>>,
+    keypair: &Keypair,
+    packet_sender: Sender<PacketBatch>,
+    staked_nodes: Arc<RwLock<StakedNodes>>,
+    quic_server_params: QuicStreamerConfig,
+    qos_config: SimpleQosConfig,
+    cancel: CancellationToken,
+) -> Result<SpawnServerResult, QuicServerError> {
+    let stats = Arc::<StreamerStats>::default();
+
+    let simple_qos = Arc::new(SimpleQos::new(
+        qos_config,
+        quic_server_params.max_connections_per_peer,
+        quic_server_params.max_staked_connections,
+        stats.clone(),
+        staked_nodes,
+        cancel.clone(),
+    ));
+
+    spawn_server_with_cancel_generic_abstract_socket(
         thread_name,
         metrics_name,
         stats,

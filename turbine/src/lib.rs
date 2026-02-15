@@ -23,6 +23,12 @@ pub mod sigverify_shreds;
 
 pub mod xdp;
 
+#[cfg(feature = "dpdk")]
+pub use agave_dpdk::DpdkUdpSender;
+#[cfg(not(feature = "dpdk"))]
+#[derive(Clone, Debug)]
+pub struct DpdkUdpSender;
+
 #[macro_use]
 extern crate log;
 

@@ -1314,6 +1314,191 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("EXPERIMENTAL: Enable XDP zero copy. Requires hardware support"),
     )
     .arg(
+        Arg::with_name("dpdk_enable")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk")
+            .takes_value(false)
+            .requires("dpdk_devargs")
+            .requires("dpdk_ip")
+            .help(
+                "EXPERIMENTAL: Enable DPDK dataplane for TPU/TVU (requires vfio/uio PMD). \
+                 Mutually exclusive with --experimental-retransmit-xdp-cpu-cores",
+            ),
+    )
+    .arg(
+        Arg::with_name("dpdk_dry_run")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-dry-run")
+            .takes_value(false)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Initialize DPDK, print resolved port info, then exit"),
+    )
+    .arg(
+        Arg::with_name("dpdk_devargs")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-devargs")
+            .takes_value(true)
+            .value_name("DEVARGS")
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: DPDK device devargs (ex: '0000:3b:00.1')"),
+    )
+    .arg(
+        Arg::with_name("dpdk_ip")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-ip")
+            .takes_value(true)
+            .value_name("IPV4")
+            .validator(is_parsable::<std::net::Ipv4Addr>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: IPv4 address assigned to the DPDK interface"),
+    )
+    .arg(
+        Arg::with_name("dpdk_prefix_len")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-prefix-len")
+            .takes_value(true)
+            .value_name("PREFIX_LEN")
+            .validator(|s| is_within_range(s, 0..=32))
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: IPv4 prefix length for the DPDK interface"),
+    )
+    .arg(
+        Arg::with_name("dpdk_gateway")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-gateway")
+            .takes_value(true)
+            .value_name("IPV4")
+            .validator(is_parsable::<std::net::Ipv4Addr>)
+            .requires("dpdk_enable")
+            .help(
+                "EXPERIMENTAL: IPv4 gateway for the DPDK interface (required for /31 and /32, and \
+                 generally needed for off-subnet peers)",
+            ),
+    )
+    .arg(
+        Arg::with_name("dpdk_gateway_mac")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-gateway-mac")
+            .takes_value(true)
+            .value_name("MAC")
+            .validator(validate_dpdk_gateway_mac)
+            .requires("dpdk_enable")
+            .help(
+                "EXPERIMENTAL: Static gateway MAC for DPDK (skips ARP probing; requires --experimental-dpdk-gateway \
+                 or devargs gateway inference)",
+            ),
+    )
+    .arg(
+        Arg::with_name("dpdk_eal_arg")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-eal-arg")
+            .takes_value(true)
+            .multiple(true)
+            .value_name("ARG")
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Additional DPDK EAL arg (repeatable)"),
+    )
+    .arg(
+        Arg::with_name("dpdk_link_up_timeout_secs")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-link-up-timeout-secs")
+            .takes_value(true)
+            .value_name("SECS")
+            .validator(is_parsable::<u64>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Seconds to wait for DPDK link to come up during init"),
+    )
+    .arg(
+        Arg::with_name("dpdk_cpu_cores")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-cpu-cores")
+            .takes_value(true)
+            .value_name("CPU_LIST")
+            .validator(|value| validate_cpu_ranges(value, "--experimental-dpdk-cpu-cores"))
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Pin DPDK I/O threads to the specified CPU cores"),
+    )
+    .arg(
+        Arg::with_name("dpdk_io_threads")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-io-threads")
+            .takes_value(true)
+            .value_name("THREADS")
+            .validator(is_parsable::<u16>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Number of DPDK I/O threads (RX queues)"),
+    )
+    .arg(
+        Arg::with_name("dpdk_rx_desc")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-rx-desc")
+            .takes_value(true)
+            .value_name("DESC")
+            .validator(is_parsable::<u16>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: DPDK RX ring descriptor count"),
+    )
+    .arg(
+        Arg::with_name("dpdk_tx_desc")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-tx-desc")
+            .takes_value(true)
+            .value_name("DESC")
+            .validator(is_parsable::<u16>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: DPDK TX ring descriptor count"),
+    )
+    .arg(
+        Arg::with_name("dpdk_mbuf_count")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-mbuf-count")
+            .takes_value(true)
+            .value_name("COUNT")
+            .validator(is_parsable::<u32>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: mbuf count in the DPDK mempool"),
+    )
+    .arg(
+        Arg::with_name("dpdk_mbuf_data_size")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-mbuf-data-size")
+            .takes_value(true)
+            .value_name("BYTES")
+            .validator(is_parsable::<u16>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: mbuf data room size (bytes)"),
+    )
+    .arg(
+        Arg::with_name("dpdk_shred_tx_channel_cap")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-shred-tx-channel-cap")
+            .takes_value(true)
+            .value_name("CAP")
+            .validator(is_parsable::<usize>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Channel capacity for DPDK shred TX queue"),
+    )
+    .arg(
+        Arg::with_name("dpdk_quic_tx_channel_cap")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-quic-tx-channel-cap")
+            .takes_value(true)
+            .value_name("CAP")
+            .validator(is_parsable::<usize>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Channel capacity for DPDK QUIC TX queue"),
+    )
+    .arg(
+        Arg::with_name("dpdk_quic_rx_channel_cap")
+            .hidden(hidden_unless_forced())
+            .long("experimental-dpdk-quic-rx-channel-cap")
+            .takes_value(true)
+            .value_name("CAP")
+            .validator(is_parsable::<usize>)
+            .requires("dpdk_enable")
+            .help("EXPERIMENTAL: Per-socket channel capacity for DPDK QUIC RX queue"),
+    )
+    .arg(
         Arg::with_name("use_connection_cache")
             .long("use-connection-cache")
             .takes_value(false)
@@ -1327,6 +1512,38 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
     .args(&rpc_bigtable_config::args())
     .args(&send_transaction_config::args())
     .args(&rpc_bootstrap_config::args())
+}
+
+fn validate_dpdk_gateway_mac(value: String) -> std::result::Result<(), String> {
+    let s = value.trim();
+    if s.is_empty() {
+        return Err("dpdk gateway mac is empty".to_string());
+    }
+    let sep = if s.contains(':') {
+        ':'
+    } else if s.contains('-') {
+        '-'
+    } else {
+        return Err(
+            "dpdk gateway mac must use ':' or '-' separators (ex: 7c:c2:55:af:f4:d8)".to_string(),
+        );
+    };
+    let parts: Vec<&str> = s.split(sep).collect();
+    if parts.len() != 6 {
+        return Err(format!(
+            "dpdk gateway mac must have 6 octets (got {})",
+            parts.len()
+        ));
+    }
+    for part in parts {
+        if part.len() != 2 {
+            return Err(format!("dpdk gateway mac octet must be 2 hex chars (got '{part}')"));
+        }
+        if u8::from_str_radix(part, 16).is_err() {
+            return Err(format!("dpdk gateway mac octet is not hex: '{part}'"));
+        }
+    }
+    Ok(())
 }
 
 fn validators_set(

@@ -106,6 +106,8 @@ struct RetransmitStats {
     num_nodes: AtomicUsize,
     num_addrs_failed: AtomicUsize,
     num_shreds_dropped_xdp_full: AtomicUsize,
+    #[cfg(feature = "dpdk")]
+    num_shreds_dropped_dpdk_full: AtomicUsize,
     num_loopback_errs: AtomicUsize,
     num_shreds: usize,
     num_shreds_skipped: AtomicUsize,
@@ -128,7 +130,11 @@ impl RetransmitStats {
         cluster_info: &ClusterInfo,
         cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
         is_xdp: bool,
+        is_dpdk: bool,
     ) {
+        #[cfg(not(feature = "dpdk"))]
+        let _ = is_dpdk;
+
         const SUBMIT_CADENCE: Duration = Duration::from_secs(2);
         if self.since.elapsed() < SUBMIT_CADENCE {
             return;
@@ -136,6 +142,51 @@ impl RetransmitStats {
         cluster_nodes_cache
             .get(root_bank.slot(), root_bank, working_bank, cluster_info)
             .submit_metrics("cluster_nodes_retransmit", timestamp());
+        #[cfg(feature = "dpdk")]
+        datapoint_info!(
+            "retransmit-stage",
+            "is_xdp" => is_xdp.to_string(),
+            "is_dpdk" => is_dpdk.to_string(),
+            ("total_time", self.total_time, i64),
+            ("epoch_fetch", self.epoch_fetch, i64),
+            ("epoch_cache_update", self.epoch_cache_update, i64),
+            ("total_batches", self.total_batches, i64),
+            ("num_small_batches", self.num_small_batches, i64),
+            ("num_nodes", *self.num_nodes.get_mut(), i64),
+            ("num_addrs_failed", *self.num_addrs_failed.get_mut(), i64),
+            (
+                "num_shreds_dropped_xdp_full",
+                *self.num_shreds_dropped_xdp_full.get_mut(),
+                i64
+            ),
+            (
+                "num_shreds_dropped_dpdk_full",
+                *self.num_shreds_dropped_dpdk_full.get_mut(),
+                i64
+            ),
+            ("num_loopback_errs", *self.num_loopback_errs.get_mut(), i64),
+            ("num_shreds", self.num_shreds, i64),
+            (
+                "num_shreds_skipped",
+                *self.num_shreds_skipped.get_mut(),
+                i64
+            ),
+            ("retransmit_total", *self.retransmit_total.get_mut(), i64),
+            ("addr_cache_hit", *self.addr_cache_hit.get_mut(), i64),
+            ("addr_cache_miss", *self.addr_cache_miss.get_mut(), i64),
+            (
+                "compute_turbine",
+                *self.compute_turbine_peers_total.get_mut(),
+                i64
+            ),
+            (
+                "unknown_shred_slot_leader",
+                self.unknown_shred_slot_leader,
+                i64
+            ),
+        );
+
+        #[cfg(not(feature = "dpdk"))]
         datapoint_info!(
             "retransmit-stage",
             "is_xdp" => is_xdp.to_string(),
@@ -226,6 +277,8 @@ impl<const K: usize> ShredDeduper<K> {
 enum RetransmitSocket<'a> {
     Socket(&'a UdpSocket),
     Xdp(&'a XdpSender),
+    #[cfg(feature = "dpdk")]
+    Dpdk(&'a crate::DpdkUdpSender),
     Multihomed {
         sockets: &'a [UdpSocket],
         interface_offset: usize,
@@ -239,8 +292,16 @@ impl<'a> RetransmitSocket<'a> {
         thread_index: usize,
         retransmit_sockets: &'a [UdpSocket],
         xdp_sender: Option<&'a XdpSender>,
+        dpdk_sender: Option<&'a crate::DpdkUdpSender>,
         cluster_info: &'a ClusterInfo,
     ) -> Self {
+        let _ = dpdk_sender;
+
+        #[cfg(feature = "dpdk")]
+        if let Some(dpdk_sender) = dpdk_sender {
+            return RetransmitSocket::Dpdk(dpdk_sender);
+        }
+
         if let Some(xdp_sender) = xdp_sender {
             RetransmitSocket::Xdp(xdp_sender)
         } else if cluster_info.bind_ip_addrs().multihoming_enabled() {
@@ -276,6 +337,10 @@ impl<'a> RetransmitSocket<'a> {
             RetransmitSocket::Xdp(_) => {
                 unreachable!("get_socket() should not be called for XDP variants")
             }
+            #[cfg(feature = "dpdk")]
+            RetransmitSocket::Dpdk(_) => {
+                unreachable!("get_socket() should not be called for DPDK variants")
+            }
         }
     }
 }
@@ -295,6 +360,7 @@ fn retransmit(
     retransmit_sockets: &[UdpSocket],
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     xdp_sender: Option<&XdpSender>,
+    dpdk_sender: Option<&crate::DpdkUdpSender>,
     stats: &mut RetransmitStats,
     cluster_nodes_cache: &ClusterNodesCache<RetransmitStage>,
     addr_cache: &mut AddrCache,
@@ -404,8 +470,9 @@ fn retransmit(
         )
     };
 
-    let retransmit_socket =
-        |index: usize| RetransmitSocket::new(index, retransmit_sockets, xdp_sender, cluster_info);
+    let retransmit_socket = |index: usize| {
+        RetransmitSocket::new(index, retransmit_sockets, xdp_sender, dpdk_sender, cluster_info)
+    };
 
     let slot_stats = if num_shreds < PAR_ITER_MIN_NUM_SHREDS {
         stats.num_small_batches += 1;
@@ -447,7 +514,8 @@ fn retransmit(
         &working_bank,
         cluster_info,
         cluster_nodes_cache,
-        xdp_sender.is_some(),
+        xdp_sender.is_some() && dpdk_sender.is_none(),
+        dpdk_sender.is_some(),
     );
     Ok(())
 }
@@ -501,6 +569,22 @@ fn retransmit_shred(
                             .num_shreds_dropped_xdp_full
                             .fetch_add(num_addrs, Ordering::Relaxed);
                         sent = 0;
+                    }
+                }
+                sent
+            }
+            #[cfg(feature = "dpdk")]
+            RetransmitSocket::Dpdk(sender) => {
+                let bytes = shred.bytes;
+                let mut sent = 0;
+                for addr in addrs.iter().copied() {
+                    let SocketAddr::V4(addr) = addr else { continue };
+                    if sender.try_send_to(addr, bytes.clone()).is_ok() {
+                        sent += 1;
+                    } else {
+                        stats
+                            .num_shreds_dropped_dpdk_full
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 sent
@@ -657,6 +741,7 @@ impl RetransmitStage {
         rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
         slot_status_notifier: Option<SlotStatusNotifier>,
         xdp_sender: Option<XdpSender>,
+        dpdk_sender: Option<crate::DpdkUdpSender>,
         votor_event_sender: Option<Sender<VotorEvent>>,
     ) -> Self {
         let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
@@ -691,6 +776,7 @@ impl RetransmitStage {
                         &retransmit_sockets,
                         &quic_endpoint_sender,
                         xdp_sender.as_ref(),
+                        dpdk_sender.as_ref(),
                         &mut stats,
                         &cluster_nodes_cache,
                         &mut addr_cache,
@@ -760,6 +846,8 @@ impl RetransmitStats {
             num_nodes: AtomicUsize::default(),
             num_addrs_failed: AtomicUsize::default(),
             num_shreds_dropped_xdp_full: AtomicUsize::default(),
+            #[cfg(feature = "dpdk")]
+            num_shreds_dropped_dpdk_full: AtomicUsize::default(),
             num_loopback_errs: AtomicUsize::default(),
             num_shreds: 0usize,
             num_shreds_skipped: AtomicUsize::default(),

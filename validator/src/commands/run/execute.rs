@@ -159,7 +159,16 @@ pub fn execute(
     let init_complete_file = matches.value_of("init_complete_file");
 
     let private_rpc = matches.is_present("private_rpc");
+    #[cfg(feature = "dpdk")]
+    let mut do_port_check = !matches.is_present("no_port_check");
+    #[cfg(not(feature = "dpdk"))]
     let do_port_check = !matches.is_present("no_port_check");
+    #[cfg(not(feature = "dpdk"))]
+    if matches.is_present("dpdk_enable") {
+        return Err(
+            "--experimental-dpdk requires agave-validator built with `--features dpdk`".into(),
+        );
+    }
 
     let ledger_path = run_args.ledger_path;
 
@@ -605,6 +614,8 @@ pub fn execute(
         wen_restart_proto_path: value_t!(matches, "wen_restart", PathBuf).ok(),
         wen_restart_coordinator: value_t!(matches, "wen_restart_coordinator", Pubkey).ok(),
         turbine_disabled: Arc::<AtomicBool>::default(),
+        #[cfg(feature = "dpdk")]
+        dpdk: None,
         retransmit_xdp,
         broadcast_stage_type: BroadcastStageType::Standard,
         use_tpu_client_next: !matches.is_present("use_connection_cache"),
@@ -641,6 +652,129 @@ pub fn execute(
         )]
         .into(),
     };
+
+    #[cfg(feature = "dpdk")]
+    if matches.is_present("dpdk_enable") {
+        if restricted_repair_only_mode {
+            return Err(
+                "--experimental-dpdk is not compatible with --restricted-repair-only-mode".into(),
+            );
+        }
+        if validator_config.retransmit_xdp.is_some() {
+            return Err(
+                "--experimental-dpdk is not compatible with --experimental-retransmit-xdp-cpu-cores; \
+                 choose one dataplane (DPDK or XDP)"
+                    .into(),
+            );
+        }
+        if do_port_check {
+            warn!("DPDK enabled, disabling port check (kernel sockets are not used for TPU/TVU)");
+        }
+        do_port_check = false;
+
+        let dpdk_dry_run = matches.is_present("dpdk_dry_run");
+
+        let mut dpdk_config = validator_config.dpdk.take().unwrap_or_default();
+        dpdk_config.devargs = matches
+            .value_of("dpdk_devargs")
+            .expect("required by clap")
+            .to_string();
+        dpdk_config.local_ip = value_t_or_exit!(matches, "dpdk_ip", Ipv4Addr);
+        dpdk_config.prefix_len = value_t!(matches, "dpdk_prefix_len", u8).unwrap_or(32);
+
+        // Operators sometimes prefer a "private" secondary IP. That generally won't work for
+        // mainnet TPU/TVU unless peers can route it. Warn early.
+        let dpdk_ip = dpdk_config.local_ip;
+        let o = dpdk_ip.octets();
+        let is_rfc1918 = o[0] == 10
+            || (o[0] == 172 && (16..=31).contains(&o[1]))
+            || (o[0] == 192 && o[1] == 168);
+        let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
+        let is_link_local = o[0] == 169 && o[1] == 254;
+        if is_rfc1918 || is_cgnat || is_link_local {
+            warn!(
+                "--experimental-dpdk-ip {} is not a typical public IPv4 (private/CGNAT/link-local). \
+                 Ensure it is reachable from validator peers for TPU/TVU.",
+                dpdk_ip
+            );
+        }
+
+        dpdk_config.gateway_ip = value_t!(matches, "dpdk_gateway", Ipv4Addr).ok();
+        if dpdk_config.gateway_ip.is_none() {
+            if let Some((gw, source)) = agave_dpdk::infer_gateway_from_devargs(&dpdk_config.devargs)
+            {
+                info!("DPDK gateway_ip inferred as {gw} ({source})");
+                dpdk_config.gateway_ip = Some(gw);
+            }
+        }
+        if let Some(mac) = matches.value_of("dpdk_gateway_mac") {
+            let mac = mac.parse::<agave_dpdk::DpdkMacAddr>().map_err(|e| {
+                format!("failed to parse --experimental-dpdk-gateway-mac '{mac}': {e}")
+            })?;
+            dpdk_config.gateway_mac = Some(mac);
+        }
+        dpdk_config.eal_args = values_t!(matches, "dpdk_eal_arg", String).unwrap_or_default();
+        if let Ok(secs) = value_t!(matches, "dpdk_link_up_timeout_secs", u64) {
+            dpdk_config.link_up_timeout_secs = secs;
+        }
+        if let Some(cpus) = matches.value_of("dpdk_cpu_cores") {
+            dpdk_config.io_thread_cpus = Some(parse_cpu_ranges(cpus).unwrap());
+        }
+        if let Ok(threads) = value_t!(matches, "dpdk_io_threads", u16) {
+            dpdk_config.io_threads = threads;
+        }
+        if let Ok(rx_desc) = value_t!(matches, "dpdk_rx_desc", u16) {
+            dpdk_config.rx_desc = rx_desc;
+        }
+        if let Ok(tx_desc) = value_t!(matches, "dpdk_tx_desc", u16) {
+            dpdk_config.tx_desc = tx_desc;
+        }
+        if let Ok(mbuf_count) = value_t!(matches, "dpdk_mbuf_count", u32) {
+            dpdk_config.mbuf_count = mbuf_count;
+        }
+        if let Ok(mbuf_data_size) = value_t!(matches, "dpdk_mbuf_data_size", u16) {
+            dpdk_config.mbuf_data_size = mbuf_data_size;
+        }
+        if let Ok(cap) = value_t!(matches, "dpdk_shred_tx_channel_cap", usize) {
+            dpdk_config.shred_tx_channel_cap = cap;
+        }
+        if let Ok(cap) = value_t!(matches, "dpdk_quic_tx_channel_cap", usize) {
+            dpdk_config.quic_tx_channel_cap = cap;
+        }
+        if let Ok(cap) = value_t!(matches, "dpdk_quic_rx_channel_cap", usize) {
+            dpdk_config.quic_rx_channel_cap = cap;
+        }
+
+        if dpdk_dry_run {
+            let exit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let dpdk = agave_dpdk::DpdkBuilder::new(dpdk_config.clone())
+                .build(exit)
+                .map_err(|e| format!("DPDK dry-run failed during init: {e}"))?;
+            println!("DPDK dry-run:");
+            println!("  devargs: {}", dpdk_config.devargs);
+            println!("  io_threads: {}", dpdk_config.io_threads);
+            println!("  tx_queues: {}", dpdk.tx_queues());
+            println!("  port_id: {}", dpdk.port_id());
+            println!("  port_name: {}", dpdk.port_name());
+            println!("  mac: {}", dpdk.local_mac());
+            println!("  link: up");
+            println!("  ip: {}/{}", dpdk_config.local_ip, dpdk_config.prefix_len);
+            if let Some(gw) = dpdk_config.gateway_ip {
+                println!("  gateway: {gw}");
+            }
+            if let Some(gw_mac) = dpdk_config.gateway_mac {
+                println!("  gateway_mac: {gw_mac}");
+            }
+            if !dpdk_config.eal_args.is_empty() {
+                println!("  eal_args: {:?}", dpdk_config.eal_args);
+            }
+            drop(dpdk);
+            println!("DPDK dry-run complete; exiting due to --experimental-dpdk-dry-run");
+            return Ok(());
+        }
+
+        validator_config.dpdk = Some(dpdk_config);
+    }
 
     let reserved = validator_config
         .retransmit_xdp
@@ -876,6 +1010,55 @@ pub fn execute(
 
         // A node in this configuration shouldn't be an entrypoint to other nodes
         node.sockets.ip_echo = None;
+    }
+
+    #[cfg(feature = "dpdk")]
+    if let Some(dpdk_config) = validator_config.dpdk.as_ref() {
+        use solana_gossip::contact_info::Protocol;
+
+        let dpdk_ip = IpAddr::V4(dpdk_config.local_ip);
+
+        if let Some(gossip) = node.info.gossip() {
+            if gossip.ip() == dpdk_ip {
+                return Err(format!(
+                    "--experimental-dpdk-ip {} matches the validator advertised gossip IP. \
+                     DPDK does not support sharing the same IP with the kernel network stack. \
+                     Set --public-ip (and related RPC flags) to the management/kernel IP, and use \
+                     --experimental-dpdk-ip only for TPU/TVU",
+                    dpdk_config.local_ip
+                )
+                .into());
+            }
+        }
+
+        if let Some(tpu_udp) = node.info.tpu(Protocol::UDP) {
+            node.info
+                .set_tpu(SocketAddr::new(dpdk_ip, tpu_udp.port()))
+                .expect("operator must spin up node with valid TPU address");
+        }
+        if let Some(tpu_forwards_udp) = node.info.tpu_forwards(Protocol::UDP) {
+            node.info
+                .set_tpu_forwards(SocketAddr::new(dpdk_ip, tpu_forwards_udp.port()))
+                .expect("operator must spin up node with valid TPU forwards address");
+        }
+        if let Some(tpu_vote_udp) = node.info.tpu_vote(Protocol::UDP) {
+            node.info
+                .set_tpu_vote(Protocol::UDP, SocketAddr::new(dpdk_ip, tpu_vote_udp.port()))
+                .expect("operator must spin up node with valid TPU vote address");
+        }
+        if let Some(tpu_vote_quic) = node.info.tpu_vote(Protocol::QUIC) {
+            node.info
+                .set_tpu_vote(
+                    Protocol::QUIC,
+                    SocketAddr::new(dpdk_ip, tpu_vote_quic.port()),
+                )
+                .expect("operator must spin up node with valid TPU vote QUIC address");
+        }
+        if let Some(tvu_udp) = node.info.tvu(Protocol::UDP) {
+            node.info
+                .set_tvu(Protocol::UDP, SocketAddr::new(dpdk_ip, tvu_udp.port()))
+                .expect("operator must spin up node with valid TVU address");
+        }
     }
 
     if !private_rpc {

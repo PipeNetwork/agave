@@ -15,7 +15,9 @@ use {
     crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError},
     futures::{stream::FuturesUnordered, Future, StreamExt as _},
     indexmap::map::{Entry, IndexMap},
-    quinn::{Accept, Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime},
+    quinn::{
+        Accept, AsyncUdpSocket, Connecting, Connection, Endpoint, EndpointConfig, TokioRuntime,
+    },
     rand::{thread_rng, Rng},
     smallvec::SmallVec,
     solana_keypair::Keypair,
@@ -211,9 +213,7 @@ pub fn spawn_server_with_cancel(
     quic_server_params: QuicStreamerConfig,
     qos_config: SwQosConfig,
     cancel: CancellationToken,
-) -> Result<SpawnNonBlockingServerResult, QuicServerError>
-where
-{
+) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
     let stats = Arc::<StreamerStats>::default();
 
     let swqos = Arc::new(SwQos::new(
@@ -227,6 +227,41 @@ where
     ));
 
     spawn_server_with_cancel_and_qos(
+        name,
+        stats,
+        sockets,
+        keypair,
+        packet_sender,
+        quic_server_params,
+        swqos,
+        cancel,
+    )
+}
+
+/// Spawn a streamer instance in the current tokio runtime using abstract UDP sockets.
+pub fn spawn_server_with_abstract_socket_with_cancel(
+    name: &'static str,
+    sockets: impl IntoIterator<Item = Arc<dyn AsyncUdpSocket>>,
+    keypair: &Keypair,
+    packet_sender: Sender<PacketBatch>,
+    staked_nodes: Arc<RwLock<StakedNodes>>,
+    quic_server_params: QuicStreamerConfig,
+    qos_config: SwQosConfig,
+    cancel: CancellationToken,
+) -> Result<SpawnNonBlockingServerResult, QuicServerError> {
+    let stats = Arc::<StreamerStats>::default();
+
+    let swqos = Arc::new(SwQos::new(
+        qos_config,
+        quic_server_params.max_staked_connections,
+        quic_server_params.max_unstaked_connections,
+        quic_server_params.max_connections_per_peer,
+        stats.clone(),
+        staked_nodes,
+        cancel.clone(),
+    ));
+
+    spawn_server_with_abstract_socket_with_cancel_and_qos(
         name,
         stats,
         sockets,
@@ -261,6 +296,75 @@ where
         .into_iter()
         .map(|sock| {
             Endpoint::new(
+                EndpointConfig::default(),
+                Some(config.clone()),
+                sock,
+                Arc::new(TokioRuntime),
+            )
+            .map_err(QuicServerError::EndpointFailed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (packet_batch_sender, packet_batch_receiver) =
+        bounded(quic_server_params.accumulator_channel_size);
+    task::spawn_blocking({
+        let cancel = cancel.clone();
+        let stats = stats.clone();
+        move || {
+            run_packet_batch_sender(packet_sender, packet_batch_receiver, stats, cancel);
+        }
+    });
+
+    let max_concurrent_connections = quic_server_params.max_concurrent_connections();
+    let handle = tokio::spawn({
+        let endpoints = endpoints.clone();
+        let stats = stats.clone();
+        async move {
+            let tasks = run_server(
+                name,
+                endpoints.clone(),
+                packet_batch_sender,
+                stats.clone(),
+                quic_server_params,
+                cancel,
+                qos,
+            )
+            .await;
+            tasks.close();
+            tasks.wait().await;
+        }
+    });
+
+    Ok(SpawnNonBlockingServerResult {
+        endpoints,
+        stats,
+        thread: handle,
+        max_concurrent_connections,
+    })
+}
+
+/// Spawn a streamer instance in the current tokio runtime using abstract UDP sockets.
+pub(crate) fn spawn_server_with_abstract_socket_with_cancel_and_qos<Q, C>(
+    name: &'static str,
+    stats: Arc<StreamerStats>,
+    sockets: impl IntoIterator<Item = Arc<dyn AsyncUdpSocket>>,
+    keypair: &Keypair,
+    packet_sender: Sender<PacketBatch>,
+    quic_server_params: QuicStreamerConfig,
+    qos: Arc<Q>,
+    cancel: CancellationToken,
+) -> Result<SpawnNonBlockingServerResult, QuicServerError>
+where
+    Q: QosController<C> + Send + Sync + 'static,
+    C: ConnectionContext + Send + Sync + 'static,
+{
+    let sockets: Vec<_> = sockets.into_iter().collect();
+    info!("Start {name} quic server on {sockets:?}");
+    let (config, _) = configure_server(keypair)?;
+
+    let endpoints = sockets
+        .into_iter()
+        .map(|sock| {
+            Endpoint::new_with_abstract_socket(
                 EndpointConfig::default(),
                 Some(config.clone()),
                 sock,

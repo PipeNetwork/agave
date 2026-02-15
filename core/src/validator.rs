@@ -31,7 +31,7 @@ use {
         system_monitor_service::{
             verify_net_stats_access, SystemMonitorService, SystemMonitorStatsReportConfig,
         },
-        tpu::{ForwardingClientOption, Tpu, TpuSockets},
+        tpu::{ForwardingClientOption, Tpu, TpuIngressChannels, TpuSockets},
         tvu::{Tvu, TvuConfig, TvuSockets},
     },
     agave_snapshots::{
@@ -380,6 +380,8 @@ pub struct ValidatorConfig {
     pub tvu_shred_sigverify_threads: NonZeroUsize,
     pub delay_leader_block_for_pending_fork: bool,
     pub use_tpu_client_next: bool,
+    #[cfg(feature = "dpdk")]
+    pub dpdk: Option<agave_dpdk::DpdkNetConfig>,
     pub retransmit_xdp: Option<XdpConfig>,
     pub repair_handler_type: RepairHandlerType,
 }
@@ -462,6 +464,8 @@ impl ValidatorConfig {
                 .expect("thread count is non-zero"),
             delay_leader_block_for_pending_fork: false,
             use_tpu_client_next: true,
+            #[cfg(feature = "dpdk")]
+            dpdk: None,
             retransmit_xdp: None,
             repair_handler_type: RepairHandlerType::default(),
         }
@@ -647,6 +651,9 @@ pub struct Validator {
     repair_quic_endpoints: Option<[Endpoint; 3]>,
     repair_quic_endpoints_runtime: Option<TokioRuntime>,
     repair_quic_endpoints_join_handle: Option<repair::quic_endpoint::AsyncTryJoinHandle>,
+    #[cfg(feature = "dpdk")]
+    #[allow(dead_code)] // keep dataplane alive for the validator lifetime
+    dpdk: Option<agave_dpdk::Dpdk>,
     xdp_retransmitter: Option<XdpRetransmitter>,
     // This runtime is used to run the client owned by SendTransactionService.
     // We don't wait for its JoinHandle here because ownership and shutdown
@@ -1594,6 +1601,206 @@ impl Validator {
                 (None, None)
             };
 
+        let (tpu_packet_sender, tpu_packet_receiver) = unbounded();
+        let (tpu_vote_packet_sender, tpu_vote_packet_receiver) = unbounded();
+        let (tpu_forwarded_packet_sender, tpu_forwarded_packet_receiver) = unbounded();
+        let tpu_ingress = TpuIngressChannels {
+            packet_sender: tpu_packet_sender.clone(),
+            packet_receiver: tpu_packet_receiver,
+            vote_packet_sender: tpu_vote_packet_sender.clone(),
+            vote_packet_receiver: tpu_vote_packet_receiver,
+            forwarded_packet_sender: tpu_forwarded_packet_sender.clone(),
+            forwarded_packet_receiver: tpu_forwarded_packet_receiver,
+        };
+
+        #[cfg(feature = "dpdk")]
+        let mut dpdk_broadcast_sender: Option<solana_turbine::DpdkUdpSender> = None;
+        #[cfg(not(feature = "dpdk"))]
+        let dpdk_broadcast_sender: Option<solana_turbine::DpdkUdpSender> = None;
+
+        #[cfg(feature = "dpdk")]
+        let mut dpdk_retransmit_sender: Option<solana_turbine::DpdkUdpSender> = None;
+        #[cfg(not(feature = "dpdk"))]
+        let dpdk_retransmit_sender: Option<solana_turbine::DpdkUdpSender> = None;
+
+        #[cfg(feature = "dpdk")]
+        let mut dpdk_shred_fetch_receiver: Option<(
+            solana_streamer::streamer::PacketBatchReceiver,
+            Arc<solana_streamer::streamer::StreamerReceiveStats>,
+        )> = None;
+        #[cfg(not(feature = "dpdk"))]
+        let dpdk_shred_fetch_receiver: Option<(
+            solana_streamer::streamer::PacketBatchReceiver,
+            Arc<solana_streamer::streamer::StreamerReceiveStats>,
+        )> = None;
+
+        #[cfg(feature = "dpdk")]
+        let mut dpdk_quic_sockets: Option<crate::tpu::TpuDpdkQuicSockets> = None;
+        #[cfg(not(feature = "dpdk"))]
+        let dpdk_quic_sockets: Option<crate::tpu::TpuDpdkQuicSockets> = None;
+
+        #[cfg(feature = "dpdk")]
+        let dpdk = if let Some(dpdk_config) = config.dpdk.clone() {
+            use {
+                agave_dpdk::{DpdkBuilder, PacketRoute},
+                solana_perf::packet::{PacketBatch, PacketBatchRecycler},
+                solana_streamer::{
+                    evicting_sender::EvictingSender,
+                    streamer::{ChannelSend, StreamerReceiveStats},
+                },
+            };
+
+            let tpu_udp_port = node
+                .info
+                .tpu(Protocol::UDP)
+                .context("tpu udp address missing")?
+                .port();
+            let tpu_forwards_udp_port = node
+                .info
+                .tpu_forwards(Protocol::UDP)
+                .context("tpu_forwards udp address missing")?
+                .port();
+            let tpu_vote_udp_port = node
+                .info
+                .tpu_vote(Protocol::UDP)
+                .context("tpu_vote udp address missing")?
+                .port();
+            let tpu_vote_quic_port = node
+                .info
+                .tpu_vote(Protocol::QUIC)
+                .context("tpu_vote quic address missing")?
+                .port();
+            let tvu_udp_port = node
+                .info
+                .tvu(Protocol::UDP)
+                .context("tvu udp address missing")?
+                .port();
+            let tpu_quic_port = node
+                .info
+                .tpu(Protocol::QUIC)
+                .context("tpu quic address missing")?
+                .port();
+            let tpu_forwards_quic_port = node
+                .info
+                .tpu_forwards(Protocol::QUIC)
+                .context("tpu_forwards quic address missing")?
+                .port();
+
+            let in_vote_only_mode = Some(bank_forks.read().unwrap().get_vote_only_mode_signal());
+
+            let mut builder = DpdkBuilder::new(dpdk_config);
+
+            let (builder2, tpu_quic_sockets_v) =
+                builder.add_quic_port(tpu_quic_port, node.sockets.tpu_quic.len());
+            builder = builder2;
+            let (builder2, tpu_forwards_quic_sockets_v) =
+                builder.add_quic_port(tpu_forwards_quic_port, node.sockets.tpu_forwards_quic.len());
+            builder = builder2;
+            let (builder2, tpu_vote_quic_sockets_v) =
+                builder.add_quic_port(tpu_vote_quic_port, node.sockets.tpu_vote_quic.len());
+            builder = builder2;
+
+            dpdk_quic_sockets = Some(crate::tpu::TpuDpdkQuicSockets {
+                transactions: tpu_quic_sockets_v
+                    .into_iter()
+                    .map(|sock| sock as Arc<dyn quinn::AsyncUdpSocket>)
+                    .collect(),
+                transaction_forwards: tpu_forwards_quic_sockets_v
+                    .into_iter()
+                    .map(|sock| sock as Arc<dyn quinn::AsyncUdpSocket>)
+                    .collect(),
+                vote: tpu_vote_quic_sockets_v
+                    .into_iter()
+                    .map(|sock| sock as Arc<dyn quinn::AsyncUdpSocket>)
+                    .collect(),
+            });
+
+            if tpu_enable_udp {
+                let tpu_recycler = PacketBatchRecycler::warmed(1000, 1024);
+                let tpu_stats = Arc::new(StreamerReceiveStats::new("tpu_receiver_dpdk"));
+                let tpu_sender =
+                    Arc::new(tpu_packet_sender.clone()) as Arc<dyn ChannelSend<PacketBatch> + Sync>;
+                builder = builder.add_packet_route(PacketRoute {
+                    dst_port: tpu_udp_port,
+                    sender: tpu_sender,
+                    recycler: tpu_recycler,
+                    stats: tpu_stats,
+                    in_vote_only_mode: in_vote_only_mode.clone(),
+                    is_staked_service: false,
+                });
+
+                let fwd_recycler = PacketBatchRecycler::warmed(1000, 1024);
+                let fwd_stats = Arc::new(StreamerReceiveStats::new("tpu_forwards_receiver_dpdk"));
+                let fwd_sender = Arc::new(tpu_forwarded_packet_sender.clone())
+                    as Arc<dyn ChannelSend<PacketBatch> + Sync>;
+                builder = builder.add_packet_route(PacketRoute {
+                    dst_port: tpu_forwards_udp_port,
+                    sender: fwd_sender,
+                    recycler: fwd_recycler,
+                    stats: fwd_stats,
+                    in_vote_only_mode: in_vote_only_mode.clone(),
+                    is_staked_service: false,
+                });
+            }
+
+            let vote_recycler = PacketBatchRecycler::warmed(1000, 1024);
+            let vote_stats = Arc::new(StreamerReceiveStats::new("tpu_vote_receiver_dpdk"));
+            let vote_sender = Arc::new(tpu_vote_packet_sender.clone())
+                as Arc<dyn ChannelSend<PacketBatch> + Sync>;
+            builder = builder.add_packet_route(PacketRoute {
+                dst_port: tpu_vote_udp_port,
+                sender: vote_sender,
+                recycler: vote_recycler,
+                stats: vote_stats,
+                in_vote_only_mode: None,
+                is_staked_service: true,
+            });
+
+            let (tvu_sender, tvu_receiver) =
+                EvictingSender::new_bounded(crate::shred_fetch_stage::SHRED_FETCH_CHANNEL_SIZE);
+            let tvu_recycler = PacketBatchRecycler::warmed(100, 1024);
+            let tvu_stats = Arc::new(StreamerReceiveStats::new("shred_fetch_receiver_dpdk"));
+            let tvu_sender = Arc::new(tvu_sender) as Arc<dyn ChannelSend<PacketBatch> + Sync>;
+            builder = builder.add_packet_route(PacketRoute {
+                dst_port: tvu_udp_port,
+                sender: tvu_sender,
+                recycler: tvu_recycler,
+                stats: tvu_stats.clone(),
+                in_vote_only_mode: None,
+                is_staked_service: false,
+            });
+
+            let dpdk = builder
+                .build(exit.clone())
+                .context("failed to initialize DPDK dataplane")?;
+
+            info!(
+                "DPDK initialized: port_id={} port_name={} mac={} ip={} tx_queues={}",
+                dpdk.port_id(),
+                dpdk.port_name(),
+                dpdk.local_mac(),
+                dpdk.local_ip(),
+                dpdk.tx_queues(),
+            );
+
+            let broadcast_src_port = node.sockets.broadcast[0]
+                .local_addr()
+                .expect("failed to get broadcast socket local address")
+                .port();
+            dpdk_broadcast_sender = Some(dpdk.udp_sender(broadcast_src_port));
+
+            let retransmit_src_port = node.sockets.retransmit_sockets[0]
+                .local_addr()
+                .expect("failed to get retransmit socket local address")
+                .port();
+            dpdk_retransmit_sender = Some(dpdk.udp_sender(retransmit_src_port));
+
+            dpdk_shred_fetch_receiver = Some((tvu_receiver, tvu_stats));
+            Some(dpdk)
+        } else {
+            None
+        };
+
         // disable all2all tests if not allowed for a given cluster type
         let alpenglow_socket = if genesis_config.cluster_type == ClusterType::Testnet
             || genesis_config.cluster_type == ClusterType::Development
@@ -1646,6 +1853,8 @@ impl Validator {
                 replay_transactions_threads: config.replay_transactions_threads,
                 shred_sigverify_threads: config.tvu_shred_sigverify_threads,
                 xdp_sender: xdp_sender.clone(),
+                dpdk_sender: dpdk_retransmit_sender,
+                dpdk_shred_fetch_receiver: dpdk_shred_fetch_receiver,
             },
             &max_slots,
             block_metadata_notifier,
@@ -1719,15 +1928,18 @@ impl Validator {
                 transactions_quic: node.sockets.tpu_quic,
                 transactions_forwards_quic: node.sockets.tpu_forwards_quic,
                 vote_quic: node.sockets.tpu_vote_quic,
+                dpdk_quic: dpdk_quic_sockets,
                 vote_forwarding_client: node.sockets.tpu_vote_forwarding_client,
                 vortexor_receivers: node.sockets.vortexor_receivers,
             },
+            tpu_ingress,
             rpc_subscriptions.clone(),
             transaction_status_sender,
             entry_notification_sender,
             blockstore.clone(),
             &config.broadcast_stage_type,
             xdp_sender,
+            dpdk_broadcast_sender,
             exit,
             node.info.shred_version(),
             vote_tracker,
@@ -1827,6 +2039,8 @@ impl Validator {
             repair_quic_endpoints,
             repair_quic_endpoints_runtime,
             repair_quic_endpoints_join_handle,
+            #[cfg(feature = "dpdk")]
+            dpdk,
             xdp_retransmitter,
             _tpu_client_next_runtime: tpu_client_next_runtime,
         })

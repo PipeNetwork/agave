@@ -157,27 +157,50 @@ impl BroadcastRun for BroadcastFakeShredsRun {
         _bank_forks: &RwLock<BankForks>,
         _quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     ) -> Result<()> {
-        let sock = match sock {
-            BroadcastSocket::Udp(sock) => sock,
+        match sock {
+            BroadcastSocket::Udp(sock) => {
+                for (data_shreds, batch_info) in receiver {
+                    let fake = batch_info.is_some();
+                    let peers = cluster_info.tvu_peers(ContactInfo::clone);
+                    peers.iter().enumerate().for_each(|(i, peer)| {
+                        if fake == (i <= self.partition) {
+                            // Send fake shreds to the first N peers
+                            if let Some(addr) = peer.tvu(Protocol::UDP) {
+                                data_shreds.iter().for_each(|b| {
+                                    sock.send_to(b.payload(), addr).unwrap();
+                                });
+                            }
+                        }
+                    });
+                }
+                Ok(())
+            }
             BroadcastSocket::Xdp(_) => {
                 panic!("Xdp not supported for fake shreds");
             }
-        };
-        for (data_shreds, batch_info) in receiver {
-            let fake = batch_info.is_some();
-            let peers = cluster_info.tvu_peers(ContactInfo::clone);
-            peers.iter().enumerate().for_each(|(i, peer)| {
-                if fake == (i <= self.partition) {
-                    // Send fake shreds to the first N peers
-                    if let Some(addr) = peer.tvu(Protocol::UDP) {
-                        data_shreds.iter().for_each(|b| {
-                            sock.send_to(b.payload(), addr).unwrap();
-                        });
+            #[cfg(feature = "dpdk")]
+            BroadcastSocket::Dpdk(sock) => {
+                for (data_shreds, batch_info) in receiver {
+                    let fake = batch_info.is_some();
+                    let peers = cluster_info.tvu_peers(ContactInfo::clone);
+                    for (i, peer) in peers.iter().enumerate() {
+                        if fake == (i <= self.partition) {
+                            if let Some(SocketAddr::V4(addr)) = peer.tvu(Protocol::UDP) {
+                                for b in data_shreds.iter() {
+                                    if sock
+                                        .try_send_to(addr, b.payload().bytes.clone())
+                                        .is_err()
+                                    {
+                                        return Err(Error::DpdkChannelFull);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-            });
+                Ok(())
+            }
         }
-        Ok(())
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {
         for (data_shreds, _) in receiver {

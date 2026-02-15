@@ -253,8 +253,42 @@ impl ShredFetchStage {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn packet_modifier_from_receiver(
+        modifier_thread_name: &'static str,
+        packet_receiver: PacketBatchReceiver,
+        receiver_stats: Arc<StreamerReceiveStats>,
+        sender: EvictingSender<PacketBatch>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        shred_version: u16,
+        name: &'static str,
+        flags: PacketFlags,
+        repair_context: Option<RepairContext>,
+        turbine_disabled: Arc<AtomicBool>,
+    ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let modifier_hdl = Builder::new()
+            .name(modifier_thread_name.to_string())
+            .spawn(move || {
+                Self::modify_packets(
+                    packet_receiver,
+                    Some(receiver_stats),
+                    sender,
+                    &sharable_banks,
+                    shred_version,
+                    name,
+                    flags,
+                    repair_context.as_ref(),
+                    turbine_disabled,
+                )
+            })
+            .unwrap();
+        (Vec::new(), modifier_hdl)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         sockets: Vec<Arc<UdpSocket>>,
+        dpdk_packet_receiver: Option<(PacketBatchReceiver, Arc<StreamerReceiveStats>)>,
         turbine_quic_endpoint_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_response_quic_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_socket: Arc<UdpSocket>,
@@ -273,21 +307,35 @@ impl ShredFetchStage {
             outstanding_repair_requests,
         };
 
-        let (mut tvu_threads, tvu_filter) = Self::packet_modifier(
-            "solRcvrShred",
-            "solTvuPktMod",
-            sockets,
-            exit.clone(),
-            sender.clone(),
-            recycler.clone(),
-            bank_forks.clone(),
-            shred_version,
-            "shred_fetch",
-            "shred_fetch_receiver",
-            PacketFlags::empty(),
-            None, // repair_context
-            turbine_disabled.clone(),
-        );
+        let (mut tvu_threads, tvu_filter) = match dpdk_packet_receiver {
+            Some((packet_receiver, receiver_stats)) => Self::packet_modifier_from_receiver(
+                "solTvuPktMod",
+                packet_receiver,
+                receiver_stats,
+                sender.clone(),
+                bank_forks.clone(),
+                shred_version,
+                "shred_fetch",
+                PacketFlags::empty(),
+                None, // repair_context
+                turbine_disabled.clone(),
+            ),
+            None => Self::packet_modifier(
+                "solRcvrShred",
+                "solTvuPktMod",
+                sockets,
+                exit.clone(),
+                sender.clone(),
+                recycler.clone(),
+                bank_forks.clone(),
+                shred_version,
+                "shred_fetch",
+                "shred_fetch_receiver",
+                PacketFlags::empty(),
+                None, // repair_context
+                turbine_disabled.clone(),
+            ),
+        };
 
         let (repair_receiver, repair_handler) = Self::packet_modifier(
             "solRcvrShredRep",

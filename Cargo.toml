@@ -30,6 +30,7 @@ members = [
     "cost-model",
     "curves/curve25519",
     "download-utils",
+    "dpdk",
     "entry",
     "faucet",
     "feature-set",
@@ -184,6 +185,7 @@ Inflector = "0.11.4"
 aes-gcm-siv = "0.11.1"
 agave-banking-stage-ingress-types = { path = "banking-stage-ingress-types", version = "=3.1.8", features = ["agave-unstable-api"] }
 agave-cargo-registry = { path = "cargo-registry", version = "=3.1.8" }
+agave-dpdk = { path = "dpdk", version = "=3.1.8", features = ["agave-unstable-api"] }
 agave-feature-set = { path = "feature-set", version = "=3.1.8", features = ["agave-unstable-api"] }
 agave-fs = { path = "fs", version = "=3.1.8", features = ["agave-unstable-api"] }
 agave-geyser-plugin-interface = { path = "geyser-plugin-interface", version = "=3.1.8" }
@@ -236,6 +238,7 @@ bytemuck_derive = "1.10.2"
 bytes = "1.10"
 bzip2 = "0.4.4"
 caps = "0.5.5"
+cc = "1.2.16"
 cargo_metadata = "0.15.4"
 cfg-if = "1.0.4"
 cfg_eval = "0.1.2"
@@ -335,6 +338,7 @@ pbkdf2 = { version = "0.12.2", default-features = false }
 pem = "1.1.1"
 percentage = "0.1.0"
 pickledb = { version = "0.5.1", default-features = false }
+pkg-config = "0.3.22"
 predicates = "2.1"
 pretty-hex = "0.3.0"
 pretty_assertions = "1.4.1"

@@ -106,6 +106,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-dpdk"
+version = "3.1.8"
+dependencies = [
+ "bytes",
+ "cc",
+ "crossbeam-channel",
+ "futures 0.3.31",
+ "libc",
+ "log",
+ "pkg-config",
+ "quinn",
+ "solana-metrics",
+ "solana-packet",
+ "solana-perf",
+ "solana-streamer",
+ "solana-time-utils",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "agave-feature-set"
 version = "3.1.8"
 dependencies = [
@@ -409,6 +429,7 @@ dependencies = [
 name = "agave-validator"
 version = "3.1.8"
 dependencies = [
+ "agave-dpdk",
  "agave-geyser-plugin-interface",
  "agave-logger",
  "agave-snapshots",
@@ -8190,6 +8211,7 @@ name = "solana-core"
 version = "3.1.8"
 dependencies = [
  "agave-banking-stage-ingress-types",
+ "agave-dpdk",
  "agave-feature-set",
  "agave-logger",
  "agave-reserved-account-keys",
@@ -11655,6 +11677,7 @@ dependencies = [
 name = "solana-turbine"
 version = "3.1.8"
 dependencies = [
+ "agave-dpdk",
  "agave-feature-set",
  "agave-logger",
  "agave-votor",
