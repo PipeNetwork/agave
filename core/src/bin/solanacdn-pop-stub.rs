@@ -1,7 +1,9 @@
 use {
-    anyhow::{bail, Context, Result},
+    anyhow::{anyhow, bail, Context, Result},
     quinn::{Endpoint, ServerConfig},
     rand::random,
+    reqwest::Client,
+    serde_json::json,
     solanacdn_protocol::{
         crypto::{random_nonce_16, SignatureBytes},
         frame::{decode_envelope, encode_envelope},
@@ -15,10 +17,14 @@ use {
     solana_transaction::{versioned::VersionedTransaction, Transaction},
     std::{
         net::SocketAddr,
+        str::FromStr,
         sync::{Arc, Once},
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
-    tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    tokio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        sync::mpsc,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -30,6 +36,8 @@ struct Config {
     exit_after_ms: u64,
     origin_pop_id: String,
     target_slot: Option<u64>,
+    rpc_url: Option<String>,
+    echo_commits: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -67,7 +75,7 @@ async fn main() -> Result<()> {
 }
 
 fn usage() -> &'static str {
-    "solanacdn-pop-stub [--listen HOST:PORT] [--batches N] [--txs-per-batch N] [--interval-ms MS] [--exit-after-ms MS] [--origin-pop-id ID] [--target-slot SLOT]"
+    "solanacdn-pop-stub [--listen HOST:PORT] [--batches N] [--txs-per-batch N] [--interval-ms MS] [--exit-after-ms MS] [--origin-pop-id ID] [--target-slot SLOT] [--rpc-url URL] [--echo-commits]"
 }
 
 fn parse_args() -> Result<Config> {
@@ -79,6 +87,8 @@ fn parse_args() -> Result<Config> {
         exit_after_ms: 1_000,
         origin_pop_id: "local-pop".to_string(),
         target_slot: None,
+        rpc_url: None,
+        echo_commits: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -116,6 +126,12 @@ fn parse_args() -> Result<Config> {
                 cfg.target_slot =
                     Some(value.parse().with_context(|| format!("invalid --target-slot: {value}"))?);
             }
+            "--rpc-url" => {
+                cfg.rpc_url = Some(next_arg(&mut args, "--rpc-url")?);
+            }
+            "--echo-commits" => {
+                cfg.echo_commits = true;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: {}", usage());
                 std::process::exit(0);
@@ -138,7 +154,7 @@ fn next_arg<I: Iterator<Item = String>>(args: &mut I, name: &str) -> Result<Stri
 
 async fn handle_connection(conn: quinn::Connection, cfg: Config) -> Result<()> {
     loop {
-        let (mut send, mut recv) = match conn.accept_bi().await {
+        let (send, mut recv) = match conn.accept_bi().await {
             Ok(stream) => stream,
             Err(err) => {
                 eprintln!("solanacdn-pop-stub: accept_bi ended: {err}");
@@ -157,7 +173,7 @@ async fn handle_connection(conn: quinn::Connection, cfg: Config) -> Result<()> {
         match msg {
             AgentToPop::Auth(_) | AgentToPop::AuthWithSessionToken(_) => {
                 eprintln!("solanacdn-pop-stub: received auth");
-                handle_control_stream(&mut send, recv, cfg.clone()).await?;
+                handle_control_stream(send, recv, cfg.clone()).await?;
                 return Ok(());
             }
             other => {
@@ -171,10 +187,19 @@ async fn handle_connection(conn: quinn::Connection, cfg: Config) -> Result<()> {
 }
 
 async fn handle_control_stream(
-    send: &mut quinn::SendStream,
+    mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     cfg: Config,
 ) -> Result<()> {
+    let (out_tx, mut out_rx) = mpsc::channel::<PopToAgent>(64);
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            if write_pop_msg(&mut send, &msg).await.is_err() {
+                return;
+            }
+        }
+    });
+
     let auth_ok = AuthOk {
         pop_id: cfg.origin_pop_id.clone(),
         server_time_ms: now_ms(),
@@ -182,35 +207,48 @@ async fn handle_control_stream(
         udp_shreds_port: 0,
         udp_votes_port: 0,
     };
-    write_pop_msg(send, &PopToAgent::AuthOk(auth_ok)).await?;
+    if out_tx.send(PopToAgent::AuthOk(auth_ok)).await.is_err() {
+        return Ok(());
+    }
 
-    let read_task = tokio::spawn(async move {
-        loop {
-            match read_agent_msg(&mut recv).await {
-                Ok(msg) => match msg {
-                    AgentToPop::FairBatchCommit(commit) => {
-                        eprintln!(
-                            "solanacdn-pop-stub: received FairBatchCommit batch_id={} order_start={} txs={}",
-                            commit.payload.batch_id,
-                            commit.payload.order_start,
-                            commit.payload.tx_sigs.len()
-                        );
-                    }
-                    AgentToPop::Heartbeat(_) => {}
-                    AgentToPop::Capabilities(cap) => {
-                        eprintln!(
-                            "solanacdn-pop-stub: capabilities tx_fair_ordering={}",
-                            cap.tx_fair_ordering
-                        );
-                    }
-                    other => {
-                        eprintln!("solanacdn-pop-stub: ctrl msg {other:?}");
-                    }
-                },
-                Err(_) => break,
+    let read_task = {
+        let out_tx = out_tx.clone();
+        let echo_commits = cfg.echo_commits;
+        tokio::spawn(async move {
+            loop {
+                match read_agent_msg(&mut recv).await {
+                    Ok(msg) => match msg {
+                        AgentToPop::FairBatchCommit(commit) => {
+                            eprintln!(
+                                "solanacdn-pop-stub: received FairBatchCommit batch_id={} order_start={} txs={}",
+                                commit.payload.batch_id,
+                                commit.payload.order_start,
+                                commit.payload.tx_sigs.len()
+                            );
+                            if echo_commits {
+                                let _ = out_tx
+                                    .send(PopToAgent::FairBatchCommit(commit))
+                                    .await;
+                            }
+                        }
+                        AgentToPop::Heartbeat(_) => {}
+                        AgentToPop::Capabilities(cap) => {
+                            eprintln!(
+                                "solanacdn-pop-stub: capabilities tx_fair_ordering={}",
+                                cap.tx_fair_ordering
+                            );
+                        }
+                        other => {
+                            eprintln!("solanacdn-pop-stub: ctrl msg {other:?}");
+                        }
+                    },
+                    Err(_) => break,
+                }
             }
-        }
-    });
+        })
+    };
+
+    let rpc_client = cfg.rpc_url.as_ref().map(|_| Client::new());
 
     let mut batches_sent: u64 = 0;
     loop {
@@ -218,8 +256,25 @@ async fn handle_control_stream(
             break;
         }
         let batch_id = random::<u128>();
-        let batch = build_fair_batch(&cfg, batch_id);
-        write_pop_msg(send, &PopToAgent::FairBatch(batch)).await?;
+        let blockhash = if let (Some(url), Some(client)) =
+            (cfg.rpc_url.as_ref(), rpc_client.as_ref())
+        {
+            match fetch_latest_blockhash(client, url).await {
+                Ok(hash) => hash,
+                Err(err) => {
+                    eprintln!(
+                        "solanacdn-pop-stub: failed to fetch blockhash from {url}: {err:#}"
+                    );
+                    Hash::new_unique()
+                }
+            }
+        } else {
+            Hash::new_unique()
+        };
+        let batch = build_fair_batch(&cfg, batch_id, blockhash);
+        if out_tx.send(PopToAgent::FairBatch(batch)).await.is_err() {
+            break;
+        }
         batches_sent = batches_sent.saturating_add(1);
         if cfg.batches != 0 && batches_sent >= cfg.batches {
             break;
@@ -232,12 +287,12 @@ async fn handle_control_stream(
     }
 
     let _ = read_task.await;
+    let _ = writer.await;
     Ok(())
 }
 
-fn build_fair_batch(cfg: &Config, batch_id: u128) -> FairBatch {
+fn build_fair_batch(cfg: &Config, batch_id: u128, recent_blockhash: Hash) -> FairBatch {
     let signer = Keypair::new();
-    let recent_blockhash = Hash::new_unique();
     let mut txs = Vec::with_capacity(cfg.txs_per_batch);
 
     for idx in 0..cfg.txs_per_batch {
@@ -291,6 +346,29 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis() as u64
+}
+
+async fn fetch_latest_blockhash(client: &Client, rpc_url: &str) -> Result<Hash> {
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLatestBlockhash",
+        "params": []
+    });
+    let resp = client
+        .post(rpc_url)
+        .json(&request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let value: serde_json::Value = resp.json().await?;
+    let hash_str = value
+        .get("result")
+        .and_then(|v| v.get("value"))
+        .and_then(|v| v.get("blockhash"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing blockhash in RPC response"))?;
+    Hash::from_str(hash_str).map_err(|err| anyhow!("invalid blockhash: {err}"))
 }
 
 fn make_server_config() -> Result<ServerConfig> {

@@ -114,10 +114,36 @@ For a repeatable local-cluster `--fair` smoke test, use the lightweight POP stub
    cargo run -p solana-core --bin solanacdn-pop-stub -- --listen 127.0.0.1:9002
    ```
 
+   To emit repeated batches:
+
+   ```bash
+   cargo run -p solana-core --bin solanacdn-pop-stub -- \\
+     --listen 127.0.0.1:9002 --batches 0 --interval-ms 200 --exit-after-ms 0
+   ```
+
 3. Verify fair-batch counters moved:
 
    ```bash
    curl -s http://127.0.0.1:9100/metrics | rg 'solanacdn_tx_fair_batch_(received|injected)_total'
+   ```
+
+4. Fair-slashing smoke test (optional):
+
+   - Start the validator with `--fair-slashing` or `--fair-slashing-enforce`.
+   - Run the stub with a target slot and RPC URL so commit memos use a recent blockhash:
+
+   ```bash
+   cargo run -p solana-core --bin solanacdn-pop-stub -- \\
+     --listen 127.0.0.1:9002 \\
+     --target-slot 1 \\
+     --rpc-url http://127.0.0.1:8899 \\
+     --echo-commits
+   ```
+
+   Then watch the fair-slashing counters:
+
+   ```bash
+   curl -s http://127.0.0.1:9100/metrics | rg 'solanacdn_fair_(commits_rx_total|ledger_commits_seen_total|ledger_audit_checked_total)'
    ```
 
 ## Notes / limitations
