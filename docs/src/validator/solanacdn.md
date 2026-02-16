@@ -97,6 +97,29 @@ To restore the startup configuration:
 - Transaction hygiene counters include dedup drops (`solanacdn_tx_deduped_packets_total`) and relay drops in fair mode (`solanacdn_tx_relay_dropped_fair_mode_total`).
 - Fair/slashing Prometheus counters include commits, audit failures, and vote withholding (`solanacdn_fair_votes_withheld_total`).
 
+## Local POP stub (fair smoke test)
+
+For a repeatable local-cluster `--fair` smoke test, use the lightweight POP stub binary included in this repo.
+
+1. Start a local cluster with fair ordering enabled and SolanaCDN pointed at the stub:
+
+   ```bash
+   SOLANA_RUN_SH_VALIDATOR_ARGS="--fair --solanacdn-pop 127.0.0.1:9002 --solanacdn-tls-insecure-skip-verify --solanacdn-metrics-addr 127.0.0.1:9100" \\
+     scripts/run.sh
+   ```
+
+2. In a second terminal, run the stub (sends one fair batch by default):
+
+   ```bash
+   cargo run -p solana-core --bin solanacdn-pop-stub -- --listen 127.0.0.1:9002
+   ```
+
+3. Verify fair-batch counters moved:
+
+   ```bash
+   curl -s http://127.0.0.1:9100/metrics | rg 'solanacdn_tx_fair_batch_(received|injected)_total'
+   ```
+
 ## Notes / limitations
 
 - Vote tunneling is UDP-only. If validator QUIC votes are enabled, SolanaCDN vote tunneling is disabled automatically.
