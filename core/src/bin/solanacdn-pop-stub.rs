@@ -1,6 +1,9 @@
 use {
     anyhow::{anyhow, bail, Context, Result},
-    quinn::{Endpoint, ServerConfig},
+    quinn::{
+        crypto::rustls::QuicServerConfig,
+        Endpoint, ServerConfig,
+    },
     rand::random,
     reqwest::Client,
     serde_json::json,
@@ -14,11 +17,12 @@ use {
     solana_keypair::Keypair,
     solana_message::Message,
     solana_signer::Signer,
+    solana_tls_utils::{crypto_provider, new_dummy_x509_certificate},
     solana_transaction::{versioned::VersionedTransaction, Transaction},
     std::{
         net::SocketAddr,
         str::FromStr,
-        sync::{Arc, Once},
+        sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::{
@@ -60,18 +64,21 @@ async fn main() -> Result<()> {
         let Some(connecting) = incoming else {
             continue;
         };
-        let cfg = cfg.clone();
-        tokio::spawn(async move {
-            match connecting.await {
-                Ok(conn) => {
-                    if let Err(err) = handle_connection(conn, cfg).await {
-                        eprintln!("solanacdn-pop-stub: connection error: {err:#}");
-                    }
+        match connecting.await {
+            Ok(conn) => {
+                if let Err(err) = handle_connection(conn, cfg.clone()).await {
+                    eprintln!("solanacdn-pop-stub: connection error: {err:#}");
                 }
-                Err(err) => eprintln!("solanacdn-pop-stub: failed to accept connection: {err}"),
             }
-        });
+            Err(err) => eprintln!("solanacdn-pop-stub: failed to accept connection: {err}"),
+        }
+
+        if cfg.exit_after_ms > 0 {
+            break;
+        }
     }
+
+    Ok(())
 }
 
 fn usage() -> &'static str {
@@ -173,8 +180,22 @@ async fn handle_connection(conn: quinn::Connection, cfg: Config) -> Result<()> {
         match msg {
             AgentToPop::Auth(_) | AgentToPop::AuthWithSessionToken(_) => {
                 eprintln!("solanacdn-pop-stub: received auth");
-                handle_control_stream(send, recv, cfg.clone()).await?;
-                return Ok(());
+                let drain_conn = conn.clone();
+                let drain_task = tokio::spawn(async move {
+                    loop {
+                        let stream = drain_conn.accept_bi().await;
+                        let Ok((_send, recv)) = stream else {
+                            break;
+                        };
+                        tokio::spawn(async move {
+                            drain_stream(recv).await;
+                        });
+                    }
+                });
+
+                let res = handle_control_stream(conn.clone(), send, recv, cfg.clone()).await;
+                let _ = drain_task.await;
+                return res;
             }
             other => {
                 eprintln!("solanacdn-pop-stub: ignoring stream message: {other:?}");
@@ -187,6 +208,7 @@ async fn handle_connection(conn: quinn::Connection, cfg: Config) -> Result<()> {
 }
 
 async fn handle_control_stream(
+    conn: quinn::Connection,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     cfg: Config,
@@ -284,6 +306,8 @@ async fn handle_control_stream(
 
     if cfg.exit_after_ms > 0 {
         tokio::time::sleep(Duration::from_millis(cfg.exit_after_ms)).await;
+        conn.close(0u32.into(), b"done");
+        drop(out_tx);
     }
 
     let _ = read_task.await;
@@ -372,77 +396,12 @@ async fn fetch_latest_blockhash(client: &Client, rpc_url: &str) -> Result<Hash> 
 }
 
 fn make_server_config() -> Result<ServerConfig> {
-    init_rustls();
     let keypair = Keypair::new();
     let (cert, key) = new_dummy_x509_certificate(&keypair);
-    let tls = rustls::ServerConfig::builder()
+    let server_tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(crypto_provider()))
+        .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
-    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
-        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadSignature))?;
-    Ok(ServerConfig::with_crypto(Arc::new(quic)))
-}
-
-fn init_rustls() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-fn new_dummy_x509_certificate(
-    keypair: &Keypair,
-) -> (
-    rustls::pki_types::CertificateDer<'static>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-) {
-    const PKCS8_PREFIX: [u8; 16] = [
-        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22,
-        0x04, 0x20,
-    ];
-
-    let key_pkcs8_der = {
-        let keypair_secret_bytes = keypair.secret_bytes();
-        let keypair_secret_len = keypair_secret_bytes.len();
-        if keypair_secret_len != 32 {
-            panic!("Unexpected secret key length!");
-        }
-        let buffer_size = PKCS8_PREFIX
-            .len()
-            .checked_add(keypair_secret_len)
-            .expect("Unexpected secret key length!");
-        let mut key_pkcs8_der = Vec::<u8>::with_capacity(buffer_size);
-        key_pkcs8_der.extend_from_slice(&PKCS8_PREFIX);
-        key_pkcs8_der.extend_from_slice(keypair_secret_bytes);
-        key_pkcs8_der
-    };
-
-    let mut cert_der = Vec::<u8>::with_capacity(0xf4);
-    cert_der.extend_from_slice(&[
-        0x30, 0x81, 0xf6, 0x30, 0x81, 0xa9, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x08, 0x01,
-        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
-        0x30, 0x16, 0x31, 0x14, 0x30, 0x12, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x0b, 0x53,
-        0x6f, 0x6c, 0x61, 0x6e, 0x61, 0x20, 0x6e, 0x6f, 0x64, 0x65, 0x30, 0x20, 0x17, 0x0d,
-        0x37, 0x30, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a, 0x18,
-        0x0f, 0x34, 0x30, 0x39, 0x36, 0x30, 0x31, 0x30, 0x31, 0x30, 0x30, 0x30, 0x30, 0x30,
-        0x30, 0x5a, 0x30, 0x00, 0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03,
-        0x21, 0x00,
-    ]);
-    cert_der.extend_from_slice(&keypair.pubkey().to_bytes());
-    cert_der.extend_from_slice(&[
-        0xa3, 0x29, 0x30, 0x27, 0x30, 0x17, 0x06, 0x03, 0x55, 0x1d, 0x11, 0x01, 0x01, 0xff,
-        0x04, 0x0d, 0x30, 0x0b, 0x82, 0x09, 0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x68, 0x6f, 0x73,
-        0x74, 0x30, 0x0c, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x02, 0x30,
-        0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x41, 0x00, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff, 0xff, 0xff,
-    ]);
-
-    (
-        rustls::pki_types::CertificateDer::from(cert_der),
-        rustls::pki_types::PrivateKeyDer::try_from(key_pkcs8_der).expect("pkcs8"),
-    )
+    let quic_config = QuicServerConfig::try_from(server_tls_config)?;
+    Ok(ServerConfig::with_crypto(Arc::new(quic_config)))
 }

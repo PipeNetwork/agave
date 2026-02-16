@@ -21,6 +21,9 @@
 #   EXPECT_FAIR_LEDGER_COMMITS_SEEN_MIN=0
 #   EXPECT_FAIR_LEDGER_AUDIT_CHECKED_MIN=0
 #   STRICT_SLASHING_METRICS=0
+#   TOTAL_TIMEOUT_SECS=120
+#   CLEANUP_TIMEOUT_SECS=10
+#   RUN_SH_LOG=          # optional path to capture scripts/run.sh output
 #
 set -euo pipefail
 
@@ -39,6 +42,14 @@ FAIR_SLASHING_ENFORCE="${FAIR_SLASHING_ENFORCE:-0}"
 TARGET_SLOT="${TARGET_SLOT:-}"
 WAIT_FOR_METRICS_SECS="${WAIT_FOR_METRICS_SECS:-15}"
 STRICT_SLASHING_METRICS="${STRICT_SLASHING_METRICS:-0}"
+TOTAL_TIMEOUT_SECS="${TOTAL_TIMEOUT_SECS:-120}"
+CLEANUP_TIMEOUT_SECS="${CLEANUP_TIMEOUT_SECS:-10}"
+
+if [[ -z "${LIBCLANG_PATH:-}" && -d /opt/homebrew/opt/llvm/lib ]]; then
+  export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
+  export DYLD_LIBRARY_PATH="/opt/homebrew/opt/llvm/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
+  export PATH="/opt/homebrew/opt/llvm/bin:${PATH}"
+fi
 
 if [[ -z "${EXPECT_FAIR_RECEIVED_MIN+x}" ]]; then
   EXPECT_FAIR_RECEIVED_MIN=1
@@ -93,16 +104,44 @@ export SOLANA_RUN_SH_VALIDATOR_ARGS="${validator_args[*]}"
 init_file="${root_dir}/config/run/init-completed"
 
 run_pid=""
+watchdog_pid=""
+main_pid="$$"
+run_log="${RUN_SH_LOG:-${root_dir}/config/run/solanacdn-fair-smoke.log}"
 cleanup() {
+  if [[ -n "${watchdog_pid}" ]]; then
+    kill "${watchdog_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${run_pid}" ]]; then
     kill -INT "${run_pid}" 2>/dev/null || true
+    for _ in $(seq 1 "${CLEANUP_TIMEOUT_SECS}"); do
+      if ! kill -0 "${run_pid}" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    if kill -0 "${run_pid}" 2>/dev/null; then
+      kill "${run_pid}" 2>/dev/null || true
+    fi
     wait "${run_pid}" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT INT TERM
 
+if [[ "${TOTAL_TIMEOUT_SECS}" -gt 0 ]]; then
+  (
+    sleep "${TOTAL_TIMEOUT_SECS}"
+    echo "Overall timeout (${TOTAL_TIMEOUT_SECS}s) reached; shutting down." >&2
+    kill -TERM "${main_pid}" 2>/dev/null || true
+  ) &
+  watchdog_pid=$!
+fi
+
 echo "Starting local validator..."
-"${root_dir}/scripts/run.sh" &
+if [[ -n "${run_log}" ]]; then
+  "${root_dir}/scripts/run.sh" >"${run_log}" 2>&1 &
+else
+  "${root_dir}/scripts/run.sh" &
+fi
 run_pid=$!
 
 echo "Waiting for validator init (${init_file})..."
@@ -143,7 +182,11 @@ if [[ "${ECHO_COMMITS}" -eq 1 ]]; then
 fi
 
 echo "Running POP stub..."
-cargo run -p solana-core --bin solanacdn-pop-stub -- "${stub_args[@]}"
+stub_bin="${root_dir}/target/debug/solanacdn-pop-stub"
+if [[ ! -x "${stub_bin}" ]]; then
+  cargo build -p solana-core --bin solanacdn-pop-stub
+fi
+"${stub_bin}" "${stub_args[@]}"
 
 metrics_url="http://${METRICS_ADDR}/metrics"
 echo "Checking metrics at ${metrics_url}..."
