@@ -81,6 +81,8 @@ const FAIR_SLASH_WITNESS_TTL_MS: u64 = 60_000;
 const FAIR_SLASH_WITNESS_MAX_ENTRIES: usize = 1_000_000;
 const FAIR_SLASHED_TTL_MS: u64 = 10 * 60_000;
 const FAIR_SLASHED_MAX_ENTRIES: usize = 20_000;
+const POP_EGRESS_IP_TTL_MS: u64 = 10 * 60_000;
+const POP_EGRESS_IP_MAX_ENTRIES: usize = 50_000;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -498,6 +500,8 @@ pub struct SolanaCdnConfig {
     pub publish_discarded_shreds: bool,
     pub subscribe_shreds: bool,
     pub inject_shreds: bool,
+    /// If disabled, drop repair shreds (risk: can stall if shreds are missing).
+    pub repair_shreds: bool,
     /// How to gate turbine TVU shreds when SolanaCDN is enabled.
     pub tvu_shred_ingest_mode: TvuShredIngestMode,
     /// In `SolanaCdnPreferred` mode, treat SolanaCDN as stalled when no POP-delivered shreds have
@@ -545,6 +549,7 @@ impl SolanaCdnConfig {
             publish_discarded_shreds: true,
             subscribe_shreds: true,
             inject_shreds: true,
+            repair_shreds: true,
             tvu_shred_ingest_mode: TvuShredIngestMode::All,
             tvu_shred_hybrid_stale_ms: 2_000,
             direct_shreds_from_pop: true,
@@ -584,6 +589,7 @@ impl Default for SolanaCdnConfig {
             publish_discarded_shreds: true,
             subscribe_shreds: true,
             inject_shreds: true,
+            repair_shreds: true,
             tvu_shred_ingest_mode: TvuShredIngestMode::All,
             tvu_shred_hybrid_stale_ms: 2_000,
             direct_shreds_from_pop: true,
@@ -1061,6 +1067,7 @@ pub struct SolanaCdnStatus {
     pub fair_votes_withheld_total: u64,
     pub fair_ledger_audit_checked_total: u64,
     pub fair_ledger_audit_failed_total: u64,
+    pub fair_ledger_audit_inconclusive_total: u64,
     pub fair_ledger_audit_get_slot_entries_failed_total: u64,
     pub fair_ledger_commits_seen_total: u64,
     pub fair_ledger_commits_invalid_total: u64,
@@ -1126,6 +1133,7 @@ pub struct SolanaCdnHandle {
     tx_fair_slashing_enforce_override: AtomicU8,
     fair_ledger_audit_checked: AtomicU64,
     fair_ledger_audit_failed: AtomicU64,
+    fair_ledger_audit_inconclusive: AtomicU64,
     fair_ledger_audit_get_slot_entries_failed: AtomicU64,
     fair_ledger_commits_seen: AtomicU64,
     fair_ledger_commits_invalid: AtomicU64,
@@ -1135,7 +1143,8 @@ pub struct SolanaCdnHandle {
     dropped_shred_payloads: AtomicU64,
     dropped_vote_datagrams: AtomicU64,
     uplink_broadcast_lagged: AtomicU64,
-    ignore_src_ips: DashSet<IpAddr>,
+    pop_endpoint_ips: DashSet<IpAddr>,
+    pop_egress_ips: DashMap<IpAddr, u64>,
     connected_pops: DashSet<SocketAddr>,
     publisher_endpoint: ArcSwapOption<String>,
     publisher_switches_total: AtomicU64,
@@ -1185,6 +1194,7 @@ impl SolanaCdnHandle {
             ),
             fair_ledger_audit_checked: AtomicU64::new(0),
             fair_ledger_audit_failed: AtomicU64::new(0),
+            fair_ledger_audit_inconclusive: AtomicU64::new(0),
             fair_ledger_audit_get_slot_entries_failed: AtomicU64::new(0),
             fair_ledger_commits_seen: AtomicU64::new(0),
             fair_ledger_commits_invalid: AtomicU64::new(0),
@@ -1194,7 +1204,8 @@ impl SolanaCdnHandle {
             dropped_shred_payloads: AtomicU64::new(0),
             dropped_vote_datagrams: AtomicU64::new(0),
             uplink_broadcast_lagged: AtomicU64::new(0),
-            ignore_src_ips: DashSet::new(),
+            pop_endpoint_ips: DashSet::new(),
+            pop_egress_ips: DashMap::new(),
             connected_pops: DashSet::new(),
             publisher_endpoint: ArcSwapOption::const_empty(),
             publisher_switches_total: AtomicU64::new(0),
@@ -1291,6 +1302,10 @@ impl SolanaCdnHandle {
 
     pub fn vote_tunnel_enabled(&self) -> bool {
         self.cfg.vote_tunnel
+    }
+
+    pub fn repair_shreds_enabled(&self) -> bool {
+        self.cfg.repair_shreds
     }
 
     pub fn tx_fair_slashing_enabled(&self) -> bool {
@@ -1602,18 +1617,26 @@ impl SolanaCdnHandle {
         ordered_batches.sort_by_key(|(order_start, batch_id)| (*order_start, *batch_id));
 
         let mut expected: Vec<[u8; 64]> = Vec::new();
-        for (order_start, batch_id) in ordered_batches {
+        let mut incomplete = false;
+        'batches: for (_order_start, batch_id) in ordered_batches {
             let Some(chunk_total) = batch_chunk_total.get(&batch_id).copied() else {
                 continue;
             };
             for chunk_index in 0..chunk_total {
                 let key = (batch_id, chunk_index);
                 let Some(sigs) = chunk_sigs.get(&key) else {
-                    self.mark_fair_slashed(expected_leader, slot, order_start, now_ms());
-                    return false;
+                    // NOTE: Missing commit chunks are treated as inconclusive for now. This may
+                    // change back to slashing once commit delivery is more reliable.
+                    incomplete = true;
+                    break 'batches;
                 };
                 expected.extend_from_slice(sigs);
             }
+        }
+        if incomplete {
+            self.fair_ledger_audit_inconclusive
+                .fetch_add(1, Ordering::Relaxed);
+            return true;
         }
 
         if expected.is_empty() {
@@ -1799,18 +1822,62 @@ impl SolanaCdnHandle {
     }
 
     pub fn should_ignore_src_ip(&self, ip: IpAddr) -> bool {
-        ip.is_loopback() || self.ignore_src_ips.contains(&ip)
+        if ip.is_loopback() {
+            return true;
+        }
+        let now = now_ms();
+        let mut egress_ok = false;
+        if let Some(entry) = self.pop_egress_ips.get(&ip) {
+            let expires_at = *entry;
+            drop(entry);
+            if expires_at >= now {
+                egress_ok = true;
+            } else {
+                self.pop_egress_ips.remove(&ip);
+            }
+        }
+        if self.is_connected() {
+            let mut has_connected = false;
+            for ep in self.connected_pops.iter() {
+                has_connected = true;
+                if ep.ip() == ip {
+                    return true;
+                }
+            }
+            if has_connected {
+                return egress_ok;
+            }
+            // Fallback when connected_pops is not yet populated (startup/tests).
+            if self.pop_endpoint_ips.contains(&ip) {
+                return true;
+            }
+            return egress_ok;
+        }
+        if self.pop_endpoint_ips.contains(&ip) {
+            return true;
+        }
+        egress_ok
     }
 
+    /// Replace the POP endpoint allowlist with the provided set (used for discovery refreshes).
     pub fn note_pop_endpoints(&self, endpoints: &[SocketAddr]) {
+        self.pop_endpoint_ips.clear();
         for ep in endpoints {
-            self.ignore_src_ips.insert(ep.ip());
+            self.pop_endpoint_ips.insert(ep.ip());
         }
+    }
+
+    pub fn note_pop_endpoint(&self, endpoint: SocketAddr) {
+        self.pop_endpoint_ips.insert(endpoint.ip());
     }
 
     pub fn note_pop_egress_ip(&self, ip: IpAddr) {
         if !ip.is_loopback() {
-            self.ignore_src_ips.insert(ip);
+            if self.pop_egress_ips.len() > POP_EGRESS_IP_MAX_ENTRIES {
+                self.pop_egress_ips.clear();
+            }
+            self.pop_egress_ips
+                .insert(ip, now_ms().saturating_add(POP_EGRESS_IP_TTL_MS));
         }
     }
 
@@ -1920,6 +1987,8 @@ impl SolanaCdnHandle {
         let fair_ledger_audit_checked_total =
             self.fair_ledger_audit_checked.load(Ordering::Relaxed);
         let fair_ledger_audit_failed_total = self.fair_ledger_audit_failed.load(Ordering::Relaxed);
+        let fair_ledger_audit_inconclusive_total =
+            self.fair_ledger_audit_inconclusive.load(Ordering::Relaxed);
         let fair_ledger_audit_get_slot_entries_failed_total = self
             .fair_ledger_audit_get_slot_entries_failed
             .load(Ordering::Relaxed);
@@ -2041,6 +2110,7 @@ impl SolanaCdnHandle {
             fair_votes_withheld_total,
             fair_ledger_audit_checked_total,
             fair_ledger_audit_failed_total,
+            fair_ledger_audit_inconclusive_total,
             fair_ledger_audit_get_slot_entries_failed_total,
             fair_ledger_commits_seen_total,
             fair_ledger_commits_invalid_total,
@@ -2212,6 +2282,7 @@ impl SolanaCdnHandle {
             "fair_votes_withheld_total": self.fair_votes_withheld.load(Ordering::Relaxed) as i64,
             "fair_ledger_audit_checked_total": self.fair_ledger_audit_checked.load(Ordering::Relaxed) as i64,
             "fair_ledger_audit_failed_total": self.fair_ledger_audit_failed.load(Ordering::Relaxed) as i64,
+            "fair_ledger_audit_inconclusive_total": self.fair_ledger_audit_inconclusive.load(Ordering::Relaxed) as i64,
             "fair_ledger_audit_get_slot_entries_failed_total": self.fair_ledger_audit_get_slot_entries_failed.load(Ordering::Relaxed) as i64,
             "fair_ledger_commits_seen_total": self.fair_ledger_commits_seen.load(Ordering::Relaxed) as i64,
             "fair_ledger_commits_invalid_total": self.fair_ledger_commits_invalid.load(Ordering::Relaxed) as i64,
@@ -2248,6 +2319,16 @@ impl SolanaCdnHandle {
 
 pub fn global() -> Option<Arc<SolanaCdnHandle>> {
     GLOBAL.load_full()
+}
+
+#[cfg(test)]
+pub(crate) fn set_global_for_tests(handle: Option<Arc<SolanaCdnHandle>>) {
+    GLOBAL.store(handle);
+}
+
+#[cfg(test)]
+pub(crate) fn new_handle_for_tests(cfg: SolanaCdnConfig) -> Arc<SolanaCdnHandle> {
+    Arc::new(SolanaCdnHandle::new(cfg))
 }
 
 pub fn fair_slashing_is_slashed_leader(leader: &Pubkey, slot: u64) -> bool {
@@ -3953,6 +4034,13 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.fair_ledger_audit_failed_total
     ));
 
+    out.push_str("# HELP solanacdn_fair_ledger_audit_inconclusive_total Number of slots where fair ordering audit was inconclusive (missing commit chunks)\n");
+    out.push_str("# TYPE solanacdn_fair_ledger_audit_inconclusive_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_ledger_audit_inconclusive_total {}\n",
+        status.fair_ledger_audit_inconclusive_total
+    ));
+
     out.push_str("# HELP solanacdn_fair_ledger_audit_get_slot_entries_failed_total Number of slots where the fair ordering audit could not read entries from blockstore\n");
     out.push_str("# TYPE solanacdn_fair_ledger_audit_get_slot_entries_failed_total counter\n");
     out.push_str(&format!(
@@ -5058,7 +5146,7 @@ async fn run_pop_session(
         }
     };
 
-    handle.note_pop_endpoints(&[endpoint]);
+    handle.note_pop_endpoint(endpoint);
 
     let _ = session_events_tx.send(SessionEvent::Connected {
         endpoint,
@@ -6414,6 +6502,49 @@ mod tests {
     }
 
     #[test]
+    fn fair_ledger_audit_missing_chunks_are_inconclusive() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let slot = 42;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+
+        let sigs: Vec<[u8; 64]> = (0..(FAIR_LEDGER_COMMIT_MAX_SIGS_PER_CHUNK + 1))
+            .map(|i| [i as u8; 64])
+            .collect();
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs.as_slice(),
+        );
+        assert!(commit_txs.len() >= 2);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_enforce = true;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        assert!(handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        let status = handle.status_snapshot();
+        assert_eq!(status.fair_slashed_leaders_len, 0);
+        assert_eq!(status.fair_ledger_audit_inconclusive_total, 1);
+    }
+
+    #[test]
     fn fair_commit_equivocation_marks_slashed() {
         let leader_identity = Arc::new(Keypair::new());
         let leader = leader_identity.pubkey();
@@ -6824,6 +6955,7 @@ mod tests {
         assert!(text.contains("solanacdn_fair_votes_withheld_total "));
         assert!(text.contains("solanacdn_fair_ledger_audit_checked_total "));
         assert!(text.contains("solanacdn_fair_ledger_audit_failed_total "));
+        assert!(text.contains("solanacdn_fair_ledger_audit_inconclusive_total "));
         assert!(text.contains(
             "solanacdn_fair_ledger_audit_get_slot_entries_failed_total "
         ));

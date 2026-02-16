@@ -162,6 +162,7 @@ impl FromClapArgMatches for RunArgs {
         if (matches.is_present("solanacdn_only")
             || matches.is_present("solanacdn_hybrid")
             || solanacdn_race_requested
+            || matches.is_present("solanacdn_no_repair")
             || matches.is_present("fair")
             || matches.is_present("fair_slashing")
             || matches.is_present("fair_slashing_enforce"))
@@ -1618,6 +1619,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("solanacdn-no-inject")
             .takes_value(false)
             .help("Disable injecting SolanaCDN shreds into local TVU/gossip"),
+    )
+    .arg(
+        Arg::with_name("solanacdn_no_repair")
+            .long("solanacdn-no-repair")
+            .takes_value(false)
+            .help("Disable repair shreds (risk: may stall if SolanaCDN misses shreds)"),
     )
     .arg(
         Arg::with_name("solanacdn_no_direct_shreds")

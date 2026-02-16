@@ -100,4 +100,5 @@ To restore the startup configuration:
 ## Notes / limitations
 
 - Vote tunneling is UDP-only. If validator QUIC votes are enabled, SolanaCDN vote tunneling is disabled automatically.
+- `--solanacdn-no-repair` disables repair shreds; this can stall catch-up if SolanaCDN misses shreds. Use with care.
 - `--fair-slashing-enforce` can reduce vote participation if violations are detected; use with care.

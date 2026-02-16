@@ -623,6 +623,10 @@ pub fn execute(
         cfg.publish_discarded_shreds = !matches.is_present("solanacdn_only_accepted_shreds");
         cfg.subscribe_shreds = !matches.is_present("solanacdn_no_subscribe");
         cfg.inject_shreds = !matches.is_present("solanacdn_no_inject");
+        cfg.repair_shreds = !matches.is_present("solanacdn_no_repair");
+        if !cfg.repair_shreds {
+            warn!("solanacdn: repair shreds disabled; this can stall catch-up if SolanaCDN misses shreds");
+        }
         cfg.tvu_shred_ingest_mode = if matches.is_present("solanacdn_only") {
             solana_core::solanacdn::TvuShredIngestMode::SolanaCdnOnly
         } else if matches.is_present("solanacdn_hybrid") {

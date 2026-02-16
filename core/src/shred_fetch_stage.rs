@@ -162,16 +162,25 @@ impl ShredFetchStage {
                 )
             };
             let turbine_disabled = turbine_disabled.load(Ordering::Relaxed);
-            let solanacdn = (!flags.contains(PacketFlags::REPAIR))
-                .then(crate::solanacdn::global)
-                .flatten();
-            let solanacdn_publish = solanacdn.as_ref().filter(|h| h.publish_shreds_enabled());
-            for mut packet in packet_batch.iter_mut() {
-                let discard_by_solanacdn_only = solanacdn
+            let solanacdn = crate::solanacdn::global();
+            let repair_disabled = flags.contains(PacketFlags::REPAIR)
+                && solanacdn
                     .as_ref()
-                    .is_some_and(|h| !h.should_ingest_tvu_shred(packet.meta().addr));
+                    .is_some_and(|h| !h.repair_shreds_enabled());
+            let solanacdn_publish = if flags.contains(PacketFlags::REPAIR) {
+                None
+            } else {
+                solanacdn.as_ref().filter(|h| h.publish_shreds_enabled())
+            };
+            for mut packet in packet_batch.iter_mut() {
+                let discard_by_solanacdn_only = !flags.contains(PacketFlags::REPAIR)
+                    && solanacdn
+                        .as_ref()
+                        .is_some_and(|h| !h.should_ingest_tvu_shred(packet.meta().addr));
                 let mut discarded = packet.meta().discard();
-                if !discarded
+                if !discarded && repair_disabled {
+                    discarded = true;
+                } else if !discarded
                     && (turbine_disabled
                         || should_discard_shred(
                             packet.as_ref(),
@@ -539,5 +548,123 @@ fn check_feature_activation(
             let shred_epoch = epoch_schedule.get_epoch(shred_slot);
             feature_epoch < shred_epoch
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            repair::serve_repair::ShredRepairType,
+            solanacdn::{new_handle_for_tests, set_global_for_tests, SolanaCdnConfig},
+        },
+        solana_ledger::{
+            genesis_utils::{create_genesis_config, GenesisConfigInfo},
+            shred::Shredder,
+        },
+        solana_gossip::contact_info::ContactInfo,
+        solana_perf::packet::PinnedPacketBatch,
+        solana_runtime::bank::Bank,
+        solana_signer::Signer,
+        solana_streamer::socket::SocketAddrSpace,
+        solana_time_utils::timestamp,
+        std::net::{IpAddr, Ipv4Addr, SocketAddr},
+    };
+
+    struct GlobalGuard;
+    impl Drop for GlobalGuard {
+        fn drop(&mut self) {
+            set_global_for_tests(None);
+        }
+    }
+
+    fn run_repair_flag_case(repair_shreds: bool) -> Option<bool> {
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.repair_shreds = repair_shreds;
+        let handle = new_handle_for_tests(cfg);
+        set_global_for_tests(Some(handle));
+        let _guard = GlobalGuard;
+
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+
+        let keypair = Arc::new(Keypair::new());
+        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
+        let cluster_info =
+            Arc::new(ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified));
+        let repair_socket = match UdpSocket::bind("127.0.0.1:0") {
+            Ok(sock) => Arc::new(sock),
+            Err(err) => {
+                eprintln!("skipping test (udp bind failed): {err}");
+                return None;
+            }
+        };
+        let outstanding = Arc::new(RwLock::new(OutstandingShredRepairs::default()));
+        let repair_context = RepairContext {
+            repair_socket,
+            cluster_info,
+            outstanding_repair_requests: outstanding.clone(),
+        };
+
+        let slot = 5;
+        let shred_keypair = Keypair::new();
+        let shred = Shredder::single_shred_for_tests(slot, &shred_keypair);
+        let repair_type = ShredRepairType::Shred(slot, shred.index() as u64);
+        let nonce = outstanding
+            .write()
+            .unwrap()
+            .add_request(repair_type, timestamp());
+
+        let mut packet = shred.payload().to_packet(Some(nonce));
+        packet.meta_mut().flags |= PacketFlags::REPAIR;
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234);
+        packet.meta_mut().set_socket_addr(&addr);
+        let batch = PacketBatch::from(PinnedPacketBatch::new(vec![packet]));
+
+        let (input_tx, input_rx) = unbounded();
+        let (sendr, output_rx) = EvictingSender::new_bounded(1);
+        let turbine_disabled = Arc::new(AtomicBool::new(false));
+
+        let handle_thread = std::thread::spawn(move || {
+            ShredFetchStage::modify_packets(
+                input_rx,
+                None,
+                sendr,
+                &sharable_banks,
+                42,
+                "test_repair",
+                PacketFlags::REPAIR,
+                Some(&repair_context),
+                turbine_disabled,
+            );
+        });
+
+        input_tx.send(batch).unwrap();
+        drop(input_tx);
+
+        let out_batch = output_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let discard = out_batch
+            .iter()
+            .next()
+            .expect("packet")
+            .meta()
+            .discard();
+
+        handle_thread.join().unwrap();
+        Some(discard)
+    }
+
+    #[test]
+    fn solanacdn_no_repair_drops_repair_packets() {
+        let allow = run_repair_flag_case(true);
+        let deny = run_repair_flag_case(false);
+        if allow.is_none() || deny.is_none() {
+            return;
+        }
+        assert!(!allow.unwrap());
+        assert!(deny.unwrap());
     }
 }
