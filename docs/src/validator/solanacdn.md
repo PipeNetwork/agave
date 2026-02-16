@@ -117,7 +117,8 @@ For a repeatable local-cluster `--fair` smoke test, use the lightweight POP stub
    The script asserts metric thresholds by default. Override via env:
    `WAIT_FOR_METRICS_SECS`, `EXPECT_FAIR_RECEIVED_MIN`, `EXPECT_FAIR_INJECTED_MIN`,
    `EXPECT_FAIR_COMMITS_RX_MIN`, `EXPECT_FAIR_LEDGER_COMMITS_SEEN_MIN`,
-   `EXPECT_FAIR_LEDGER_AUDIT_CHECKED_MIN`.
+   `EXPECT_FAIR_LEDGER_AUDIT_CHECKED_MIN`, `STRICT_SLASHING_METRICS` (set to `1` to require
+   ledger commit/audit counters > 0 when slashing is enabled).
 
 2. In a second terminal, run the stub (sends one fair batch by default):
 
