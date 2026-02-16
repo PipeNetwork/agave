@@ -108,6 +108,12 @@ For a repeatable local-cluster `--fair` smoke test, use the lightweight POP stub
      scripts/run.sh
    ```
 
+   Or run the helper script (starts validator + stub and checks metrics):
+
+   ```bash
+   scripts/solanacdn-fair-smoke.sh
+   ```
+
 2. In a second terminal, run the stub (sends one fair batch by default):
 
    ```bash
