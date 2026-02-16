@@ -14,6 +14,12 @@
 #   FAIR_SLASHING_ENFORCE=0
 #   TARGET_SLOT=         # if empty and slashing enabled, auto-fetch current slot
 #   ECHO_COMMITS=        # unset = auto (enabled for slashing)
+#   WAIT_FOR_METRICS_SECS=15
+#   EXPECT_FAIR_RECEIVED_MIN=1
+#   EXPECT_FAIR_INJECTED_MIN=1
+#   EXPECT_FAIR_COMMITS_RX_MIN=1
+#   EXPECT_FAIR_LEDGER_COMMITS_SEEN_MIN=0
+#   EXPECT_FAIR_LEDGER_AUDIT_CHECKED_MIN=0
 #
 set -euo pipefail
 
@@ -30,6 +36,23 @@ EXIT_AFTER_MS="${EXIT_AFTER_MS:-1000}"
 FAIR_SLASHING="${FAIR_SLASHING:-0}"
 FAIR_SLASHING_ENFORCE="${FAIR_SLASHING_ENFORCE:-0}"
 TARGET_SLOT="${TARGET_SLOT:-}"
+WAIT_FOR_METRICS_SECS="${WAIT_FOR_METRICS_SECS:-15}"
+
+if [[ -z "${EXPECT_FAIR_RECEIVED_MIN+x}" ]]; then
+  EXPECT_FAIR_RECEIVED_MIN=1
+fi
+if [[ -z "${EXPECT_FAIR_INJECTED_MIN+x}" ]]; then
+  EXPECT_FAIR_INJECTED_MIN=1
+fi
+if [[ -z "${EXPECT_FAIR_COMMITS_RX_MIN+x}" ]]; then
+  if [[ "${FAIR_SLASHING}" -eq 1 || "${FAIR_SLASHING_ENFORCE}" -eq 1 ]]; then
+    EXPECT_FAIR_COMMITS_RX_MIN=1
+  else
+    EXPECT_FAIR_COMMITS_RX_MIN=0
+  fi
+fi
+EXPECT_FAIR_LEDGER_COMMITS_SEEN_MIN="${EXPECT_FAIR_LEDGER_COMMITS_SEEN_MIN:-0}"
+EXPECT_FAIR_LEDGER_AUDIT_CHECKED_MIN="${EXPECT_FAIR_LEDGER_AUDIT_CHECKED_MIN:-0}"
 
 if [[ -z "${ECHO_COMMITS+x}" ]]; then
   if [[ "${FAIR_SLASHING}" -eq 1 || "${FAIR_SLASHING_ENFORCE}" -eq 1 ]]; then
@@ -110,8 +133,64 @@ cargo run -p solana-core --bin solanacdn-pop-stub -- "${stub_args[@]}"
 
 metrics_url="http://${METRICS_ADDR}/metrics"
 echo "Checking metrics at ${metrics_url}..."
-curl -s "${metrics_url}" | grep -E 'solanacdn_tx_fair_batch_(received|injected)_total' || true
 
-if [[ "${FAIR_SLASHING}" -eq 1 || "${FAIR_SLASHING_ENFORCE}" -eq 1 ]]; then
-  curl -s "${metrics_url}" | grep -E 'solanacdn_fair_(commits_rx_total|ledger_commits_seen_total|ledger_audit_checked_total)' || true
-fi
+metric_value_from() {
+  local metrics="$1"
+  local name="$2"
+  local value
+  value="$(awk -v n="${name}" '$1==n {print $2; exit}' <<<"${metrics}")"
+  if [[ -z "${value}" ]]; then
+    echo 0
+  else
+    echo "${value}"
+  fi
+}
+
+assert_min() {
+  local name="$1"
+  local value="$2"
+  local min="$3"
+  if (( value < min )); then
+    echo "FAIL: ${name}=${value} < ${min}"
+    return 1
+  fi
+  return 0
+}
+
+deadline=$((SECONDS + WAIT_FOR_METRICS_SECS))
+while true; do
+  metrics="$(curl -s "${metrics_url}" || true)"
+  fair_received="$(metric_value_from "${metrics}" "solanacdn_tx_fair_batch_received_total")"
+  fair_injected="$(metric_value_from "${metrics}" "solanacdn_tx_fair_batch_injected_total")"
+  fair_commits_rx="$(metric_value_from "${metrics}" "solanacdn_fair_commits_rx_total")"
+  fair_commits_seen="$(metric_value_from "${metrics}" "solanacdn_fair_ledger_commits_seen_total")"
+  fair_audit_checked="$(metric_value_from "${metrics}" "solanacdn_fair_ledger_audit_checked_total")"
+
+  ok=1
+  assert_min "solanacdn_tx_fair_batch_received_total" "${fair_received}" "${EXPECT_FAIR_RECEIVED_MIN}" || ok=0
+  assert_min "solanacdn_tx_fair_batch_injected_total" "${fair_injected}" "${EXPECT_FAIR_INJECTED_MIN}" || ok=0
+
+  if [[ "${FAIR_SLASHING}" -eq 1 || "${FAIR_SLASHING_ENFORCE}" -eq 1 ]]; then
+    assert_min "solanacdn_fair_commits_rx_total" "${fair_commits_rx}" "${EXPECT_FAIR_COMMITS_RX_MIN}" || ok=0
+    assert_min "solanacdn_fair_ledger_commits_seen_total" "${fair_commits_seen}" "${EXPECT_FAIR_LEDGER_COMMITS_SEEN_MIN}" || ok=0
+    assert_min "solanacdn_fair_ledger_audit_checked_total" "${fair_audit_checked}" "${EXPECT_FAIR_LEDGER_AUDIT_CHECKED_MIN}" || ok=0
+  fi
+
+  if [[ "${ok}" -eq 1 ]]; then
+    echo "Metrics thresholds satisfied."
+    break
+  fi
+
+  if (( SECONDS >= deadline )); then
+    echo "Metrics thresholds not met before timeout (${WAIT_FOR_METRICS_SECS}s)."
+    echo "Last values:"
+    echo "  solanacdn_tx_fair_batch_received_total=${fair_received}"
+    echo "  solanacdn_tx_fair_batch_injected_total=${fair_injected}"
+    echo "  solanacdn_fair_commits_rx_total=${fair_commits_rx}"
+    echo "  solanacdn_fair_ledger_commits_seen_total=${fair_commits_seen}"
+    echo "  solanacdn_fair_ledger_audit_checked_total=${fair_audit_checked}"
+    exit 1
+  fi
+
+  sleep 1
+done
