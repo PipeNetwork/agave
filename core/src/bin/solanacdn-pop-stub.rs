@@ -59,23 +59,31 @@ async fn main() -> Result<()> {
     let server_config = make_server_config()?;
     let endpoint = Endpoint::server(server_config, cfg.listen)?;
 
+    if cfg.exit_after_ms > 0 {
+        let endpoint = endpoint.clone();
+        let exit_after_ms = cfg.exit_after_ms;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(exit_after_ms)).await;
+            endpoint.close(0u32.into(), b"done");
+        });
+    }
+
     loop {
         let incoming = endpoint.accept().await;
         let Some(connecting) = incoming else {
-            continue;
-        };
-        match connecting.await {
-            Ok(conn) => {
-                if let Err(err) = handle_connection(conn, cfg.clone()).await {
-                    eprintln!("solanacdn-pop-stub: connection error: {err:#}");
-                }
-            }
-            Err(err) => eprintln!("solanacdn-pop-stub: failed to accept connection: {err}"),
-        }
-
-        if cfg.exit_after_ms > 0 {
             break;
-        }
+        };
+        let cfg = cfg.clone();
+        tokio::spawn(async move {
+            match connecting.await {
+                Ok(conn) => {
+                    if let Err(err) = handle_connection(conn, cfg).await {
+                        eprintln!("solanacdn-pop-stub: connection error: {err:#}");
+                    }
+                }
+                Err(err) => eprintln!("solanacdn-pop-stub: failed to accept connection: {err}"),
+            }
+        });
     }
 
     Ok(())

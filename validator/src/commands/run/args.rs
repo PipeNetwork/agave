@@ -1532,6 +1532,12 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("Skip Pipe API TLS certificate verification (dev only)"),
     )
     .arg(
+        Arg::with_name("solanacdn_api_tls_bootstrap")
+            .long("solanacdn-api-tls-bootstrap")
+            .takes_value(false)
+            .help("Allow POP TLS CA bootstrap via the Pipe API (opt-in)"),
+    )
+    .arg(
         Arg::with_name("solanacdn_udp")
             .long("solanacdn-udp")
             .value_name("MODE")
@@ -1637,6 +1643,22 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("solanacdn-no-vote-tunnel")
             .takes_value(false)
             .help("Disable vote tunneling via SolanaCDN POP mesh (UDP votes only)"),
+    )
+    .arg(
+        Arg::with_name("solanacdn_vote_dedup_ttl_ms")
+            .long("solanacdn-vote-dedup-ttl-ms")
+            .value_name("MILLISECONDS")
+            .takes_value(true)
+            .validator(is_parsable::<u64>)
+            .help("Deduplicate POP vote-tunnel datagrams for this TTL (ms); 0 disables (default: 2000)"),
+    )
+    .arg(
+        Arg::with_name("solanacdn_vote_dedup_max_entries")
+            .long("solanacdn-vote-dedup-max-entries")
+            .value_name("COUNT")
+            .takes_value(true)
+            .validator(is_parsable::<usize>)
+            .help("Max in-memory entries for vote-tunnel dedup; 0 disables (default: 200000)"),
     )
     .args(&pub_sub_config::args(/*test_validator:*/ false))
     .args(&json_rpc_config::args())

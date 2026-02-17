@@ -612,6 +612,7 @@ pub fn execute(
             .map(PathBuf::from);
         cfg.pipe_api_tls_insecure_skip_verify =
             matches.is_present("solanacdn_api_tls_insecure_skip_verify");
+        cfg.pipe_api_tls_bootstrap = matches.is_present("solanacdn_api_tls_bootstrap");
 
         cfg.udp_mode = match matches.value_of("solanacdn_udp").unwrap_or("auto") {
             "off" => solana_core::solanacdn::DataPlaneMode::Off,
@@ -641,6 +642,12 @@ pub fn execute(
         }
         cfg.direct_shreds_from_pop = !matches.is_present("solanacdn_no_direct_shreds");
         cfg.vote_tunnel = !matches.is_present("solanacdn_no_vote_tunnel");
+        if let Ok(v) = value_t!(matches, "solanacdn_vote_dedup_ttl_ms", u64) {
+            cfg.vote_dedup_ttl_ms = if v == 0 { 0 } else { v.min(60_000) };
+        }
+        if let Ok(v) = value_t!(matches, "solanacdn_vote_dedup_max_entries", usize) {
+            cfg.vote_dedup_max_entries = if v == 0 { 0 } else { v.min(2_000_000) };
+        }
         let fair_slashing_enforce = matches.is_present("fair_slashing_enforce");
         let fair_slashing = matches.is_present("fair_slashing") || fair_slashing_enforce;
         cfg.tx_fair_slashing = fair_slashing;

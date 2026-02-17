@@ -7,8 +7,8 @@ pagination_label: SolanaCDN (Integrated)
 
 This fork includes an **integrated SolanaCDN client** in the validator (no `solanacdn-agent` sidecar).
 
-This feature is experimental/pre-release. For production today, the recommended path remains the
-`solanacdn-agent` sidecar (so you can upgrade/rollback independently of validator binaries).
+This is the recommended production path. The `solanacdn-agent` sidecar is deprecated and kept only
+for legacy deployments.
 
 ## What it does
 
@@ -17,7 +17,8 @@ When enabled, the validator:
 - publishes inbound TVU shreds to a SolanaCDN POP (QUIC; optional UDP data plane)
 - subscribes to POP shreds and injects them into local TVU/gossip
 - optionally requests POP direct injection of raw shred UDP payloads to validator ports (lowest latency)
-- tunnels UDP vote packets via the POP mesh (best-effort)
+- tunnels UDP vote packets via the POP mesh (best-effort) and injects POP vote-tunnel responses into
+  the validator vote socket when enabled
 - posts per-run counters to the Pipe API ingest endpoint (so the Pipe console can show agent-style metrics)
 - optionally enables fair transaction ordering for transactions submitted via SolanaCDN
 - optionally audits/enforces fair ordering using leader-signed commits and ledger audit
@@ -51,6 +52,14 @@ Dev-only escape hatch:
 - By default, the validator verifies POP TLS certificates using the system/WebPKI trust roots.
 - If you provide `--solanacdn-tls-ca-cert-path`, only that CA bundle is trusted for POP verification.
 - If `/etc/solanacdn/tls/ca.crt` exists, it is used automatically as the POP/control CA bundle.
+- In the open-source build, POP TLS CA bootstrap via the Pipe API is opt-in only.
+  Enable with `--solanacdn-api-tls-bootstrap`.
+
+## Vote tunnel dedup tuning
+
+- Vote-tunnel responses are deduplicated by default (TTL 2000ms, 200000 entries).
+- Tune with `--solanacdn-vote-dedup-ttl-ms <MILLISECONDS>` (set `0` to disable).
+- Tune with `--solanacdn-vote-dedup-max-entries <COUNT>` (set `0` to disable).
 
 ## Fair transaction ordering (experimental)
 
@@ -95,6 +104,7 @@ To restore the startup configuration:
 - Race metrics (SolanaCDN vs gossip): enabled by default; disable with `--solanacdn-race=false`. Tune via `--solanacdn-race-sample-bits` and `--solanacdn-race-window-ms` (compatible with `--solanacdn-only` / `--solanacdn-hybrid`; does not change shred ingest mode).
 - Fair Prometheus counters include fair-batch tx receive/inject totals (`solanacdn_tx_fair_batch_received_total`, `solanacdn_tx_fair_batch_injected_total`) and fair-priority lookups/hits (`solanacdn_fair_priority_lookups_total`, `solanacdn_fair_priority_hits_total`).
 - Transaction hygiene counters include dedup drops (`solanacdn_tx_deduped_packets_total`) and relay drops in fair mode (`solanacdn_tx_relay_dropped_fair_mode_total`).
+- Vote-tunnel counters include `solanacdn_rx_vote_packets_total` and `solanacdn_dropped_vote_datagrams_total`.
 - Fair/slashing Prometheus counters include commits, audit failures, and vote withholding (`solanacdn_fair_votes_withheld_total`).
 
 ## Local POP stub (fair smoke test)
