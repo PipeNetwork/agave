@@ -77,6 +77,12 @@ Audit-only mode (records evidence/counters, does not change voting):
 
 - `--fair-slashing`
 
+Strict audit rules (implies `--fair-slashing`; treats missing committed transactions/commit chunks
+as violations and requires the committed fair list to appear as a prefix, allowing only vote
+transactions and commit-memo transactions ahead of it):
+
+- `--fair-slashing-strict`
+
 Enforcement mode (implies `--fair-slashing`; withholds votes when a fair ordering violation is observed):
 
 - `--fair-slashing-enforce`

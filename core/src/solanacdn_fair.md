@@ -58,6 +58,18 @@ lower committed `order_ix`.
 Missing tails are tolerated (e.g. if a committed transaction never landed), as long as no overtake
 is observed.
 
+### Strict mode (`--fair-slashing-strict`)
+
+When strict mode is enabled, the leader’s ledger commit becomes a stronger contract:
+
+- **No insertion ahead of the fair prefix:** except for vote transactions and the fair-commit memo
+  transactions themselves, the committed fair transaction list must appear as a prefix in the
+  target slot. Inserting other non-vote transactions “in front” of the committed fair list is a
+  violation.
+- **No committed drops:** every committed fair transaction signature must land in the target slot
+  (missing tail is a violation).
+- **Missing commit chunks are violations:** partial/fragmented ledger commits do not pass audit.
+
 ## Optional: enforcement (`--fair-slashing-enforce`)
 
 When `--fair-slashing-enforce` is enabled, fair-ordering violations (ledger audit failure or commit

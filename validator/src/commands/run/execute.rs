@@ -649,8 +649,11 @@ pub fn execute(
             cfg.vote_dedup_max_entries = if v == 0 { 0 } else { v.min(2_000_000) };
         }
         let fair_slashing_enforce = matches.is_present("fair_slashing_enforce");
-        let fair_slashing = matches.is_present("fair_slashing") || fair_slashing_enforce;
+        let fair_slashing_strict = matches.is_present("fair_slashing_strict");
+        let fair_slashing =
+            matches.is_present("fair_slashing") || fair_slashing_enforce || fair_slashing_strict;
         cfg.tx_fair_slashing = fair_slashing;
+        cfg.tx_fair_slashing_strict = fair_slashing_strict;
         cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
         cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
@@ -673,6 +676,18 @@ pub fn execute(
 
         cfg
     });
+
+    let tx_io_check: Option<String> = if matches.is_present("tx_io_check") {
+        Some(
+            matches
+                .value_of("tx_io_check")
+                .unwrap_or("/var/tmp/tx_io.log")
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    info!("tx_io_check set to {:?}", tx_io_check);
 
     let mut validator_config = ValidatorConfig {
         require_tower: matches.is_present("require_tower"),
@@ -784,11 +799,13 @@ pub fn execute(
             ),
             fair_ordering: matches.is_present("fair")
                 || matches.is_present("fair_slashing")
+                || matches.is_present("fair_slashing_strict")
                 || matches.is_present("fair_slashing_enforce"),
             ..SchedulerConfig::default()
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
         banking_trace_dir_byte_limit: parse_banking_trace_dir_byte_limit(matches),
+        tx_io_check,
         validator_exit: Arc::new(RwLock::new(Exit::default())),
         validator_exit_backpressure: [(
             SnapshotPackagerService::NAME.to_string(),

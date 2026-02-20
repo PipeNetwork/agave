@@ -519,6 +519,10 @@ pub struct SolanaCdnConfig {
     /// If enabled, subscribe to leader-signed fair ordering commits and audit the ledger for fair
     /// ordering violations (records evidence/counters only).
     pub tx_fair_slashing: bool,
+    /// If enabled (in addition to `tx_fair_slashing`), treat missing ledger commit chunks, missing
+    /// committed fair transactions, and non-exempt transaction insertion ahead of the committed
+    /// fair prefix as fair-ordering violations.
+    pub tx_fair_slashing_strict: bool,
     /// If enabled (in addition to `tx_fair_slashing`), enforce fair ordering non-equivocation via
     /// vote withholding when a fair ordering violation is observed (ledger audit failure or
     /// commit equivocation).
@@ -564,6 +568,7 @@ impl SolanaCdnConfig {
             vote_dedup_max_entries: DEFAULT_VOTE_DEDUP_MAX_ENTRIES,
             tx_fair_ordering: false,
             tx_fair_slashing: false,
+            tx_fair_slashing_strict: false,
             tx_fair_slashing_enforce: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
@@ -607,6 +612,7 @@ impl Default for SolanaCdnConfig {
             vote_dedup_max_entries: DEFAULT_VOTE_DEDUP_MAX_ENTRIES,
             tx_fair_ordering: false,
             tx_fair_slashing: false,
+            tx_fair_slashing_strict: false,
             tx_fair_slashing_enforce: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
@@ -1111,6 +1117,7 @@ pub struct SolanaCdnStatus {
     pub publisher_switches_total: u64,
     pub tx_fair_ordering: bool,
     pub tx_fair_slashing: bool,
+    pub tx_fair_slashing_strict: bool,
     pub tx_fair_slashing_enforce: bool,
     pub tx_fair_slashing_enforce_configured: bool,
     pub tx_fair_slashing_enforce_override: Option<bool>,
@@ -1582,10 +1589,18 @@ impl SolanaCdnHandle {
             return true;
         }
 
+        #[derive(Clone, Copy, Debug)]
+        struct SlotTx {
+            sig0: [u8; 64],
+            is_exempt: bool,
+        }
+
         let expected_leader = PubkeyBytes(leader.to_bytes());
         let memo_program_id = FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID;
+        let vote_program_id = solana_vote_program::id();
+        let strict = self.cfg.tx_fair_slashing_strict;
 
-        let mut slot_tx_sigs: Vec<[u8; 64]> = Vec::new();
+        let mut slot_txs: Vec<SlotTx> = Vec::new();
         let mut batch_order_start: HashMap<u128, u64> = HashMap::new();
         let mut batch_chunk_total: HashMap<u128, u16> = HashMap::new();
         let mut chunk_sigs: HashMap<(u128, u16), Vec<[u8; 64]>> = HashMap::new();
@@ -1593,13 +1608,13 @@ impl SolanaCdnHandle {
 
         for entry in entries {
             for tx in entry.transactions.iter() {
-                if let Some(sig0) = tx
+                let Some(sig0) = tx
                     .signatures
                     .get(0)
                     .and_then(|s| s.as_ref().try_into().ok())
-                {
-                    slot_tx_sigs.push(sig0);
-                }
+                else {
+                    continue;
+                };
 
                 let (account_keys, instructions) = match &tx.message {
                     VersionedMessage::Legacy(msg) => {
@@ -1610,10 +1625,16 @@ impl SolanaCdnHandle {
                     }
                 };
 
+                let mut is_vote = false;
+                let mut is_fair_commit_memo_tx = false;
+
                 for ix in instructions {
                     let Some(program_id) = account_keys.get(ix.program_id_index as usize) else {
                         continue;
                     };
+                    if program_id == &vote_program_id {
+                        is_vote = true;
+                    }
                     if program_id != &memo_program_id {
                         continue;
                     }
@@ -1642,6 +1663,7 @@ impl SolanaCdnHandle {
                     if chunk.payload.leader_pubkey != expected_leader {
                         continue;
                     }
+                    is_fair_commit_memo_tx = true;
 
                     let batch_id = chunk.payload.batch_id;
                     if let Some(prev_order_start) =
@@ -1690,6 +1712,11 @@ impl SolanaCdnHandle {
                         chunk_sigs.insert(key, sigs);
                     }
                 }
+
+                slot_txs.push(SlotTx {
+                    sig0,
+                    is_exempt: is_vote || is_fair_commit_memo_tx,
+                });
             }
         }
 
@@ -1721,9 +1748,14 @@ impl SolanaCdnHandle {
             }
         }
         if incomplete {
-            self.fair_ledger_audit_inconclusive
-                .fetch_add(1, Ordering::Relaxed);
-            return true;
+            if strict {
+                self.mark_fair_slashed(expected_leader, slot, 0, now_ms());
+                return false;
+            } else {
+                self.fair_ledger_audit_inconclusive
+                    .fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
         }
 
         if expected.is_empty() {
@@ -1735,8 +1767,46 @@ impl SolanaCdnHandle {
             expected_pos.entry(*sig).or_insert(idx);
         }
 
+        if strict {
+            let mut cursor: usize = 0;
+            for tx in slot_txs {
+                if tx.is_exempt {
+                    continue;
+                }
+                if cursor >= expected.len() {
+                    break;
+                }
+
+                let sig = tx.sig0;
+                if sig == expected[cursor] {
+                    cursor = cursor.saturating_add(1);
+                    continue;
+                }
+
+                if let Some(&pos) = expected_pos.get(&sig) {
+                    if pos > cursor {
+                        self.mark_fair_slashed(expected_leader, slot, cursor as u64, now_ms());
+                        return false;
+                    }
+                    continue;
+                }
+
+                // Non-exempt transaction inserted ahead of the committed fair prefix.
+                self.mark_fair_slashed(expected_leader, slot, cursor as u64, now_ms());
+                return false;
+            }
+
+            // Strict mode requires that the entire committed fair list lands in the target slot.
+            if cursor < expected.len() {
+                self.mark_fair_slashed(expected_leader, slot, cursor as u64, now_ms());
+                return false;
+            }
+            return true;
+        }
+
         let mut cursor: usize = 0;
-        for sig in slot_tx_sigs {
+        for tx in slot_txs {
+            let sig = tx.sig0;
             let Some(&pos) = expected_pos.get(&sig) else {
                 continue;
             };
@@ -2055,6 +2125,7 @@ impl SolanaCdnHandle {
         let publisher_switches_total = self.publisher_switches_total.load(Ordering::Relaxed);
         let tx_fair_ordering = self.cfg.tx_fair_ordering;
         let tx_fair_slashing = self.cfg.tx_fair_slashing;
+        let tx_fair_slashing_strict = self.cfg.tx_fair_slashing_strict;
         let tx_fair_slashing_enforce = self.tx_fair_slashing_enforce_enabled();
         let tx_fair_slashing_enforce_configured = self.cfg.tx_fair_slashing_enforce;
         let tx_fair_slashing_enforce_override = self.tx_fair_slashing_enforce_override();
@@ -2183,6 +2254,7 @@ impl SolanaCdnHandle {
             publisher_switches_total,
             tx_fair_ordering,
             tx_fair_slashing,
+            tx_fair_slashing_strict,
             tx_fair_slashing_enforce,
             tx_fair_slashing_enforce_configured,
             tx_fair_slashing_enforce_override,
@@ -4089,6 +4161,13 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str(&format!(
         "solanacdn_tx_fair_slashing_enabled {}\n",
         if status.tx_fair_slashing { 1 } else { 0 }
+    ));
+
+    out.push_str("# HELP solanacdn_tx_fair_slashing_strict_enabled Whether strict fair slashing rules are enabled (0/1)\n");
+    out.push_str("# TYPE solanacdn_tx_fair_slashing_strict_enabled gauge\n");
+    out.push_str(&format!(
+        "solanacdn_tx_fair_slashing_strict_enabled {}\n",
+        if status.tx_fair_slashing_strict { 1 } else { 0 }
     ));
 
     out.push_str("# HELP solanacdn_tx_fair_slashing_enforce_enabled Whether fair slashing vote withholding is enabled (0/1)\n");
@@ -6672,6 +6751,134 @@ mod tests {
     }
 
     #[test]
+    fn fair_ledger_audit_strict_missing_tail_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let slot = 42;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            &[sig_a, sig_b],
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into(), tx_a.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_strict = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
+    fn fair_ledger_audit_strict_rejects_insertion_ahead_of_fair_prefix() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let slot = 42;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let inserted_signer = Keypair::new();
+        let inserted = Transaction::new(
+            &[&inserted_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(99)],
+                Some(&inserted_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            &[sig_a, sig_b],
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into(), tx_a.into(), inserted.into(), tx_b.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_strict = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
     fn fair_ledger_audit_missing_chunks_are_inconclusive() {
         let leader_identity = Arc::new(Keypair::new());
         let leader = leader_identity.pubkey();
@@ -6712,6 +6919,50 @@ mod tests {
         let status = handle.status_snapshot();
         assert_eq!(status.fair_slashed_leaders_len, 0);
         assert_eq!(status.fair_ledger_audit_inconclusive_total, 1);
+    }
+
+    #[test]
+    fn fair_ledger_audit_strict_missing_chunks_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let slot = 42;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+
+        let sigs: Vec<[u8; 64]> = (0..(FAIR_LEDGER_COMMIT_MAX_SIGS_PER_CHUNK + 1))
+            .map(|i| [i as u8; 64])
+            .collect();
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs.as_slice(),
+        );
+        assert!(commit_txs.len() >= 2);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_strict = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        let status = handle.status_snapshot();
+        assert_eq!(status.fair_slashed_leaders_len, 1);
+        assert_eq!(status.fair_ledger_audit_inconclusive_total, 0);
     }
 
     #[test]
@@ -7123,6 +7374,7 @@ mod tests {
         assert!(text.contains("solanacdn_fair_priority_lookups_total "));
         assert!(text.contains("solanacdn_fair_priority_hits_total "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enabled "));
+        assert!(text.contains("solanacdn_tx_fair_slashing_strict_enabled "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enforce_enabled "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enforce_configured "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enforce_override{state=\"inherit\"} 1"));
