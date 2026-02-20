@@ -166,6 +166,7 @@ impl FromClapArgMatches for RunArgs {
             || matches.is_present("fair")
             || matches.is_present("fair_slashing")
             || matches.is_present("fair_slashing_strict")
+            || matches.is_present("fair_slashing_witness")
             || matches.is_present("fair_slashing_enforce"))
             && !has_solanacdn_discovery
         {
@@ -1427,6 +1428,16 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("fair_slashing_witness")
+            .long("fair-slashing-witness")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Subscribe to POP-signed fair batch witnesses so auditors can \
+                 punish “leader received a fair batch but never committed it”. This requires a \
+                 POP witness stream (protocol v6+) and implies --fair-slashing.",
+            ),
+    )
+    .arg(
         Arg::with_name("fair_slashing_enforce")
             .long("fair-slashing-enforce")
             .takes_value(false)
@@ -1913,6 +1924,29 @@ mod tests {
                 "--solanacdn-api-token",
                 "pk_test_dummy",
                 "--fair-slashing-strict",
+            ],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn fair_slashing_witness_requires_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_parse_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--fair-slashing-witness"],
+        );
+    }
+
+    #[test]
+    fn fair_slashing_witness_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-slashing-witness",
             ],
             default_run_args,
         );

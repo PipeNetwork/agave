@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
-use dashmap::{DashMap, DashSet};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use ed25519_dalek_v2::{Signer as DalekSigner, SigningKey, VerifyingKey};
 use quinn::Endpoint;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -83,6 +83,9 @@ const FAIR_SLASH_WITNESS_TTL_MS: u64 = 60_000;
 const FAIR_SLASH_WITNESS_MAX_ENTRIES: usize = 1_000_000;
 const FAIR_SLASHED_TTL_MS: u64 = 10 * 60_000;
 const FAIR_SLASHED_MAX_ENTRIES: usize = 20_000;
+const FAIR_BATCH_WITNESS_TTL_MS: u64 = 10 * 60_000;
+const FAIR_BATCH_WITNESS_MAX_SLOTS: usize = 50_000;
+const FAIR_BATCH_WITNESS_MAX_BATCHES_PER_SLOT: usize = 8_192;
 const POP_EGRESS_IP_TTL_MS: u64 = 10 * 60_000;
 const POP_EGRESS_IP_MAX_ENTRIES: usize = 50_000;
 
@@ -209,6 +212,26 @@ struct FairSlashedKey {
 #[derive(Clone, Copy, Debug)]
 struct FairSlashedEntry {
     expires_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FairWitnessBatch {
+    tx_count: u32,
+    tx_merkle_root: [u8; 32],
+    pop_time_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FairWitnessSlotState {
+    gen: u64,
+    expires_at_ms: u64,
+    batches: HashMap<u128, FairWitnessBatch>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FairLedgerAuditSlotEntry {
+    ok: bool,
+    witness_gen: u64,
 }
 
 static FAIR_PRIORITIES: OnceLock<DashMap<[u8; 64], FairPriorityEntry>> = OnceLock::new();
@@ -523,6 +546,9 @@ pub struct SolanaCdnConfig {
     /// committed fair transactions, and non-exempt transaction insertion ahead of the committed
     /// fair prefix as fair-ordering violations.
     pub tx_fair_slashing_strict: bool,
+    /// If enabled (in addition to `tx_fair_slashing`), subscribe to POP-signed fair batch
+    /// witnesses and treat “witnessed but not committed on-chain” as a fair-ordering violation.
+    pub tx_fair_slashing_witness: bool,
     /// If enabled (in addition to `tx_fair_slashing`), enforce fair ordering non-equivocation via
     /// vote withholding when a fair ordering violation is observed (ledger audit failure or
     /// commit equivocation).
@@ -569,6 +595,7 @@ impl SolanaCdnConfig {
             tx_fair_ordering: false,
             tx_fair_slashing: false,
             tx_fair_slashing_strict: false,
+            tx_fair_slashing_witness: false,
             tx_fair_slashing_enforce: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
@@ -613,6 +640,7 @@ impl Default for SolanaCdnConfig {
             tx_fair_ordering: false,
             tx_fair_slashing: false,
             tx_fair_slashing_strict: false,
+            tx_fair_slashing_witness: false,
             tx_fair_slashing_enforce: false,
             shreds_queue_len: 8192,
             votes_queue_len: 1024,
@@ -1118,6 +1146,7 @@ pub struct SolanaCdnStatus {
     pub tx_fair_ordering: bool,
     pub tx_fair_slashing: bool,
     pub tx_fair_slashing_strict: bool,
+    pub tx_fair_slashing_witness: bool,
     pub tx_fair_slashing_enforce: bool,
     pub tx_fair_slashing_enforce_configured: bool,
     pub tx_fair_slashing_enforce_override: Option<bool>,
@@ -1206,9 +1235,12 @@ pub struct SolanaCdnHandle {
     fair_ledger_audit_get_slot_entries_failed: AtomicU64,
     fair_ledger_commits_seen: AtomicU64,
     fair_ledger_commits_invalid: AtomicU64,
-    fair_ledger_audited_slots: DashMap<u64, bool>,
+    fair_ledger_audited_slots: DashMap<u64, FairLedgerAuditSlotEntry>,
     fair_order_witnesses: DashMap<FairOrderWitnessKey, FairOrderWitnessEntry>,
     fair_slashed_leaders: DashMap<FairSlashedKey, FairSlashedEntry>,
+    fair_batch_witness_rx: AtomicU64,
+    fair_batch_witness_invalid: AtomicU64,
+    fair_batch_witness_slots: DashMap<FairSlashedKey, FairWitnessSlotState>,
     dropped_shred_payloads: AtomicU64,
     dropped_vote_datagrams: AtomicU64,
     uplink_broadcast_lagged: AtomicU64,
@@ -1271,6 +1303,9 @@ impl SolanaCdnHandle {
             fair_ledger_audited_slots: DashMap::new(),
             fair_order_witnesses: DashMap::new(),
             fair_slashed_leaders: DashMap::new(),
+            fair_batch_witness_rx: AtomicU64::new(0),
+            fair_batch_witness_invalid: AtomicU64::new(0),
+            fair_batch_witness_slots: DashMap::new(),
             dropped_shred_payloads: AtomicU64::new(0),
             dropped_vote_datagrams: AtomicU64::new(0),
             uplink_broadcast_lagged: AtomicU64::new(0),
@@ -1540,6 +1575,85 @@ impl SolanaCdnHandle {
         }
     }
 
+    fn fair_batch_witness_gen(&self, key: &FairSlashedKey, now: u64) -> u64 {
+        let Some(entry) = self.fair_batch_witness_slots.get(key) else {
+            return 0;
+        };
+        if entry.expires_at_ms < now {
+            drop(entry);
+            self.fair_batch_witness_slots.remove(key);
+            return 0;
+        }
+        entry.gen
+    }
+
+    fn note_fair_batch_witness_for_slashing(&self, witness: &solanacdn_protocol::messages::FairBatchWitness) {
+        if !self.cfg.tx_fair_slashing || !self.cfg.tx_fair_slashing_witness {
+            return;
+        }
+        let Some(slot) = witness.payload.attestation.target_slot else {
+            return;
+        };
+
+        if self.fair_batch_witness_slots.len() > FAIR_BATCH_WITNESS_MAX_SLOTS {
+            self.fair_batch_witness_slots.clear();
+        }
+
+        let now = now_ms();
+        let key = FairSlashedKey {
+            leader: witness.payload.leader_pubkey,
+            slot,
+        };
+        let expires_at_ms = now.saturating_add(FAIR_BATCH_WITNESS_TTL_MS);
+
+        let batch_id = witness.payload.attestation.batch_id;
+        let batch = FairWitnessBatch {
+            tx_count: witness.payload.attestation.tx_count,
+            tx_merkle_root: witness.payload.attestation.tx_merkle_root,
+            pop_time_ms: witness.payload.pop_time_ms,
+        };
+
+        match self.fair_batch_witness_slots.entry(key) {
+            Entry::Occupied(mut occ) => {
+                let state = occ.get_mut();
+                if state.expires_at_ms < now {
+                    state.gen = 0;
+                    state.batches.clear();
+                }
+                state.expires_at_ms = expires_at_ms;
+
+                if state.batches.len() > FAIR_BATCH_WITNESS_MAX_BATCHES_PER_SLOT {
+                    state.batches.clear();
+                }
+
+                if let Some(existing) = state.batches.get(&batch_id) {
+                    if existing.tx_count == batch.tx_count
+                        && existing.tx_merkle_root == batch.tx_merkle_root
+                    {
+                        return;
+                    }
+                    // Conflicting POP witness for the same batch_id: keep the first one to avoid
+                    // accidental slashing due to inconsistent witness streams.
+                    self.fair_batch_witness_invalid
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+
+                state.gen = state.gen.wrapping_add(1);
+                state.batches.insert(batch_id, batch);
+            }
+            Entry::Vacant(vac) => {
+                let mut batches = HashMap::new();
+                batches.insert(batch_id, batch);
+                vac.insert(FairWitnessSlotState {
+                    gen: 1,
+                    expires_at_ms,
+                    batches,
+                });
+            }
+        }
+    }
+
     fn audit_fair_ledger_commits_for_slot(
         &self,
         blockstore: &Blockstore,
@@ -1550,8 +1664,30 @@ impl SolanaCdnHandle {
             return;
         }
 
-        if self.fair_ledger_audited_slots.contains_key(&slot) {
-            return;
+        let now = now_ms();
+        let witness_gen = if self.cfg.tx_fair_slashing_witness {
+            self.fair_batch_witness_gen(
+                &FairSlashedKey {
+                    leader: PubkeyBytes(leader.to_bytes()),
+                    slot,
+                },
+                now,
+            )
+        } else {
+            0
+        };
+
+        if let Some(entry) = self.fair_ledger_audited_slots.get(&slot) {
+            let ok = entry.ok;
+            let prev_witness_gen = entry.witness_gen;
+            drop(entry);
+
+            if !ok {
+                return;
+            }
+            if !self.cfg.tx_fair_slashing_witness || witness_gen <= prev_witness_gen {
+                return;
+            }
         }
 
         self.fair_ledger_audit_checked
@@ -1571,7 +1707,13 @@ impl SolanaCdnHandle {
         if self.fair_ledger_audited_slots.len() > 100_000 {
             self.fair_ledger_audited_slots.clear();
         }
-        self.fair_ledger_audited_slots.insert(slot, ok);
+        self.fair_ledger_audited_slots.insert(
+            slot,
+            FairLedgerAuditSlotEntry {
+                ok,
+                witness_gen,
+            },
+        );
 
         if !ok {
             self.fair_ledger_audit_failed
@@ -1595,10 +1737,30 @@ impl SolanaCdnHandle {
             is_exempt: bool,
         }
 
+        let now = now_ms();
         let expected_leader = PubkeyBytes(leader.to_bytes());
         let memo_program_id = FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID;
         let vote_program_id = solana_vote_program::id();
         let strict = self.cfg.tx_fair_slashing_strict;
+        let witness_batches: Option<HashMap<u128, FairWitnessBatch>> =
+            self.cfg.tx_fair_slashing_witness.then(|| {
+                let key = FairSlashedKey {
+                    leader: expected_leader,
+                    slot,
+                };
+                let Some(entry) = self.fair_batch_witness_slots.get(&key) else {
+                    return None;
+                };
+                if entry.expires_at_ms < now {
+                    drop(entry);
+                    self.fair_batch_witness_slots.remove(&key);
+                    return None;
+                }
+                if entry.batches.is_empty() {
+                    return None;
+                }
+                Some(entry.batches.clone())
+            }).flatten();
 
         let mut slot_txs: Vec<SlotTx> = Vec::new();
         let mut batch_order_start: HashMap<u128, u64> = HashMap::new();
@@ -1717,6 +1879,79 @@ impl SolanaCdnHandle {
                     sig0,
                     is_exempt: is_vote || is_fair_commit_memo_tx,
                 });
+            }
+        }
+
+        if let Some(witnessed) = witness_batches.as_ref().filter(|m| !m.is_empty()) {
+            // If we have POP witnesses for this leader+slot, the slot must contain matching
+            // on-chain fair commit metadata for each witnessed batch.
+            if batch_order_start.is_empty() {
+                let (batch_id, witness) = witnessed.iter().next().expect("non-empty");
+                debug!(
+                    "solanacdn: missing on-chain fair commits for witnessed slot; leader={} slot={} batch_id={} pop_time_ms={}",
+                    expected_leader.to_base58(),
+                    slot,
+                    batch_id,
+                    witness.pop_time_ms
+                );
+                self.mark_fair_slashed(expected_leader, slot, 0, now);
+                return false;
+            }
+
+            for (batch_id, witness) in witnessed.iter() {
+                let Some(&order_start) = batch_order_start.get(batch_id) else {
+                    debug!(
+                        "solanacdn: missing on-chain fair commit for witnessed batch; leader={} slot={} batch_id={} pop_time_ms={}",
+                        expected_leader.to_base58(),
+                        slot,
+                        batch_id,
+                        witness.pop_time_ms
+                    );
+                    self.mark_fair_slashed(expected_leader, slot, 0, now);
+                    return false;
+                };
+
+                let Some(&chunk_total) = batch_chunk_total.get(batch_id) else {
+                    self.mark_fair_slashed(expected_leader, slot, order_start, now);
+                    return false;
+                };
+
+                let mut sigs: Vec<[u8; 64]> = Vec::new();
+                for chunk_index in 0..chunk_total {
+                    let key = (*batch_id, chunk_index);
+                    let Some(chunk) = chunk_sigs.get(&key) else {
+                        debug!(
+                            "solanacdn: missing on-chain fair commit chunk for witnessed batch; leader={} slot={} batch_id={} order_start={} chunk_index={} chunk_total={}",
+                            expected_leader.to_base58(),
+                            slot,
+                            batch_id,
+                            order_start,
+                            chunk_index,
+                            chunk_total
+                        );
+                        self.mark_fair_slashed(expected_leader, slot, order_start, now);
+                        return false;
+                    };
+                    sigs.extend_from_slice(chunk);
+                }
+
+                let tx_count: u32 = sigs.len().try_into().unwrap_or(0);
+                let tx_merkle_root = fair_merkle_root(sigs.as_slice());
+                if tx_count != witness.tx_count || tx_merkle_root != witness.tx_merkle_root {
+                    debug!(
+                        "solanacdn: on-chain fair commit mismatch for witnessed batch; leader={} slot={} batch_id={} order_start={} witness_tx_count={} witness_merkle_root={:02x?} commit_tx_count={} commit_merkle_root={:02x?}",
+                        expected_leader.to_base58(),
+                        slot,
+                        batch_id,
+                        order_start,
+                        witness.tx_count,
+                        witness.tx_merkle_root,
+                        tx_count,
+                        tx_merkle_root
+                    );
+                    self.mark_fair_slashed(expected_leader, slot, order_start, now);
+                    return false;
+                }
             }
         }
 
@@ -2126,6 +2361,7 @@ impl SolanaCdnHandle {
         let tx_fair_ordering = self.cfg.tx_fair_ordering;
         let tx_fair_slashing = self.cfg.tx_fair_slashing;
         let tx_fair_slashing_strict = self.cfg.tx_fair_slashing_strict;
+        let tx_fair_slashing_witness = self.cfg.tx_fair_slashing_witness;
         let tx_fair_slashing_enforce = self.tx_fair_slashing_enforce_enabled();
         let tx_fair_slashing_enforce_configured = self.cfg.tx_fair_slashing_enforce;
         let tx_fair_slashing_enforce_override = self.tx_fair_slashing_enforce_override();
@@ -2255,6 +2491,7 @@ impl SolanaCdnHandle {
             tx_fair_ordering,
             tx_fair_slashing,
             tx_fair_slashing_strict,
+            tx_fair_slashing_witness,
             tx_fair_slashing_enforce,
             tx_fair_slashing_enforce_configured,
             tx_fair_slashing_enforce_override,
@@ -4170,6 +4407,13 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         if status.tx_fair_slashing_strict { 1 } else { 0 }
     ));
 
+    out.push_str("# HELP solanacdn_tx_fair_slashing_witness_enabled Whether POP witness-based fair slashing is enabled (0/1)\n");
+    out.push_str("# TYPE solanacdn_tx_fair_slashing_witness_enabled gauge\n");
+    out.push_str(&format!(
+        "solanacdn_tx_fair_slashing_witness_enabled {}\n",
+        if status.tx_fair_slashing_witness { 1 } else { 0 }
+    ));
+
     out.push_str("# HELP solanacdn_tx_fair_slashing_enforce_enabled Whether fair slashing vote withholding is enabled (0/1)\n");
     out.push_str("# TYPE solanacdn_tx_fair_slashing_enforce_enabled gauge\n");
     out.push_str(&format!(
@@ -5332,18 +5576,23 @@ async fn run_pop_session(
             )))
         }
     };
+    let pop_pubkey = auth_ok.pop_pubkey;
 
     // Advertise per-session capabilities so POPs can decide whether to use fair TX ordering.
     write_agent_msg(
         &mut ctrl_send,
         &AgentToPop::Capabilities(AgentCapabilities {
             tx_fair_ordering: cfg.tx_fair_ordering,
+            ..AgentCapabilities::default()
         }),
     )
     .await?;
 
     if cfg.tx_fair_slashing {
         write_agent_msg(&mut ctrl_send, &AgentToPop::SubscribeFairCommits).await?;
+    }
+    if cfg.tx_fair_slashing && cfg.tx_fair_slashing_witness {
+        write_agent_msg(&mut ctrl_send, &AgentToPop::SubscribeFairWitnesses).await?;
     }
 
     let udp_advertised = auth_ok.udp_shreds_port != 0 && auth_ok.udp_votes_port != 0;
@@ -5578,6 +5827,7 @@ async fn run_pop_session(
                 };
                 handle_pop_msg(
                     endpoint,
+                    pop_pubkey,
                     &cfg,
                     auth.as_ref(),
                     &handle,
@@ -5619,6 +5869,7 @@ async fn run_pop_session(
                 };
                 handle_pop_msg(
                     endpoint,
+                    pop_pubkey,
                     &cfg,
                     auth.as_ref(),
                     &handle,
@@ -5660,6 +5911,7 @@ async fn run_pop_session(
                 };
                 handle_pop_msg(
                     endpoint,
+                    pop_pubkey,
                     &cfg,
                     auth.as_ref(),
                     &handle,
@@ -5763,6 +6015,7 @@ async fn run_pop_session(
                                 };
                             handle_pop_msg(
                                 endpoint,
+                                pop_pubkey,
                                 &cfg,
                                 auth.as_ref(),
                                 &handle,
@@ -5783,6 +6036,7 @@ async fn run_pop_session(
                     other => {
                         handle_pop_msg(
                             endpoint,
+                            pop_pubkey,
                             &cfg,
                             auth.as_ref(),
                             &handle,
@@ -5844,6 +6098,7 @@ async fn run_pop_session(
                 }
                 handle_pop_msg(
                     endpoint,
+                    pop_pubkey,
                     &cfg,
                     auth.as_ref(),
                     &handle,
@@ -5963,6 +6218,7 @@ async fn run_pop_session(
 
 async fn handle_pop_msg(
     endpoint: SocketAddr,
+    pop_pubkey: PubkeyBytes,
     cfg: &SolanaCdnConfig,
     auth: &AuthContext,
     handle: &SolanaCdnHandle,
@@ -6073,11 +6329,13 @@ async fn handle_pop_msg(
         PopToAgent::FairBatch(batch) => {
             let solanacdn_protocol::messages::FairBatch {
                 origin_pop_id,
+                flow_id,
                 batch_id,
                 created_at_ms: _,
                 batch_ms: _,
                 target_slot,
                 txs: incoming_txs,
+                ..
             } = batch;
 
             if incoming_txs.is_empty() {
@@ -6258,6 +6516,7 @@ async fn handle_pop_msg(
                 let leader_time_ms = now_ms();
                 let payload = FairBatchCommitPayload {
                     origin_pop_id,
+                    flow_id,
                     batch_id,
                     order_start,
                     target_slot,
@@ -6275,6 +6534,7 @@ async fn handle_pop_msg(
                             let tx_merkle_root = fair_merkle_root(sig_bytes.as_slice());
                             let receipt_payload = FairBatchReceiptCommitPayload {
                                 origin_pop_id: commit.payload.origin_pop_id.clone(),
+                                flow_id: commit.payload.flow_id,
                                 batch_id: commit.payload.batch_id,
                                 order_start: commit.payload.order_start,
                                 target_slot: commit.payload.target_slot,
@@ -6324,6 +6584,22 @@ async fn handle_pop_msg(
                     .fetch_add(deduped, Ordering::Relaxed);
             }
         }
+        PopToAgent::FairBatchWitness(witness) => {
+            handle
+                .fair_batch_witness_rx
+                .fetch_add(1, Ordering::Relaxed);
+            if !cfg.tx_fair_slashing || !cfg.tx_fair_slashing_witness {
+                return;
+            }
+            if let Err(e) = witness.verify(pop_pubkey) {
+                handle
+                    .fair_batch_witness_invalid
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!("solanacdn: invalid fair witness from {endpoint}: {e}");
+                return;
+            }
+            handle.note_fair_batch_witness_for_slashing(&witness);
+        }
         PopToAgent::FairBatchCommit(commit) => {
             handle.fair_commits_rx.fetch_add(1, Ordering::Relaxed);
             if !cfg.tx_fair_slashing {
@@ -6365,7 +6641,11 @@ fn make_single_shred_batch(kind: ShredKind, payload: Bytes) -> ShredBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solanacdn_protocol::messages::AuthOk;
+    use solanacdn_protocol::messages::{
+        AuthOk, FairBatchAttestation, FairBatchAttestationPayload, FairBatchWitness, FairBatchWitnessPayload,
+    };
+
+    const TEST_POP_PUBKEY: PubkeyBytes = PubkeyBytes([0u8; 32]);
 
     #[test]
     fn parse_hex_32_parses_sha256_hex() {
@@ -6966,6 +7246,184 @@ mod tests {
     }
 
     #[test]
+    fn fair_ledger_audit_witness_missing_onchain_commit_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        let slot = 42;
+        let batch_id = 7u128;
+        let sigs = vec![[1u8; 64], [2u8; 64]];
+
+        let witness_payload = FairBatchWitnessPayload {
+            attestation: FairBatchAttestationPayload {
+                origin_pop_id: "pop-test-1".to_string(),
+                flow_id: 0,
+                batch_id,
+                tx_seq_start: 0,
+                tx_count: sigs.len() as u32,
+                tx_merkle_root: fair_merkle_root(sigs.as_slice()),
+                created_at_ms: now_ms(),
+                batch_ms: 0,
+                target_slot: Some(slot),
+            },
+            leader_pubkey: PubkeyBytes(leader.to_bytes()),
+            pop_time_ms: now_ms(),
+        };
+        let mut rng = rand::rngs::OsRng;
+        let pop_signing_key = SigningKey::generate(&mut rng);
+        let witness = FairBatchWitness::sign(witness_payload, &pop_signing_key).expect("sign witness");
+        handle.note_fair_batch_witness_for_slashing(&witness);
+
+        // No on-chain commit memos in this slot => violation when witness is present.
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::default();
+        let tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![VersionedTransaction::from(tx).into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
+    fn fair_ledger_audit_witness_commit_mismatch_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let slot = 42;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+
+        let sigs_witness = vec![[1u8; 64], [2u8; 64]];
+        let mut sigs_commit = sigs_witness.clone();
+        sigs_commit.reverse();
+
+        let witness_payload = FairBatchWitnessPayload {
+            attestation: FairBatchAttestationPayload {
+                origin_pop_id: "pop-test-1".to_string(),
+                flow_id: 0,
+                batch_id,
+                tx_seq_start: 0,
+                tx_count: sigs_witness.len() as u32,
+                tx_merkle_root: fair_merkle_root(sigs_witness.as_slice()),
+                created_at_ms: now_ms(),
+                batch_ms: 0,
+                target_slot: Some(slot),
+            },
+            leader_pubkey: PubkeyBytes(leader.to_bytes()),
+            pop_time_ms: now_ms(),
+        };
+        let mut rng = rand::rngs::OsRng;
+        let pop_signing_key = SigningKey::generate(&mut rng);
+        let witness = FairBatchWitness::sign(witness_payload, &pop_signing_key).expect("sign witness");
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+        handle.note_fair_batch_witness_for_slashing(&witness);
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs_commit.as_slice(),
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
+    fn fair_ledger_audit_witness_commit_match_is_ok() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let slot = 42;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+
+        let sigs = vec![[1u8; 64], [2u8; 64]];
+
+        let witness_payload = FairBatchWitnessPayload {
+            attestation: FairBatchAttestationPayload {
+                origin_pop_id: "pop-test-1".to_string(),
+                flow_id: 0,
+                batch_id,
+                tx_seq_start: 0,
+                tx_count: sigs.len() as u32,
+                tx_merkle_root: fair_merkle_root(sigs.as_slice()),
+                created_at_ms: now_ms(),
+                batch_ms: 0,
+                target_slot: Some(slot),
+            },
+            leader_pubkey: PubkeyBytes(leader.to_bytes()),
+            pop_time_ms: now_ms(),
+        };
+        let mut rng = rand::rngs::OsRng;
+        let pop_signing_key = SigningKey::generate(&mut rng);
+        let witness = FairBatchWitness::sign(witness_payload, &pop_signing_key).expect("sign witness");
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+        handle.note_fair_batch_witness_for_slashing(&witness);
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs.as_slice(),
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 0);
+    }
+
+    #[test]
     fn fair_commit_equivocation_marks_slashed() {
         let leader_identity = Arc::new(Keypair::new());
         let leader = leader_identity.pubkey();
@@ -6979,6 +7437,7 @@ mod tests {
 
         let payload_1 = FairBatchCommitPayload {
             origin_pop_id: origin_pop_id.clone(),
+            flow_id: 0,
             batch_id,
             order_start,
             target_slot: Some(slot),
@@ -6991,6 +7450,7 @@ mod tests {
 
         let payload_2 = FairBatchCommitPayload {
             origin_pop_id,
+            flow_id: 0,
             batch_id,
             order_start,
             target_slot: Some(slot),
@@ -7067,6 +7527,50 @@ mod tests {
         }
     }
 
+    fn make_test_fair_batch(
+        origin_pop_id: &str,
+        batch_id: u128,
+        target_slot: Option<u64>,
+        txs: Vec<solanacdn_protocol::messages::FairTx>,
+    ) -> solanacdn_protocol::messages::FairBatch {
+        let created_at_ms = now_ms();
+        let batch_ms: u16 = 0;
+        let tx_seq_start: u64 = 0;
+        let flow_id: u128 = 0;
+
+        let sigs: Vec<[u8; 64]> = txs.iter().map(|tx| tx.sig.0).collect();
+        let tx_merkle_root = fair_merkle_root(sigs.as_slice());
+        let tx_count: u32 = txs.len().try_into().unwrap_or(0);
+
+        let attestation_payload = FairBatchAttestationPayload {
+            origin_pop_id: origin_pop_id.to_string(),
+            flow_id,
+            batch_id,
+            tx_seq_start,
+            tx_count,
+            tx_merkle_root,
+            created_at_ms,
+            batch_ms,
+            target_slot,
+        };
+        let attestation = FairBatchAttestation {
+            payload: attestation_payload,
+            signature: SignatureBytes([0u8; 64]),
+        };
+
+        solanacdn_protocol::messages::FairBatch {
+            origin_pop_id: origin_pop_id.to_string(),
+            flow_id,
+            batch_id,
+            tx_seq_start,
+            created_at_ms,
+            batch_ms,
+            target_slot,
+            attestation,
+            txs,
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fair_batch_order_start_advances_only_for_verified_txs() {
         let endpoint: SocketAddr = "198.51.100.1:4444".parse().unwrap();
@@ -7130,21 +7634,20 @@ mod tests {
         let (_sig_count, consumed) = parse_shortvec_len(bytes_3.as_slice()).expect("sig vec len");
         bytes_3[consumed] ^= 0x01;
 
-        let batch_1 = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-test-1".to_string(),
-            batch_id: 1,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs: vec![
+        let batch_1 = make_test_fair_batch(
+            "pop-test-1",
+            1,
+            None,
+            vec![
                 fair_tx_from_wire_bytes(bytes_1),
                 fair_tx_from_wire_bytes(bytes_2),
                 fair_tx_from_wire_bytes(bytes_3),
             ],
-        };
+        );
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -7182,17 +7685,16 @@ mod tests {
         );
         let bytes_4 = bincode::serialize(&VersionedTransaction::from(tx_4)).unwrap();
 
-        let batch_2 = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-test-1".to_string(),
-            batch_id: 2,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs: vec![fair_tx_from_wire_bytes(bytes_4)],
-        };
+        let batch_2 = make_test_fair_batch(
+            "pop-test-1",
+            2,
+            None,
+            vec![fair_tx_from_wire_bytes(bytes_4)],
+        );
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -7267,17 +7769,11 @@ mod tests {
             })
             .collect();
 
-        let batch = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-test-1".to_string(),
-            batch_id: 1,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs,
-        };
+        let batch = make_test_fair_batch("pop-test-1", 1, None, txs);
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -7375,6 +7871,7 @@ mod tests {
         assert!(text.contains("solanacdn_fair_priority_hits_total "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enabled "));
         assert!(text.contains("solanacdn_tx_fair_slashing_strict_enabled "));
+        assert!(text.contains("solanacdn_tx_fair_slashing_witness_enabled "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enforce_enabled "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enforce_configured "));
         assert!(text.contains("solanacdn_tx_fair_slashing_enforce_override{state=\"inherit\"} 1"));
@@ -7634,17 +8131,16 @@ mod tests {
         let fair_tx = fair_tx_from_wire_bytes(bytes);
 
         // Send the same tx 3 times in one batch — only 1 should be accepted.
-        let batch = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-dedup-test".to_string(),
-            batch_id: 99,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs: vec![fair_tx.clone(), fair_tx.clone(), fair_tx],
-        };
+        let batch = make_test_fair_batch(
+            "pop-dedup-test",
+            99,
+            None,
+            vec![fair_tx.clone(), fair_tx.clone(), fair_tx],
+        );
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -7729,17 +8225,16 @@ mod tests {
 
         let before = FAIR_BATCH_DROPPED_PAYLOAD_TOO_LARGE_TOTAL.load(Ordering::Relaxed);
 
-        let batch = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-oversize-test".to_string(),
-            batch_id: 200,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs: vec![oversized_fair_tx, good_fair_tx],
-        };
+        let batch = make_test_fair_batch(
+            "pop-oversize-test",
+            200,
+            None,
+            vec![oversized_fair_tx, good_fair_tx],
+        );
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -7841,17 +8336,11 @@ mod tests {
 
         let before = FAIR_BATCH_DROPPED_TOTAL_BYTES_EXCEEDED_TOTAL.load(Ordering::Relaxed);
 
-        let batch = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-bytes-cap-test".to_string(),
-            batch_id: 201,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs,
-        };
+        let batch = make_test_fair_batch("pop-bytes-cap-test", 201, None, txs);
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -7957,17 +8446,16 @@ mod tests {
 
         let before = FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.load(Ordering::Relaxed);
 
-        let batch = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-sig-mismatch-test".to_string(),
-            batch_id: 202,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs: vec![mismatched_fair_tx, good_fair_tx],
-        };
+        let batch = make_test_fair_batch(
+            "pop-sig-mismatch-test",
+            202,
+            None,
+            vec![mismatched_fair_tx, good_fair_tx],
+        );
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -8059,17 +8547,12 @@ mod tests {
 
         let before = FAIR_BATCH_DROPPED_SIG_MISMATCH_TOTAL.load(Ordering::Relaxed);
 
-        let batch = solanacdn_protocol::messages::FairBatch {
-            origin_pop_id: "pop-garbage-test".to_string(),
-            batch_id: 203,
-            created_at_ms: now_ms(),
-            batch_ms: 0,
-            target_slot: None,
-            txs: vec![garbage_fair_tx, good_fair_tx],
-        };
+        let batch =
+            make_test_fair_batch("pop-garbage-test", 203, None, vec![garbage_fair_tx, good_fair_tx]);
 
         handle_pop_msg(
             endpoint,
+            TEST_POP_PUBKEY,
             &cfg,
             &auth,
             &handle,
@@ -8467,6 +8950,7 @@ mod tests {
                 &mut ctrl_send,
                 &PopToAgent::AuthOk(AuthOk {
                     pop_id: "test-pop".to_string(),
+                    pop_pubkey: TEST_POP_PUBKEY,
                     server_time_ms: now_ms(),
                     udp_token,
                     udp_shreds_port: pop_udp_shreds_port,
@@ -8625,6 +9109,7 @@ mod tests {
                 &mut ctrl_send,
                 &PopToAgent::AuthOk(AuthOk {
                     pop_id: "test-pop".to_string(),
+                    pop_pubkey: TEST_POP_PUBKEY,
                     server_time_ms: now_ms(),
                     udp_token,
                     udp_shreds_port: pop_udp_shreds_port,
@@ -8808,6 +9293,7 @@ mod tests {
                 &mut ctrl_send,
                 &PopToAgent::AuthOk(AuthOk {
                     pop_id: "test-pop".to_string(),
+                    pop_pubkey: TEST_POP_PUBKEY,
                     server_time_ms: now_ms(),
                     udp_token,
                     udp_shreds_port: pop_udp_shreds_port,
@@ -8971,6 +9457,7 @@ mod tests {
                 &mut ctrl_send,
                 &PopToAgent::AuthOk(AuthOk {
                     pop_id: "test-pop".to_string(),
+                    pop_pubkey: TEST_POP_PUBKEY,
                     server_time_ms: now_ms(),
                     udp_token,
                     udp_shreds_port: pop_udp_shreds_port,
@@ -9139,6 +9626,7 @@ mod tests {
                 &mut ctrl_send,
                 &PopToAgent::AuthOk(AuthOk {
                     pop_id: "test-pop".to_string(),
+                    pop_pubkey: TEST_POP_PUBKEY,
                     server_time_ms: now_ms(),
                     udp_token: random_nonce_16(),
                     udp_shreds_port: 0,

@@ -8,15 +8,18 @@ use {
     reqwest::Client,
     serde_json::json,
     solanacdn_protocol::{
-        crypto::{random_nonce_16, SignatureBytes},
+        crypto::{PubkeyBytes, random_nonce_16, SignatureBytes},
         frame::{decode_envelope, encode_envelope},
-        messages::{AgentToPop, AuthOk, FairBatch, FairTx, PopToAgent},
+        messages::{
+            AgentToPop, AuthOk, FairBatch, FairBatchAttestation, FairBatchAttestationPayload, FairTx, PopToAgent,
+        },
     },
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_message::Message,
     solana_signer::Signer,
+    solana_sha256_hasher as sha256_hasher,
     solana_tls_utils::{crypto_provider, new_dummy_x509_certificate},
     solana_transaction::{versioned::VersionedTransaction, Transaction},
     std::{
@@ -230,8 +233,15 @@ async fn handle_control_stream(
         }
     });
 
+    let pop_signing_key = {
+        let mut rng = rand::rngs::OsRng;
+        ed25519_dalek_v2::SigningKey::generate(&mut rng)
+    };
+    let pop_pubkey = PubkeyBytes(pop_signing_key.verifying_key().to_bytes());
+
     let auth_ok = AuthOk {
         pop_id: cfg.origin_pop_id.clone(),
+        pop_pubkey,
         server_time_ms: now_ms(),
         udp_token: random_nonce_16(),
         udp_shreds_port: 0,
@@ -281,6 +291,7 @@ async fn handle_control_stream(
     let rpc_client = cfg.rpc_url.as_ref().map(|_| Client::new());
 
     let mut batches_sent: u64 = 0;
+    let mut tx_seq_start: u64 = 0;
     loop {
         if cfg.batches != 0 && batches_sent >= cfg.batches {
             break;
@@ -301,11 +312,12 @@ async fn handle_control_stream(
         } else {
             Hash::new_unique()
         };
-        let batch = build_fair_batch(&cfg, batch_id, blockhash);
+        let batch = build_fair_batch(&cfg, batch_id, tx_seq_start, blockhash, &pop_signing_key);
         if out_tx.send(PopToAgent::FairBatch(batch)).await.is_err() {
             break;
         }
         batches_sent = batches_sent.saturating_add(1);
+        tx_seq_start = tx_seq_start.saturating_add(cfg.txs_per_batch as u64);
         if cfg.batches != 0 && batches_sent >= cfg.batches {
             break;
         }
@@ -323,7 +335,13 @@ async fn handle_control_stream(
     Ok(())
 }
 
-fn build_fair_batch(cfg: &Config, batch_id: u128, recent_blockhash: Hash) -> FairBatch {
+fn build_fair_batch(
+    cfg: &Config,
+    batch_id: u128,
+    tx_seq_start: u64,
+    recent_blockhash: Hash,
+    pop_signing_key: &ed25519_dalek_v2::SigningKey,
+) -> FairBatch {
     let signer = Keypair::new();
     let mut txs = Vec::with_capacity(cfg.txs_per_batch);
 
@@ -337,14 +355,88 @@ fn build_fair_batch(cfg: &Config, batch_id: u128, recent_blockhash: Hash) -> Fai
         txs.push(FairTx { sig, payload });
     }
 
+    let created_at_ms = now_ms();
+    let batch_ms: u16 = 50;
+    let tx_count: u32 = txs.len().try_into().unwrap_or(0);
+    let tx_merkle_root = fair_merkle_root(txs.as_slice());
+    let attestation_payload = FairBatchAttestationPayload {
+        origin_pop_id: cfg.origin_pop_id.clone(),
+        flow_id: 0,
+        batch_id,
+        tx_seq_start,
+        tx_count,
+        tx_merkle_root,
+        created_at_ms,
+        batch_ms,
+        target_slot: cfg.target_slot,
+    };
+    let attestation = FairBatchAttestation::sign(attestation_payload, pop_signing_key)
+        .unwrap_or_else(|e| panic!("failed to sign FairBatchAttestation: {e}"));
+
     FairBatch {
         origin_pop_id: cfg.origin_pop_id.clone(),
+        flow_id: 0,
         batch_id,
-        created_at_ms: now_ms(),
-        batch_ms: 50,
+        tx_seq_start,
+        created_at_ms,
+        batch_ms,
         target_slot: cfg.target_slot,
+        attestation,
         txs,
     }
+}
+
+const FAIR_MERKLE_LEAF_DOMAIN: &[u8] = b"SCDNFAIRLEAFv1";
+const FAIR_MERKLE_NODE_DOMAIN: &[u8] = b"SCDNFAIRNODEv1";
+
+fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    let digest = sha256_hasher::hash(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+fn fair_merkle_leaf_hash(index: u32, sig: &[u8; 64]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(FAIR_MERKLE_LEAF_DOMAIN.len() + 4 + 64);
+    buf.extend_from_slice(FAIR_MERKLE_LEAF_DOMAIN);
+    buf.extend_from_slice(&index.to_le_bytes());
+    buf.extend_from_slice(sig);
+    sha256_bytes(&buf)
+}
+
+fn fair_merkle_node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(FAIR_MERKLE_NODE_DOMAIN.len() + 32 + 32);
+    buf.extend_from_slice(FAIR_MERKLE_NODE_DOMAIN);
+    buf.extend_from_slice(left);
+    buf.extend_from_slice(right);
+    sha256_bytes(&buf)
+}
+
+fn fair_merkle_root(txs: &[FairTx]) -> [u8; 32] {
+    if txs.is_empty() {
+        return [0u8; 32];
+    }
+    let mut level: Vec<[u8; 32]> = txs
+        .iter()
+        .enumerate()
+        .map(|(idx, tx)| fair_merkle_leaf_hash(idx as u32, &tx.sig.0))
+        .collect();
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0usize;
+        while i < level.len() {
+            let left = level[i];
+            let right = if i + 1 < level.len() {
+                level[i + 1]
+            } else {
+                left
+            };
+            next.push(fair_merkle_node_hash(&left, &right));
+            i = i.saturating_add(2);
+        }
+        level = next;
+    }
+    level[0]
 }
 
 async fn read_agent_msg<R: AsyncRead + Unpin>(reader: &mut R) -> Result<AgentToPop> {

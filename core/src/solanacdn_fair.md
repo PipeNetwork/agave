@@ -1,7 +1,8 @@
 # SolanaCDN `--fair` transaction ordering (validator-side FIFO)
 
 This document describes the fairness contract implemented by the Agave validator integration when
-SolanaCDN fair ordering is enabled (CLI `--fair`, `--fair-slashing`, or `--fair-slashing-enforce`).
+SolanaCDN fair ordering is enabled (CLI `--fair`, `--fair-slashing`, `--fair-slashing-strict`,
+`--fair-slashing-witness`, or `--fair-slashing-enforce`).
 
 ## Goal (retail user outcome)
 
@@ -69,6 +70,21 @@ When strict mode is enabled, the leader’s ledger commit becomes a stronger con
 - **No committed drops:** every committed fair transaction signature must land in the target slot
   (missing tail is a violation).
 - **Missing commit chunks are violations:** partial/fragmented ledger commits do not pass audit.
+
+### Witness mode (`--fair-slashing-witness`)
+
+The ledger alone cannot prove that a leader *received* a fair batch (a leader can always omit
+commits and claim non-receipt). Witness mode adds an **external witness stream**:
+
+- POPs broadcast a POP-signed `FairBatchWitness` containing an attestation payload
+  (`batch_id`, `tx_count`, Merkle root of signatures, `target_slot`) and the intended
+  `leader_pubkey`.
+- Auditors subscribe to this witness stream and, during ledger audit, treat it as a violation if a
+  witnessed batch has **no matching on-chain commit** (or the commit's signature list does not
+  match the witnessed `tx_count`/Merkle root).
+
+This mode requires POP support (protocol v6+) and shifts trust to the POP witness signer: a
+malicious POP can falsely accuse a leader.
 
 ## Optional: enforcement (`--fair-slashing-enforce`)
 

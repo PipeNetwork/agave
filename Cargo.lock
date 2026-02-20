@@ -12258,8 +12258,8 @@ dependencies = [
 
 [[package]]
 name = "solanacdn-protocol"
-version = "0.1.6"
-source = "git+https://github.com/pipenetwork/solanacdn-protocol?tag=v0.1.6#153d5df3c15df5c4dfa3cc5649447a51c0e45cb5"
+version = "0.1.8"
+source = "git+https://github.com/PipeNetwork/solanacdn-protocol?rev=ccb90bfd84273836e14070475fc70b2aa995a1b2#ccb90bfd84273836e14070475fc70b2aa995a1b2"
 dependencies = [
  "bs58",
  "ed25519-dalek 2.2.0",
@@ -12267,6 +12267,7 @@ dependencies = [
  "rand 0.8.5",
  "raptorq",
  "serde",
+ "serde_json",
  "thiserror 2.0.17",
 ]
 

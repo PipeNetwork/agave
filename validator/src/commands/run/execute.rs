@@ -650,10 +650,15 @@ pub fn execute(
         }
         let fair_slashing_enforce = matches.is_present("fair_slashing_enforce");
         let fair_slashing_strict = matches.is_present("fair_slashing_strict");
+        let fair_slashing_witness = matches.is_present("fair_slashing_witness");
         let fair_slashing =
-            matches.is_present("fair_slashing") || fair_slashing_enforce || fair_slashing_strict;
+            matches.is_present("fair_slashing")
+                || fair_slashing_enforce
+                || fair_slashing_strict
+                || fair_slashing_witness;
         cfg.tx_fair_slashing = fair_slashing;
         cfg.tx_fair_slashing_strict = fair_slashing_strict;
+        cfg.tx_fair_slashing_witness = fair_slashing_witness;
         cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
         cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();

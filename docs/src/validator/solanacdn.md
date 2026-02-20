@@ -83,6 +83,11 @@ transactions and commit-memo transactions ahead of it):
 
 - `--fair-slashing-strict`
 
+Witness mode (implies `--fair-slashing`; subscribes to POP-signed batch witnesses so auditors can
+punish “leader received a fair batch but never committed it”; requires POP support, protocol v6+):
+
+- `--fair-slashing-witness`
+
 Enforcement mode (implies `--fair-slashing`; withholds votes when a fair ordering violation is observed):
 
 - `--fair-slashing-enforce`
