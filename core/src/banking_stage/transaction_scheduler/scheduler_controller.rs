@@ -137,9 +137,9 @@ where
             });
             let new_leader_slot = decision.bank().map(|b| b.slot());
             self.count_metrics
-                .maybe_report_and_reset_slot(new_leader_slot);
+                .maybe_report_and_reset_slot(new_leader_slot, false);
             self.timing_metrics
-                .maybe_report_and_reset_slot(new_leader_slot);
+                .maybe_report_and_reset_slot(new_leader_slot, false);
 
             if most_recent_leader_slot != new_leader_slot {
                 self.container.flush_held_transactions();
@@ -189,9 +189,9 @@ where
                 count_metrics.update_priority_stats(priority_min_max);
             });
             self.count_metrics
-                .maybe_report_and_reset_interval(should_report);
+                .maybe_report_and_reset_interval(should_report, false);
             self.timing_metrics
-                .maybe_report_and_reset_interval(should_report);
+                .maybe_report_and_reset_interval(should_report, false);
             self.worker_metrics
                 .iter()
                 .for_each(|metrics| metrics.maybe_report_and_reset());
@@ -393,6 +393,7 @@ where
                 num_dropped_on_already_processed,
                 num_dropped_on_fee_payer,
                 num_dropped_on_capacity,
+                num_dropped_on_blacklisted_account,
                 num_buffered,
                 receive_time_us: _,
                 buffer_time_us: _,
@@ -409,6 +410,8 @@ where
                 *num_dropped_on_already_processed;
             count_metrics.num_dropped_on_receive_fee_payer += *num_dropped_on_fee_payer;
             count_metrics.num_dropped_on_capacity += *num_dropped_on_capacity;
+            count_metrics.num_dropped_on_blacklisted_account +=
+                *num_dropped_on_blacklisted_account;
             count_metrics.num_buffered += *num_buffered;
         });
 

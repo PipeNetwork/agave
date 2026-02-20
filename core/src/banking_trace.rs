@@ -7,6 +7,7 @@ use {
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_hash::Hash,
+    solana_transaction::versioned::VersionedTransaction,
     std::{
         fs::{create_dir_all, remove_dir_all},
         io::{self, Write},
@@ -20,6 +21,8 @@ use {
     },
     thiserror::Error,
 };
+
+use crate::banking_stage::house_keeper::get_serialized_packet_for_logging;
 
 pub type BankingPacketSender = TracedSender;
 pub type TracerThreadResult = Result<(), TraceError>;
@@ -443,6 +446,22 @@ impl TracedSender {
     }
 
     pub fn send(&self, batch: BankingPacketBatch) -> Result<(), SendError<BankingPacketBatch>> {
+        self.send_inner(batch, &None)
+    }
+
+    pub fn send_with_input(
+        &self,
+        batch: BankingPacketBatch,
+        input_tx_signature_sender: &Option<(Sender<String>, Arc<AtomicBool>)>,
+    ) -> Result<(), SendError<BankingPacketBatch>> {
+        self.send_inner(batch, input_tx_signature_sender)
+    }
+
+    fn send_inner(
+        &self,
+        batch: BankingPacketBatch,
+        input_tx_signature_sender: &Option<(Sender<String>, Arc<AtomicBool>)>,
+    ) -> Result<(), SendError<BankingPacketBatch>> {
         if let Some(ActiveTracer { trace_sender, exit }) = &self.active_tracer {
             if !exit.load(Ordering::Relaxed) {
                 trace_sender
@@ -456,7 +475,37 @@ impl TracedSender {
                     })?;
             }
         }
-        self.sender.send(batch)
+
+        // TX Input Signature Reporting
+        if let Some((input_tx_signature_sender, exit)) = input_tx_signature_sender {
+            if !exit.load(Ordering::Relaxed) {
+                for packet_batch in batch.iter() {
+                    for packet in packet_batch {
+                        if let Ok(versioned_transaction) =
+                            packet.deserialize_slice::<VersionedTransaction, _>(..)
+                        {
+                            if let Some(signature) = versioned_transaction.signatures.first() {
+                                let _ = input_tx_signature_sender.try_send(signature.to_string());
+                            }
+                        } else {
+                            // in case of deserialization error, fallback to this method of identification
+                            let msg = get_serialized_packet_for_logging(&packet);
+                            let _ = input_tx_signature_sender.try_send(msg);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((_, exit)) = input_tx_signature_sender {
+            if !exit.load(Ordering::Relaxed) {
+                self.sender.send(batch)
+            } else {
+                Err(SendError(batch))
+            }
+        } else {
+            self.sender.send(batch)
+        }
     }
 
     pub fn len(&self) -> usize {

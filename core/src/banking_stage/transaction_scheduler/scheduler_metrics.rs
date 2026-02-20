@@ -11,8 +11,8 @@ use {
 
 #[derive(Default)]
 pub struct SchedulerCountMetrics {
-    interval: IntervalSchedulerCountMetrics,
-    slot: SlotSchedulerCountMetrics,
+    pub interval: IntervalSchedulerCountMetrics,
+    pub slot: SlotSchedulerCountMetrics,
 }
 
 impl SchedulerCountMetrics {
@@ -21,12 +21,12 @@ impl SchedulerCountMetrics {
         update(&mut self.slot.metrics);
     }
 
-    pub fn maybe_report_and_reset_slot(&mut self, slot: Option<Slot>) {
-        self.slot.maybe_report_and_reset(slot);
+    pub fn maybe_report_and_reset_slot(&mut self, slot: Option<Slot>, bam_controller: bool) {
+        self.slot.maybe_report_and_reset(slot, bam_controller);
     }
 
-    pub fn maybe_report_and_reset_interval(&mut self, should_report: bool) {
-        self.interval.maybe_report_and_reset(should_report);
+    pub fn maybe_report_and_reset_interval(&mut self, should_report: bool, bam_controller: bool) {
+        self.interval.maybe_report_and_reset(should_report, bam_controller);
     }
 
     pub fn interval_has_data(&self) -> bool {
@@ -35,15 +35,15 @@ impl SchedulerCountMetrics {
 }
 
 #[derive(Default)]
-struct IntervalSchedulerCountMetrics {
+pub struct IntervalSchedulerCountMetrics {
     interval: AtomicInterval,
-    metrics: SchedulerCountMetricsInner,
+    pub metrics: SchedulerCountMetricsInner,
 }
 
 #[derive(Default)]
-struct SlotSchedulerCountMetrics {
+pub struct SlotSchedulerCountMetrics {
     slot: Option<Slot>,
-    metrics: SchedulerCountMetricsInner,
+    pub metrics: SchedulerCountMetricsInner,
 }
 
 #[derive(Default)]
@@ -64,6 +64,8 @@ pub struct SchedulerCountMetricsInner {
     pub num_finished: Saturating<usize>,
     /// Number of transactions that were retryable.
     pub num_retryable: Saturating<usize>,
+    /// Number of transactions that were dropped due to blacklisted account.
+    pub num_dropped_on_blacklisted_account: Saturating<usize>,
 
     /// Number of transactions that were immediately dropped on receive.
     pub num_dropped_on_receive: Saturating<usize>,
@@ -93,11 +95,16 @@ pub struct SchedulerCountMetricsInner {
 }
 
 impl IntervalSchedulerCountMetrics {
-    fn maybe_report_and_reset(&mut self, should_report: bool) {
+    fn maybe_report_and_reset(&mut self, should_report: bool, bam_controller: bool) {
+        let name = if bam_controller {
+            "bam_banking_stage_scheduler_counts"
+        } else {
+            "banking_stage_scheduler_counts"
+        };
         const REPORT_INTERVAL_MS: u64 = 1000;
         if self.interval.should_update(REPORT_INTERVAL_MS) {
             if should_report {
-                self.metrics.report("banking_stage_scheduler_counts", None);
+                self.metrics.report(name, None);
             }
             self.metrics.reset();
         }
@@ -105,12 +112,17 @@ impl IntervalSchedulerCountMetrics {
 }
 
 impl SlotSchedulerCountMetrics {
-    fn maybe_report_and_reset(&mut self, slot: Option<Slot>) {
+    fn maybe_report_and_reset(&mut self, slot: Option<Slot>, bam_controller: bool) {
+        let name = if bam_controller {
+            "bam_banking_stage_scheduler_slot_counts"
+        } else {
+            "banking_stage_scheduler_slot_counts"
+        };
         if self.slot != slot {
             // Only report if there was an assigned slot.
             if self.slot.is_some() {
                 self.metrics
-                    .report("banking_stage_scheduler_slot_counts", self.slot);
+                    .report(name, self.slot);
             }
             self.metrics.reset();
             self.slot = slot;
@@ -141,6 +153,7 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_clear: Saturating(num_dropped_on_clear),
             num_dropped_on_clean: Saturating(num_dropped_on_clean),
             num_dropped_on_capacity: Saturating(num_dropped_on_capacity),
+            num_dropped_on_blacklisted_account: Saturating(num_dropped_on_blacklisted_account),
             min_prioritization_fees: _min_prioritization_fees,
             max_prioritization_fees: _max_prioritization_fees,
         } = self;
@@ -193,7 +206,8 @@ impl SchedulerCountMetricsInner {
             ),
             ("num_dropped_on_capacity", num_dropped_on_capacity, i64),
             ("min_priority", self.get_min_priority(), i64),
-            ("max_priority", self.get_max_priority(), i64)
+            ("max_priority", self.get_max_priority(), i64),
+            ("num_dropped_on_blacklisted_account", num_dropped_on_blacklisted_account, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -210,9 +224,10 @@ impl SchedulerCountMetricsInner {
             || self.num_schedule_filtered_out != Saturating(0)
             || self.num_finished != Saturating(0)
             || self.num_retryable != Saturating(0)
+            || self.num_dropped_on_blacklisted_account != Saturating(0)
     }
 
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.num_received = Saturating(0);
         self.num_buffered = Saturating(0);
         self.num_scheduled = Saturating(0);
@@ -233,6 +248,7 @@ impl SchedulerCountMetricsInner {
         self.num_dropped_on_capacity = Saturating(0);
         self.min_prioritization_fees = u64::MAX;
         self.max_prioritization_fees = 0;
+        self.num_dropped_on_blacklisted_account = Saturating(0);
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: MinMaxResult<u64>) {
@@ -268,8 +284,8 @@ impl SchedulerCountMetricsInner {
 
 #[derive(Default)]
 pub struct SchedulerTimingMetrics {
-    interval: IntervalSchedulerTimingMetrics,
-    slot: SlotSchedulerTimingMetrics,
+    pub interval: IntervalSchedulerTimingMetrics,
+    pub slot: SlotSchedulerTimingMetrics,
 }
 
 impl SchedulerTimingMetrics {
@@ -278,25 +294,25 @@ impl SchedulerTimingMetrics {
         update(&mut self.slot.metrics);
     }
 
-    pub fn maybe_report_and_reset_slot(&mut self, slot: Option<Slot>) {
-        self.slot.maybe_report_and_reset(slot);
+    pub fn maybe_report_and_reset_slot(&mut self, slot: Option<Slot>, bam_controller: bool) {
+        self.slot.maybe_report_and_reset(slot, bam_controller);
     }
 
-    pub fn maybe_report_and_reset_interval(&mut self, should_report: bool) {
-        self.interval.maybe_report_and_reset(should_report);
+    pub fn maybe_report_and_reset_interval(&mut self, should_report: bool, bam_controller: bool) {
+        self.interval.maybe_report_and_reset(should_report, bam_controller);
     }
 }
 
 #[derive(Default)]
-struct IntervalSchedulerTimingMetrics {
+pub struct IntervalSchedulerTimingMetrics {
     interval: AtomicInterval,
-    metrics: SchedulerTimingMetricsInner,
+    pub metrics: SchedulerTimingMetricsInner,
 }
 
 #[derive(Default)]
-struct SlotSchedulerTimingMetrics {
+pub struct SlotSchedulerTimingMetrics {
     slot: Option<Slot>,
-    metrics: SchedulerTimingMetricsInner,
+    pub metrics: SchedulerTimingMetricsInner,
 }
 
 #[derive(Default)]
@@ -320,11 +336,16 @@ pub struct SchedulerTimingMetricsInner {
 }
 
 impl IntervalSchedulerTimingMetrics {
-    fn maybe_report_and_reset(&mut self, should_report: bool) {
+    fn maybe_report_and_reset(&mut self, should_report: bool, bam_controller: bool) {
+        let name = if bam_controller {
+            "bam_banking_stage_scheduler_timing"
+        } else {
+            "banking_stage_scheduler_timing"
+        };
         const REPORT_INTERVAL_MS: u64 = 1000;
         if self.interval.should_update(REPORT_INTERVAL_MS) {
             if should_report {
-                self.metrics.report("banking_stage_scheduler_timing", None);
+                self.metrics.report(name, None);
             }
             self.metrics.reset();
         }
@@ -332,12 +353,17 @@ impl IntervalSchedulerTimingMetrics {
 }
 
 impl SlotSchedulerTimingMetrics {
-    fn maybe_report_and_reset(&mut self, slot: Option<Slot>) {
+    fn maybe_report_and_reset(&mut self, slot: Option<Slot>, bam_controller: bool) {
+        let name = if bam_controller {
+            "bam_banking_stage_scheduler_slot_timing"
+        } else {
+            "banking_stage_scheduler_slot_timing"
+        };
         if self.slot != slot {
             // Only report if there was an assigned slot.
             if self.slot.is_some() {
                 self.metrics
-                    .report("banking_stage_scheduler_slot_timing", self.slot);
+                    .report(name, self.slot);
             }
             self.metrics.reset();
             self.slot = slot;

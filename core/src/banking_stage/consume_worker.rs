@@ -1692,6 +1692,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
         let shared_leader_state = SharedLeaderState::new(0, None, None);

@@ -7,6 +7,7 @@ use qualifier_attr::qualifiers;
 use {
     self::{
         committer::Committer, consumer::Consumer, decision_maker::DecisionMaker,
+        house_keeper::TxOutputStatus,
         qos_service::QosService, vote_packet_receiver::VotePacketReceiver,
         vote_storage::VoteStorage,
     },
@@ -60,6 +61,7 @@ use {
 // Below modules are pub to allow use by banking_stage bench
 pub mod committer;
 pub mod consumer;
+pub mod house_keeper;
 pub mod leader_slot_metrics;
 pub mod qos_service;
 pub mod vote_storage;
@@ -388,11 +390,13 @@ impl BankingStage {
         log_messages_bytes_limit: Option<usize>,
         bank_forks: Arc<RwLock<BankForks>>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
+        output_tx_signature_sender: Option<Sender<TxOutputStatus>>,
     ) -> Self {
         let committer = Committer::new(
             transaction_status_sender,
             replay_vote_sender,
             prioritization_fee_cache,
+            output_tx_signature_sender,
         );
 
         let context = BankingStageContext {
@@ -864,6 +868,7 @@ mod tests {
             None,
             bank_forks,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -928,6 +933,7 @@ mod tests {
             None,
             bank_forks,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         trace!("sending bank");
         drop(non_vote_sender);
@@ -1000,6 +1006,7 @@ mod tests {
             None,
             bank_forks.clone(), // keep a local-copy of bank-forks so worker threads do not lose weak access to bank-forks
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
 
         // good tx, and no verify
@@ -1150,6 +1157,7 @@ mod tests {
                 None,
                 bank_forks,
                 Arc::new(PrioritizationFeeCache::new(0u64)),
+                None,
             );
 
             // wait for banking_stage to eat the packets
@@ -1302,6 +1310,7 @@ mod tests {
             None,
             bank_forks,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();

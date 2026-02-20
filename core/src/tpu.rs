@@ -6,6 +6,7 @@ use {
     crate::{
         admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
         banking_stage::{
+            house_keeper::HouseKeeper,
             transaction_scheduler::scheduler_controller::SchedulerConfig, BankingStage,
         },
         banking_trace::{Channels, TracerThread},
@@ -107,6 +108,7 @@ pub struct Tpu {
     sig_verifier: SigVerifier,
     vote_sigverify_stage: SigVerifyStage,
     banking_stage: Arc<RwLock<Option<BankingStage>>>,
+    house_keeper_thread: HouseKeeper,
     forwarding_stage: JoinHandle<()>,
     cluster_info_vote_listener: ClusterInfoVoteListener,
     broadcast_stage: BroadcastStage,
@@ -163,6 +165,7 @@ impl Tpu {
         enable_block_production_forwarding: bool,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
         key_notifiers: Arc<RwLock<KeyUpdaters>>,
+        tx_io_check: Option<String>,
         cancel: CancellationToken,
     ) -> Self {
         let TpuSockets {
@@ -275,6 +278,29 @@ impl Tpu {
             (None, None)
         };
 
+        const TX_IO_CHANNEL_SZIE: usize = 100_000;
+        let enable_tx_io_check = tx_io_check.is_some();
+        let (input_tx_signature_sender, input_tx_signature_receiver) = if enable_tx_io_check {
+            let (input_tx_signature_sender, input_tx_signature_receiver) =
+                bounded(TX_IO_CHANNEL_SZIE);
+            (
+                Some((input_tx_signature_sender, exit.clone())),
+                Some(input_tx_signature_receiver),
+            )
+        } else {
+            (None, None)
+        };
+        let (output_tx_signature_sender, output_tx_signature_receiver) = if enable_tx_io_check {
+            let (output_tx_signature_sender, output_tx_signature_receiver) =
+                bounded(TX_IO_CHANNEL_SZIE);
+            (
+                Some(output_tx_signature_sender),
+                Some(output_tx_signature_receiver),
+            )
+        } else {
+            (None, None)
+        };
+
         let (forward_stage_sender, forward_stage_receiver) = bounded(1024);
         let sig_verifier = if let Some(vortexor_receivers) = vortexor_receivers {
             info!("starting vortexor adapter");
@@ -292,6 +318,7 @@ impl Tpu {
             let verifier = TransactionSigVerifier::new(
                 non_vote_sender,
                 enable_block_production_forwarding.then(|| forward_stage_sender.clone()),
+                input_tx_signature_sender.clone(),
             );
             SigVerifier::Local(SigVerifyStage::new(
                 packet_receiver,
@@ -343,6 +370,14 @@ impl Tpu {
             log_messages_bytes_limit,
             bank_forks.clone(),
             prioritization_fee_cache.clone(),
+            output_tx_signature_sender,
+        );
+
+        let house_keeper_thread = HouseKeeper::new(
+            input_tx_signature_receiver,
+            output_tx_signature_receiver,
+            tx_io_check,
+            exit.clone(),
         );
 
         let SpawnForwardingStageResult {
@@ -401,6 +436,7 @@ impl Tpu {
             sig_verifier,
             vote_sigverify_stage,
             banking_stage: Arc::new(RwLock::new(Some(banking_stage))),
+            house_keeper_thread,
             forwarding_stage,
             cluster_info_vote_listener,
             broadcast_stage,
@@ -429,6 +465,7 @@ impl Tpu {
                 .take()
                 .expect("banking_stage must be Some")
                 .join(),
+            self.house_keeper_thread.join(),
             self.forwarding_stage.join(),
             self.staked_nodes_updater_service.join(),
             self.tpu_quic_t.map_or(Ok(()), |t| t.join()),

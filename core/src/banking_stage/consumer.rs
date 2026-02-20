@@ -1,6 +1,7 @@
 use {
     super::{
         committer::{CommitTransactionDetails, Committer},
+        house_keeper::{AggregatedTxError, TxOutputStatus},
         leader_slot_timing_metrics::LeaderExecuteAndCommitTimings,
         qos_service::QosService,
         scheduler_messages::MaxAge,
@@ -412,6 +413,35 @@ impl Consumer {
             // `extend` can cause that assumption to be violated.
             retryable_transaction_indexes.sort_unstable();
 
+            // TX Output Status Reporting (non-retryable failures only)
+            if let Some(output_tx_signature_sender) = &self.committer.output_tx_signature_sender {
+                let sanitized_transactions = batch.sanitized_transactions();
+                let _ = processing_results
+                    .iter()
+                    .zip(sanitized_transactions.iter())
+                    .for_each(|(processing_result, tx)| {
+                        if let Err(error) = processing_result {
+                            match error {
+                                TransactionError::AccountInUse
+                                | TransactionError::WouldExceedMaxBlockCostLimit
+                                | TransactionError::WouldExceedMaxVoteCostLimit
+                                | TransactionError::WouldExceedMaxAccountCostLimit
+                                | TransactionError::WouldExceedAccountDataBlockLimit => {
+                                    // retryable, skip
+                                }
+                                _ => {
+                                    let _ = output_tx_signature_sender.try_send(TxOutputStatus {
+                                        signature: tx.signature().to_string(),
+                                        status: Err(AggregatedTxError::ConventionalErrorCode(
+                                            error.clone(),
+                                        )),
+                                    });
+                                }
+                            }
+                        }
+                    });
+            }
+
             return ExecuteAndCommitTransactionsOutput {
                 transaction_counts,
                 retryable_transaction_indexes,
@@ -421,6 +451,39 @@ impl Consumer {
                 min_prioritization_fees,
                 max_prioritization_fees,
             };
+        }
+
+        // TX Output Status Reporting
+        if let Some(output_tx_signature_sender) = &self.committer.output_tx_signature_sender {
+            let sanitized_transactions = batch.sanitized_transactions();
+            let _ = processing_results
+                .iter()
+                .zip(sanitized_transactions.iter())
+                .for_each(|(processing_result, tx)| match processing_result {
+                    Ok(_) => {
+                        let _ = output_tx_signature_sender.try_send(TxOutputStatus {
+                            signature: tx.signature().to_string(),
+                            status: Ok(()),
+                        });
+                    }
+                    Err(error) => match error {
+                        TransactionError::AccountInUse
+                        | TransactionError::WouldExceedMaxBlockCostLimit
+                        | TransactionError::WouldExceedMaxVoteCostLimit
+                        | TransactionError::WouldExceedMaxAccountCostLimit
+                        | TransactionError::WouldExceedAccountDataBlockLimit => {
+                            // retryable, skip
+                        }
+                        _ => {
+                            let _ = output_tx_signature_sender.try_send(TxOutputStatus {
+                                signature: tx.signature().to_string(),
+                                status: Err(AggregatedTxError::ConventionalErrorCode(
+                                    error.clone(),
+                                )),
+                            });
+                        }
+                    },
+                });
         }
 
         let (commit_time_us, commit_transaction_statuses) =
@@ -586,6 +649,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
         consumer.process_and_record_transactions(&bank, &transactions)
@@ -666,6 +730,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
@@ -789,6 +854,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
@@ -848,6 +914,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
@@ -909,6 +976,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
@@ -1078,6 +1146,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
@@ -1307,6 +1376,7 @@ mod tests {
             None,
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder.clone(), QosService::new(1), None);
 
@@ -1431,6 +1501,7 @@ mod tests {
             }),
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 
@@ -1555,6 +1626,7 @@ mod tests {
             }),
             replay_vote_sender,
             Arc::new(PrioritizationFeeCache::new(0u64)),
+            None,
         );
         let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
 

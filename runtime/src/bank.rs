@@ -262,6 +262,15 @@ impl CollectorFeeDetails {
         self.transaction_fee.saturating_add(self.priority_fee)
     }
 
+    pub(crate) fn total_block_rewards(&self, fee_rate_governor: FeeRateGovernor) -> u64 {
+        let (deposit, _burn) = if self.transaction_fee != 0 {
+            fee_rate_governor.burn(self.transaction_fee)
+        } else {
+            (0, 0)
+        };
+        deposit.saturating_add(self.priority_fee)
+    }
+
     pub fn total_priority_fee(&self) -> u64 {
         self.priority_fee
     }
@@ -4562,9 +4571,13 @@ impl Bank {
             ("total_us", total_us, i64),
         );
         info!(
-            "bank frozen: {slot} hash: {hash} signature_count: {} last_blockhash: {} \
+            "bank frozen: {slot} block_rewards: {} hash: {hash} signature_count: {} last_blockhash: {} \
              capitalization: {}, accounts_lt_hash checksum: {accounts_lt_hash_checksum}, stats: \
              {bank_hash_stats:?}",
+            self.collector_fee_details
+                .read()
+                .unwrap()
+                .total_block_rewards(self.fee_rate_governor.clone()),
             self.signature_count(),
             self.last_blockhash(),
             self.capitalization(),

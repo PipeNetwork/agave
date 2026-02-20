@@ -61,6 +61,7 @@ pub(crate) struct ReceivingStats {
     pub num_dropped_on_already_processed: usize,
     pub num_dropped_on_fee_payer: usize,
     pub num_dropped_on_capacity: usize,
+    pub num_dropped_on_blacklisted_account: usize,
 
     pub num_buffered: usize,
 
@@ -80,6 +81,7 @@ impl ReceivingStats {
         self.num_dropped_on_already_processed += other.num_dropped_on_already_processed;
         self.num_dropped_on_fee_payer += other.num_dropped_on_fee_payer;
         self.num_dropped_on_capacity += other.num_dropped_on_capacity;
+        self.num_dropped_on_blacklisted_account += other.num_dropped_on_blacklisted_account;
         self.num_buffered += other.num_buffered;
 
         self.receive_time_us += other.receive_time_us;
@@ -140,6 +142,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_dropped_on_already_processed: 0,
             num_dropped_on_fee_payer: 0,
             num_dropped_on_capacity: 0,
+            num_dropped_on_blacklisted_account: 0,
             num_buffered: 0,
             receive_time_us: 0,
             buffer_time_us: 0,
@@ -216,6 +219,7 @@ impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
             num_dropped_on_already_processed: stats.num_dropped_on_already_processed,
             num_dropped_on_fee_payer: stats.num_dropped_on_fee_payer,
             num_dropped_on_capacity: stats.num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: stats.num_dropped_on_blacklisted_account,
             num_buffered: stats.num_buffered,
             receive_time_us: stats.receive_time_us,
             buffer_time_us: stats.buffer_time_us,
@@ -417,6 +421,7 @@ impl TransactionViewReceiveAndBuffer {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: 0,
             num_buffered,
             receive_time_us: 0, // receive is outside this function
             buffer_time_us: start.elapsed().as_micros() as u64,
@@ -759,6 +764,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -813,6 +819,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -856,6 +863,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -898,6 +906,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -945,6 +954,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1007,6 +1017,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1054,6 +1065,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1105,6 +1117,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
@@ -1184,6 +1197,7 @@ mod tests {
             num_dropped_on_already_processed,
             num_dropped_on_fee_payer,
             num_dropped_on_capacity,
+            num_dropped_on_blacklisted_account: _,
             num_buffered,
             receive_time_us: _,
             buffer_time_us: _,
