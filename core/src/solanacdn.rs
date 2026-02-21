@@ -1801,6 +1801,8 @@ pub struct SolanaCdnStatus {
     pub dropped_vote_datagrams_oversized_payload_total: u64,
     pub dropped_vote_datagrams_invalid_payload_total: u64,
     pub dropped_vote_datagrams_unexpected_dst_total: u64,
+    pub dropped_udp_shreds_unexpected_peer_total: u64,
+    pub dropped_udp_votes_unexpected_peer_total: u64,
     pub vote_tunnel_allowed_dsts_len: u64,
     pub last_shred_slot: Option<u64>,
     pub last_shred_timestamp_ms: Option<u64>,
@@ -1872,6 +1874,8 @@ pub struct SolanaCdnHandle {
     dropped_vote_datagrams_oversized_payload: AtomicU64,
     dropped_vote_datagrams_invalid_payload: AtomicU64,
     dropped_vote_datagrams_unexpected_dst: AtomicU64,
+    dropped_udp_shreds_unexpected_peer: AtomicU64,
+    dropped_udp_votes_unexpected_peer: AtomicU64,
     uplink_broadcast_lagged: AtomicU64,
     pop_endpoint_ips: DashSet<IpAddr>,
     pop_egress_ips: DashMap<IpAddr, u64>,
@@ -1940,6 +1944,8 @@ impl SolanaCdnHandle {
             dropped_vote_datagrams_oversized_payload: AtomicU64::new(0),
             dropped_vote_datagrams_invalid_payload: AtomicU64::new(0),
             dropped_vote_datagrams_unexpected_dst: AtomicU64::new(0),
+            dropped_udp_shreds_unexpected_peer: AtomicU64::new(0),
+            dropped_udp_votes_unexpected_peer: AtomicU64::new(0),
             uplink_broadcast_lagged: AtomicU64::new(0),
             pop_endpoint_ips: DashSet::new(),
             pop_egress_ips: DashMap::new(),
@@ -3796,6 +3802,18 @@ impl SolanaCdnHandle {
         self.cfg.udp_mode
     }
 
+    fn is_pop_egress_ip_fresh(&self, ip: IpAddr, now: u64) -> bool {
+        if let Some(entry) = self.pop_egress_ips.get(&ip) {
+            let expires_at = *entry;
+            drop(entry);
+            if expires_at >= now {
+                return true;
+            }
+            self.pop_egress_ips.remove(&ip);
+        }
+        false
+    }
+
     pub fn should_ignore_src_ip(&self, ip: IpAddr) -> bool {
         if ip.is_loopback() {
             return true;
@@ -3998,6 +4016,12 @@ impl SolanaCdnHandle {
         let dropped_vote_datagrams_unexpected_dst_total = self
             .dropped_vote_datagrams_unexpected_dst
             .load(Ordering::Relaxed);
+        let dropped_udp_shreds_unexpected_peer_total = self
+            .dropped_udp_shreds_unexpected_peer
+            .load(Ordering::Relaxed);
+        let dropped_udp_votes_unexpected_peer_total = self
+            .dropped_udp_votes_unexpected_peer
+            .load(Ordering::Relaxed);
         let vote_tunnel_allowed_dsts_len = self.vote_tunnel_allowed_dsts.len() as u64;
 
         let (rx_shred_payloads_per_sec, tunneled_vote_packets_per_sec) = {
@@ -4127,6 +4151,8 @@ impl SolanaCdnHandle {
             dropped_vote_datagrams_oversized_payload_total,
             dropped_vote_datagrams_invalid_payload_total,
             dropped_vote_datagrams_unexpected_dst_total,
+            dropped_udp_shreds_unexpected_peer_total,
+            dropped_udp_votes_unexpected_peer_total,
             vote_tunnel_allowed_dsts_len,
             last_shred_slot,
             last_shred_timestamp_ms,
@@ -4282,6 +4308,8 @@ impl SolanaCdnHandle {
             "dropped_vote_datagrams_oversized_payload_total": self.dropped_vote_datagrams_oversized_payload.load(Ordering::Relaxed) as i64,
             "dropped_vote_datagrams_invalid_payload_total": self.dropped_vote_datagrams_invalid_payload.load(Ordering::Relaxed) as i64,
             "dropped_vote_datagrams_unexpected_dst_total": self.dropped_vote_datagrams_unexpected_dst.load(Ordering::Relaxed) as i64,
+            "dropped_udp_shreds_unexpected_peer_total": self.dropped_udp_shreds_unexpected_peer.load(Ordering::Relaxed) as i64,
+            "dropped_udp_votes_unexpected_peer_total": self.dropped_udp_votes_unexpected_peer.load(Ordering::Relaxed) as i64,
             "vote_tunnel_allowed_dsts_len": self.vote_tunnel_allowed_dsts.len() as i64,
             "rx_tx_packets_total": self.rx_tx_packets.load(Ordering::Relaxed) as i64,
             "tx_injected_packets_total": self.tx_injected_packets.load(Ordering::Relaxed) as i64,
@@ -5949,6 +5977,20 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str(&format!(
         "solanacdn_vote_tunnel_allowed_dsts_len {}\n",
         status.vote_tunnel_allowed_dsts_len
+    ));
+
+    out.push_str("# HELP solanacdn_udp_shreds_dropped_unexpected_peer_total UDP shred datagrams dropped due to unexpected peer IP\n");
+    out.push_str("# TYPE solanacdn_udp_shreds_dropped_unexpected_peer_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_udp_shreds_dropped_unexpected_peer_total {}\n",
+        status.dropped_udp_shreds_unexpected_peer_total
+    ));
+
+    out.push_str("# HELP solanacdn_udp_votes_dropped_unexpected_peer_total UDP vote datagrams dropped due to unexpected peer IP\n");
+    out.push_str("# TYPE solanacdn_udp_votes_dropped_unexpected_peer_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_udp_votes_dropped_unexpected_peer_total {}\n",
+        status.dropped_udp_votes_unexpected_peer_total
     ));
 
     out.push_str("# HELP solanacdn_tx_fair_ordering_enabled Whether fair transaction ordering is enabled (0/1)\n");
@@ -7697,12 +7739,20 @@ async fn run_pop_session(
                     continue;
                 }
 
+                let now = now_ms();
+                let peer_ip = peer.ip();
+                if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
+                    handle
+                        .dropped_udp_shreds_unexpected_peer
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
                 // Avoid building FEC state for non-publisher sessions.
                 if *publisher_rx.borrow() != Some(endpoint) {
                     continue;
                 }
 
-                let now = now_ms();
                 match msg {
                     PopToAgent::PushShredFecChunk(chunk) => {
                         if !cfg.inject_shreds {
@@ -7811,7 +7861,7 @@ async fn run_pop_session(
         Some(tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
-                let (len, _peer) = match sock.recv_from(&mut buf).await {
+                let (len, peer) = match sock.recv_from(&mut buf).await {
                     Ok(v) => v,
                     Err(_) => return,
                 };
@@ -7822,6 +7872,14 @@ async fn run_pop_session(
                         Err(_) => continue,
                     };
                 if token != udp_token {
+                    continue;
+                }
+                let now = now_ms();
+                let peer_ip = peer.ip();
+                if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
+                    handle
+                        .dropped_udp_votes_unexpected_peer
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 handle_pop_msg(
