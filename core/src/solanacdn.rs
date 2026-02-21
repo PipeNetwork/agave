@@ -2007,9 +2007,7 @@ impl SolanaCdnHandle {
     }
 
     fn should_dedup_tx_sig(&self, sig: [u8; 64], now: u64) -> bool {
-        if self.recent_tx_sigs.len() > TX_SIG_DEDUP_MAX_ENTRIES {
-            self.recent_tx_sigs.clear();
-        }
+        self.prune_recent_tx_sigs_if_needed(now);
         if let Some(entry) = self.recent_tx_sigs.get(&sig) {
             let expired = *entry < now;
             drop(entry);
@@ -2022,11 +2020,27 @@ impl SolanaCdnHandle {
     }
 
     fn note_dedup_tx_sig(&self, sig: [u8; 64], now: u64) {
+        self.prune_recent_tx_sigs_if_needed(now);
+        self.recent_tx_sigs
+            .insert(sig, now.saturating_add(TX_DEDUP_TTL_MS));
+    }
+
+    fn prune_recent_tx_sigs_if_needed(&self, now: u64) {
+        if self.recent_tx_sigs.len() <= TX_SIG_DEDUP_MAX_ENTRIES {
+            return;
+        }
+        let mut expired: Vec<[u8; 64]> = Vec::new();
+        for entry in self.recent_tx_sigs.iter().take(4096) {
+            if *entry.value() < now {
+                expired.push(*entry.key());
+            }
+        }
+        for key in expired {
+            self.recent_tx_sigs.remove(&key);
+        }
         if self.recent_tx_sigs.len() > TX_SIG_DEDUP_MAX_ENTRIES {
             self.recent_tx_sigs.clear();
         }
-        self.recent_tx_sigs
-            .insert(sig, now.saturating_add(TX_DEDUP_TTL_MS));
     }
 
     fn should_dedup_vote_payload(&self, dst: SocketAddr, payload: &[u8], now: u64) -> bool {
@@ -2035,9 +2049,7 @@ impl SolanaCdnHandle {
         if ttl_ms == 0 || max_entries == 0 {
             return false;
         }
-        if self.recent_vote_payloads.len() > max_entries {
-            self.recent_vote_payloads.clear();
-        }
+        self.prune_recent_vote_payloads_if_needed(now, max_entries);
         let key = vote_dedup_key(&dst, payload);
         if let Some(entry) = self.recent_vote_payloads.get(&key) {
             let expired = *entry < now;
@@ -2052,6 +2064,24 @@ impl SolanaCdnHandle {
         false
     }
 
+    fn prune_recent_vote_payloads_if_needed(&self, now: u64, max_entries: usize) {
+        if self.recent_vote_payloads.len() <= max_entries {
+            return;
+        }
+        let mut expired: Vec<u128> = Vec::new();
+        for entry in self.recent_vote_payloads.iter().take(4096) {
+            if *entry.value() < now {
+                expired.push(*entry.key());
+            }
+        }
+        for key in expired {
+            self.recent_vote_payloads.remove(&key);
+        }
+        if self.recent_vote_payloads.len() > max_entries {
+            self.recent_vote_payloads.clear();
+        }
+    }
+
     fn note_vote_tunnel_allowed_dst(&self, dst: SocketAddr, now: u64) {
         if !self.cfg.vote_tunnel {
             return;
@@ -2059,13 +2089,29 @@ impl SolanaCdnHandle {
         if VOTE_TUNNEL_ALLOWED_DST_TTL_MS == 0 || VOTE_TUNNEL_ALLOWED_DST_MAX_ENTRIES == 0 {
             return;
         }
-        if self.vote_tunnel_allowed_dsts.len() > VOTE_TUNNEL_ALLOWED_DST_MAX_ENTRIES {
-            self.vote_tunnel_allowed_dsts.clear();
-        }
+        self.prune_vote_tunnel_allowed_dsts_if_needed(now);
         self.vote_tunnel_allowed_dsts.insert(
             dst,
             now.saturating_add(VOTE_TUNNEL_ALLOWED_DST_TTL_MS),
         );
+    }
+
+    fn prune_vote_tunnel_allowed_dsts_if_needed(&self, now: u64) {
+        if self.vote_tunnel_allowed_dsts.len() <= VOTE_TUNNEL_ALLOWED_DST_MAX_ENTRIES {
+            return;
+        }
+        let mut expired: Vec<SocketAddr> = Vec::new();
+        for entry in self.vote_tunnel_allowed_dsts.iter().take(1024) {
+            if *entry.value() < now {
+                expired.push(*entry.key());
+            }
+        }
+        for key in expired {
+            self.vote_tunnel_allowed_dsts.remove(&key);
+        }
+        if self.vote_tunnel_allowed_dsts.len() > VOTE_TUNNEL_ALLOWED_DST_MAX_ENTRIES {
+            self.vote_tunnel_allowed_dsts.clear();
+        }
     }
 
     pub fn is_connected(&self) -> bool {
