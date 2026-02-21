@@ -7859,14 +7859,16 @@ async fn run_pop_session(
                     Err(_) => return,
                 };
                 let bytes = &buf[..len];
-                let (token, msg): ([u8; solanacdn_protocol::udp::UDP_TOKEN_LEN], PopToAgent) =
-                    match solanacdn_protocol::udp::decode_udp_datagram(bytes) {
+                if !bytes.starts_with(&udp_token) {
+                    continue;
+                }
+                let msg: PopToAgent =
+                    match solanacdn_protocol::frame::decode_envelope(&bytes
+                        [solanacdn_protocol::udp::UDP_TOKEN_LEN..])
+                    {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                if token != udp_token {
-                    continue;
-                }
                 if let PopToAgent::DirectShredsProbe { .. } = msg {
                     // Only learn/update egress IPs when direct POP→validator injection is enabled
                     // for the current publisher session. This avoids letting non-publisher sessions
@@ -8015,14 +8017,16 @@ async fn run_pop_session(
                     Err(_) => return,
                 };
                 let bytes = &buf[..len];
-                let (token, msg): ([u8; solanacdn_protocol::udp::UDP_TOKEN_LEN], PopToAgent) =
-                    match solanacdn_protocol::udp::decode_udp_datagram(bytes) {
+                if !bytes.starts_with(&udp_token) {
+                    continue;
+                }
+                let msg: PopToAgent =
+                    match solanacdn_protocol::frame::decode_envelope(&bytes
+                        [solanacdn_protocol::udp::UDP_TOKEN_LEN..])
+                    {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                if token != udp_token {
-                    continue;
-                }
                 let now = now_ms();
                 let peer_ip = peer.ip();
                 if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
