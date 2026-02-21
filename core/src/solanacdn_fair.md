@@ -4,6 +4,9 @@ This document describes the fairness contract implemented by the Agave validator
 SolanaCDN fair ordering is enabled (CLI `--fair`, `--fair-slashing`, `--fair-slashing-strict`,
 `--fair-slashing-witness`, `--fair-slashing-enforce`, or `--fair-max-protection`).
 
+In this fork, `--fair` enables **maximum protection** against malicious leaders (equivalent to
+`--fair-max-protection`).
+
 ## Goal (retail user outcome)
 
 Provide a stable, replayable **relative order** for transactions delivered via SolanaCDN to a given
@@ -133,7 +136,7 @@ equivocation) trigger vote withholding for the violating leader/slot.
 If your goal is “best possible outcome for retail” (minimize same-slot front-run/back-run around
 fair flow), run auditors with:
 
-- `--fair-max-protection` (recommended), or manually enable:
+- `--fair` (recommended; enables max protection), or manually enable:
 - `--fair-require-target-slot` (make all fair batches slot-bound/auditable)
 - `--fair-slashing --fair-slashing-enforce`
 - `--fair-slashing-strict` (no insertion ahead of the fair prefix; no committed drops)

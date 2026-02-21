@@ -648,7 +648,8 @@ pub fn execute(
         if let Ok(v) = value_t!(matches, "solanacdn_vote_dedup_max_entries", usize) {
             cfg.vote_dedup_max_entries = if v == 0 { 0 } else { v.min(2_000_000) };
         }
-        let fair_max_protection = matches.is_present("fair_max_protection");
+        // In this fork, `--fair` means maximum protection against malicious leaders.
+        let fair_max_protection = matches.is_present("fair_max_protection") || matches.is_present("fair");
         let fair_require_target_slot =
             matches.is_present("fair_require_target_slot") || fair_max_protection;
         let fair_slashing_enforce = matches.is_present("fair_slashing_enforce") || fair_max_protection;

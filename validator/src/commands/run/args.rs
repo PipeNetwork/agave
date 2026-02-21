@@ -1407,8 +1407,9 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("fair")
             .takes_value(false)
             .help(
-                "EXPERIMENTAL: Enable fair transaction ordering for flow submitted via \
-                 SolanaCDN (requires SolanaCDN POP/control/API token configuration)",
+                "EXPERIMENTAL: Enable fair transaction ordering for flow submitted via SolanaCDN \
+                 with maximum protection against malicious leaders (equivalent to \
+                 --fair-max-protection; requires SolanaCDN POP/control/API token configuration)",
             ),
     )
     .arg(
@@ -1437,7 +1438,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("fair-max-protection")
             .takes_value(false)
             .help(
-                "EXPERIMENTAL: Enable maximum fair-ordering protections against malicious leaders \
+                "EXPERIMENTAL: Explicit alias for --fair. Enable maximum fair-ordering protections against malicious leaders \
                  (implies --fair-require-target-slot, --fair-slashing-enforce, --fair-slashing-strict, \
                  --fair-slashing-witness, --fair-slashing-nonresponse, --fair-slashing-fence-reads, and \
                  --fair-slashing-publish-witness-memos; defaults witness quorum to 2 unless \
