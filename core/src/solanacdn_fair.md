@@ -7,6 +7,21 @@ SolanaCDN fair ordering is enabled (CLI `--fair`, `--fair-slashing`, `--fair-sla
 In this fork, `--fair` enables **maximum protection** against malicious leaders (equivalent to
 `--fair-max-protection`).
 
+## In this fork: `--fair` defaults
+
+`--fair` enables fair ordering **and** turns on the full set of protections:
+
+- `--fair-require-target-slot`
+- `--fair-slashing-enforce`
+- `--fair-slashing-strict`
+- `--fair-slashing-witness`
+- `--fair-slashing-nonresponse`
+- `--fair-slashing-fence-reads` (implies `--fair-slashing-fence`)
+- `--fair-slashing-publish-witness-memos`
+- `--fair-slashing-witness-quorum` defaults to `2` (override explicitly if desired)
+
+Enforcement is implemented as **vote withholding** on detected violations (not stake slashing).
+
 ## Goal (retail user outcome)
 
 Provide a stable, replayable **relative order** for transactions delivered via SolanaCDN to a given
@@ -56,11 +71,16 @@ When `--fair-slashing` is enabled and the batch includes a `target_slot`:
 
 - The leader writes **memo-program** transaction(s) committing to `(batch_id, order_start, tx
   signatures...)` for that slot. These commits are chunked and self-validating.
+- The leader may also write **memo-program** transactions for:
+  - `ACK` (`tx_count`, Merkle root, `target_slot`, `order_start`) and
+  - `REJECT` (batch-level rejection reason).
+- Validators (auditors) may optionally publish POP witness receipts as memo transactions (see
+  `--fair-slashing-publish-witness-memos`).
 - The leader also sends a signed `FairBatchCommit` back to the POP (and may attach a receipt commit
   containing `tx_count` and a Merkle root of signatures).
 
 If you want all fair flow to be *slot-bound* (so it is always auditable/slashable), enable
-`--fair-require-target-slot` (implied by `--fair-max-protection`).
+`--fair-require-target-slot` (implied by `--fair` / `--fair-max-protection` in this fork).
 
 The validator audits slots it produced by reading entries from blockstore and checking for
 **overtakes**: a transaction with a higher committed `order_ix` must not appear ahead of one with a
@@ -74,12 +94,18 @@ is observed.
 When strict mode is enabled, the leader’s ledger commit becomes a stronger contract:
 
 - **No insertion ahead of the fair prefix:** except for vote transactions and the fair-commit memo
-  transactions themselves, the committed fair transaction list must appear as a prefix in the
-  target slot. Inserting other non-vote transactions “in front” of the committed fair list is a
-  violation.
+  transactions themselves (and other **valid fair metadata memos** like ACK/REJECT/WITNESS), the
+  committed fair transaction list must appear as a prefix in the target slot. Inserting other
+  non-vote transactions “in front” of the committed fair list is a violation.
 - **No committed drops:** every committed fair transaction signature must land in the target slot
   (missing tail is a violation).
 - **Missing commit chunks are violations:** partial/fragmented ledger commits do not pass audit.
+
+Note: valid fair metadata memo transactions are treated as exempt even if they land in a different
+slot than the one they reference, to avoid strict-mode false positives from “mis-slotted” memos.
+
+Auditors also treat a slot as strict when they have **receipt evidence** for it (leader ACKs, and/or
+POP witnesses when non-response mode is enabled), even if `--fair-slashing-strict` is not set.
 
 ### Account fence (`--fair-slashing-fence`)
 
@@ -100,6 +126,8 @@ commits and claim non-receipt). Witness mode adds:
   (`tx_count`, Merkle root, `target_slot`, `order_start`).
 - A **POP-signed witness stream** (`FairBatchWitness`, protocol v6+) binding the leader identity to
   the POP attestation payload.
+- Optional **on-chain ACK memos** (`SCDNACKD`) and **REJECT memos** (`SCDNRJCT`) that make receipt
+  evidence replayable from the ledger.
 - Optional **on-chain witness memos** (`SCDNWITN`) that allow third parties to publish POP witness
   receipts to the ledger for replayable audits.
   - Validators can optionally publish these memos when receiving witness receipts via
@@ -113,6 +141,7 @@ Auditors subscribe to both and treat it as a violation if:
   violation; prevents leader-side insertion/dropping/rewrite of the attested list).
 - When an ACK is present for a leader+slot, auditors apply **strict** ledger audit rules for that
   slot (no non-vote insertion ahead of the committed fair prefix; no committed drops).
+- A leader must not both **ACK and REJECT** the same batch ID for a given `(leader, slot)`.
 
 This mode shifts trust assumptions: slashing requires leader-signed ACK evidence, so a malicious
 POP witness alone cannot frame a leader, but witnesses remain necessary for cross-checking ACKs.
@@ -131,12 +160,19 @@ require at least `N` distinct witnesses before using witness evidence for non-re
 When `--fair-slashing-enforce` is enabled, fair-ordering violations (ledger audit failure or commit
 equivocation) trigger vote withholding for the violating leader/slot.
 
+Commit equivocation includes signing conflicting fair order receipts for the same `(leader, slot,
+order_ix)` mapping (off-chain `FairBatchCommit` stream), and/or emitting conflicting on-chain commit
+chunks for the same batch/chunk.
+
 ## Recommended: maximum protection vs malicious leaders
 
 If your goal is “best possible outcome for retail” (minimize same-slot front-run/back-run around
 fair flow), run auditors with:
 
-- `--fair` (recommended; enables max protection), or manually enable:
+- `--fair`
+
+Equivalent manual configuration:
+
 - `--fair-require-target-slot` (make all fair batches slot-bound/auditable)
 - `--fair-slashing --fair-slashing-enforce`
 - `--fair-slashing-strict` (no insertion ahead of the fair prefix; no committed drops)
@@ -144,7 +180,7 @@ fair flow), run auditors with:
   non-receipt)
 - `--fair-slashing-witness-quorum N` (recommended `N>=2` when multiple POP witnesses exist)
 - `--fair-slashing-fence --fair-slashing-fence-reads` (same-slot account fence)
-- `--fair-slashing-publish-witness-memos` (optional replayable witness evidence on-chain)
+- `--fair-slashing-publish-witness-memos` (replayable witness evidence on-chain; adds load/fees)
 
 ## Limitations / non-goals
 
