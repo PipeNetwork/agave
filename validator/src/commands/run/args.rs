@@ -165,6 +165,7 @@ impl FromClapArgMatches for RunArgs {
             || matches.is_present("solanacdn_no_repair")
             || matches.is_present("fair")
             || matches.is_present("fair_slashing")
+            || matches.is_present("fair_max_protection")
             || matches.is_present("fair_slashing_strict")
             || matches.is_present("fair_slashing_witness")
             || matches.is_present("fair_slashing_nonresponse")
@@ -1421,6 +1422,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("fair_max_protection")
+            .long("fair-max-protection")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Enable maximum fair-ordering protections against malicious leaders \
+                 (implies --fair-slashing-enforce, --fair-slashing-strict, --fair-slashing-witness, \
+                 --fair-slashing-nonresponse, --fair-slashing-fence-reads, and \
+                 --fair-slashing-publish-witness-memos; defaults witness quorum to 2 unless \
+                 explicitly set).",
+            ),
+    )
+    .arg(
         Arg::with_name("fair_slashing_strict")
             .long("fair-slashing-strict")
             .takes_value(false)
@@ -1941,11 +1954,34 @@ mod tests {
     }
 
     #[test]
+    fn fair_max_protection_requires_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_parse_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--fair-max-protection"],
+        );
+    }
+
+    #[test]
     fn fair_slashing_accepts_api_token() {
         let default_run_args = RunArgs::default();
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
             vec!["--solanacdn-api-token", "pk_test_dummy", "--fair-slashing"],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn fair_max_protection_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-max-protection",
+            ],
             default_run_args,
         );
     }

@@ -648,13 +648,15 @@ pub fn execute(
         if let Ok(v) = value_t!(matches, "solanacdn_vote_dedup_max_entries", usize) {
             cfg.vote_dedup_max_entries = if v == 0 { 0 } else { v.min(2_000_000) };
         }
-        let fair_slashing_enforce = matches.is_present("fair_slashing_enforce");
-        let fair_slashing_strict = matches.is_present("fair_slashing_strict");
-        let fair_slashing_witness = matches.is_present("fair_slashing_witness");
-        let fair_slashing_nonresponse = matches.is_present("fair_slashing_nonresponse");
+        let fair_max_protection = matches.is_present("fair_max_protection");
+        let fair_slashing_enforce = matches.is_present("fair_slashing_enforce") || fair_max_protection;
+        let fair_slashing_strict = matches.is_present("fair_slashing_strict") || fair_max_protection;
+        let fair_slashing_witness = matches.is_present("fair_slashing_witness") || fair_max_protection;
+        let fair_slashing_nonresponse =
+            matches.is_present("fair_slashing_nonresponse") || fair_max_protection;
         let fair_slashing_publish_witness_memos =
-            matches.is_present("fair_slashing_publish_witness_memos");
-        let fair_slashing_fence_reads = matches.is_present("fair_slashing_fence_reads");
+            matches.is_present("fair_slashing_publish_witness_memos") || fair_max_protection;
+        let fair_slashing_fence_reads = matches.is_present("fair_slashing_fence_reads") || fair_max_protection;
         let fair_slashing_fence = matches.is_present("fair_slashing_fence") || fair_slashing_fence_reads;
         let fair_slashing =
             matches.is_present("fair_slashing")
@@ -671,6 +673,8 @@ pub fn execute(
         cfg.tx_fair_slashing_publish_witness_memos = fair_slashing_publish_witness_memos;
         if let Ok(v) = value_t!(matches, "fair_slashing_witness_quorum", u8) {
             cfg.tx_fair_slashing_witness_quorum = v.max(1);
+        } else if fair_max_protection {
+            cfg.tx_fair_slashing_witness_quorum = 2;
         }
         cfg.tx_fair_slashing_fence = fair_slashing_fence;
         cfg.tx_fair_slashing_fence_reads = fair_slashing_fence_reads;
