@@ -83,6 +83,8 @@ const FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID: Pubkey =
 const FAIR_LEDGER_COMMIT_MAGIC: [u8; 8] = *b"SCDNFAIR";
 const FAIR_LEDGER_COMMIT_VERSION: u8 = 1;
 const FAIR_LEDGER_COMMIT_MAX_SIGS_PER_CHUNK: usize = 12;
+const FAIR_LEDGER_ACK_MAGIC: [u8; 8] = *b"SCDNACKD";
+const FAIR_LEDGER_ACK_VERSION: u8 = 1;
 const FAIR_LEDGER_REJECT_MAGIC: [u8; 8] = *b"SCDNRJCT";
 const FAIR_LEDGER_REJECT_VERSION: u8 = 1;
 
@@ -236,6 +238,60 @@ impl FairLedgerRejectMemo {
 
     fn verify(&self) -> bool {
         if self.payload.magic != FAIR_LEDGER_REJECT_MAGIC || self.payload.version != FAIR_LEDGER_REJECT_VERSION {
+            return false;
+        }
+        let bytes = match bincode::serialize(&self.payload) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let verifying_key = match VerifyingKey::from_bytes(&self.payload.leader_pubkey.0) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        verifying_key
+            .verify_strict(
+                &bytes,
+                &ed25519_dalek_v2::Signature::from_bytes(&self.signature.0),
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FairLedgerAckMemoPayload {
+    magic: [u8; 8],
+    version: u8,
+    slot: u64,
+    origin_pop_id_hash: [u8; 32],
+    flow_id: u128,
+    batch_id: u128,
+    order_start: u64,
+    tx_count: u32,
+    tx_merkle_root: [u8; 32],
+    leader_pubkey: PubkeyBytes,
+    leader_time_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FairLedgerAckMemo {
+    payload: FairLedgerAckMemoPayload,
+    signature: SignatureBytes,
+}
+
+impl FairLedgerAckMemo {
+    fn sign(payload: FairLedgerAckMemoPayload, signing_key: &SigningKey) -> Option<Self> {
+        let bytes = bincode::serialize(&payload).ok()?;
+        let signature = signing_key.sign(&bytes);
+        Some(Self {
+            payload,
+            signature: SignatureBytes(signature.to_bytes()),
+        })
+    }
+
+    fn verify(&self) -> bool {
+        if self.payload.magic != FAIR_LEDGER_ACK_MAGIC
+            || self.payload.version != FAIR_LEDGER_ACK_VERSION
+        {
             return false;
         }
         let bytes = match bincode::serialize(&self.payload) {
@@ -522,6 +578,60 @@ fn build_fair_ledger_commit_memo_txs(
         }
     }
     out
+}
+
+fn build_fair_ledger_ack_memo_tx(
+    auth: &AuthContext,
+    recent_blockhash: solana_hash::Hash,
+    slot: u64,
+    origin_pop_id: &str,
+    flow_id: u128,
+    batch_id: u128,
+    order_start: u64,
+    tx_count: u32,
+    tx_merkle_root: [u8; 32],
+) -> Option<Vec<u8>> {
+    if slot == 0 || tx_count == 0 {
+        return None;
+    }
+
+    let leader_time_ms = now_ms();
+    let leader_pubkey = auth.validator_pubkey;
+    let origin_pop_id_hash = sha256_bytes(origin_pop_id.as_bytes());
+
+    let payload = FairLedgerAckMemoPayload {
+        magic: FAIR_LEDGER_ACK_MAGIC,
+        version: FAIR_LEDGER_ACK_VERSION,
+        slot,
+        origin_pop_id_hash,
+        flow_id,
+        batch_id,
+        order_start,
+        tx_count,
+        tx_merkle_root,
+        leader_pubkey,
+        leader_time_ms,
+    };
+    let memo = FairLedgerAckMemo::sign(payload, &auth.signing_key)?;
+    let memo_bytes = bincode::serialize(&memo).ok()?;
+
+    let cu_price = ComputeBudgetInstruction::set_compute_unit_price(10_000);
+    let memo_ix = Instruction {
+        program_id: FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID,
+        accounts: Vec::new(),
+        data: memo_bytes,
+    };
+    let message = Message::new(&[cu_price, memo_ix], Some(&auth.identity_keypair.pubkey()));
+    let signers = vec![auth.identity_keypair.as_ref()];
+    let tx = Transaction::new(&signers, message, recent_blockhash);
+    if let Some(sig) = tx
+        .signatures
+        .get(0)
+        .and_then(|s| s.as_ref().try_into().ok())
+    {
+        insert_fair_priority(sig, u64::MAX);
+    }
+    bincode::serialize(&tx).ok()
 }
 
 fn build_fair_ledger_reject_memo_tx(
@@ -2340,7 +2450,7 @@ impl SolanaCdnHandle {
         let vote_program_id = solana_vote_program::id();
         let witness_quorum = (self.cfg.tx_fair_slashing_witness_quorum.max(1) as usize)
             .min(FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH);
-        let ack_batches: Option<HashMap<u128, FairAckBatch>> = self
+        let offchain_ack_batches: Option<HashMap<u128, FairAckBatch>> = self
             .cfg
             .tx_fair_slashing_witness
             .then(|| {
@@ -2414,18 +2524,13 @@ impl SolanaCdnHandle {
                 Some(entry.batches.clone())
             })
             .flatten();
-        // When we have external receipt evidence for this leader+slot (leader ACKs and/or POP
-        // witnesses), treat the slot audit as strict to punish insertion ahead of the committed
-        // fair prefix and committed drops.
-        let strict = self.cfg.tx_fair_slashing_strict
-            || ack_batches.is_some()
-            || witness_batches.is_some();
 
         let mut slot_txs: Vec<SlotTx> = Vec::new();
         let mut batch_order_start: HashMap<u128, u64> = HashMap::new();
         let mut batch_chunk_total: HashMap<u128, u16> = HashMap::new();
         let mut chunk_sigs: HashMap<(u128, u16), Vec<[u8; 64]>> = HashMap::new();
         let mut chunk_commit_sigs: HashMap<(u128, u16), [u8; 64]> = HashMap::new();
+        let mut onchain_ack_batches: HashMap<u128, FairAckBatch> = HashMap::new();
         let mut onchain_reject_batches: HashMap<u128, FairRejectBatch> = HashMap::new();
 
         for entry in entries {
@@ -2452,6 +2557,7 @@ impl SolanaCdnHandle {
                 let mut memo_only = true;
                 let mut saw_vote = false;
                 let mut saw_valid_fair_commit_chunk = false;
+                let mut saw_valid_fair_ack_memo = false;
                 let mut saw_valid_fair_reject_memo = false;
 
                 for ix in instructions {
@@ -2551,6 +2657,57 @@ impl SolanaCdnHandle {
                                 chunk.payload.tx_sigs.into_iter().map(|sig| sig.0).collect();
                             chunk_sigs.insert(key, sigs);
                         }
+                    } else if data.len() >= FAIR_LEDGER_ACK_MAGIC.len()
+                        && &data[..FAIR_LEDGER_ACK_MAGIC.len()] == FAIR_LEDGER_ACK_MAGIC
+                    {
+                        let Ok(memo) = bincode::deserialize::<FairLedgerAckMemo>(data) else {
+                            memo_only = false;
+                            continue;
+                        };
+
+                        if !memo.verify() {
+                            memo_only = false;
+                            continue;
+                        }
+                        if memo.payload.slot != slot {
+                            memo_only = false;
+                            continue;
+                        }
+                        if memo.payload.leader_pubkey != expected_leader {
+                            memo_only = false;
+                            continue;
+                        }
+                        saw_valid_fair_ack_memo = true;
+
+                        if self.cfg.tx_fair_slashing_witness {
+                            let batch_id = memo.payload.batch_id;
+                            let ack = FairAckBatch {
+                                origin_pop_id_hash: memo.payload.origin_pop_id_hash,
+                                flow_id: memo.payload.flow_id,
+                                tx_count: memo.payload.tx_count,
+                                tx_merkle_root: memo.payload.tx_merkle_root,
+                                order_start: memo.payload.order_start,
+                                leader_time_ms: memo.payload.leader_time_ms,
+                            };
+                            if let Some(existing) = onchain_ack_batches.get(&batch_id) {
+                                if existing.origin_pop_id_hash != ack.origin_pop_id_hash
+                                    || existing.flow_id != ack.flow_id
+                                    || existing.order_start != ack.order_start
+                                    || existing.tx_count != ack.tx_count
+                                    || existing.tx_merkle_root != ack.tx_merkle_root
+                                {
+                                    self.mark_fair_slashed(
+                                        expected_leader,
+                                        slot,
+                                        ack.order_start,
+                                        now_ms(),
+                                    );
+                                    return false;
+                                }
+                            } else {
+                                onchain_ack_batches.insert(batch_id, ack);
+                            }
+                        }
                     } else if data.len() >= FAIR_LEDGER_REJECT_MAGIC.len()
                         && &data[..FAIR_LEDGER_REJECT_MAGIC.len()] == FAIR_LEDGER_REJECT_MAGIC
                     {
@@ -2608,7 +2765,9 @@ impl SolanaCdnHandle {
                 let is_vote_exempt = has_non_compute_ix && vote_only && saw_vote;
                 let is_fair_memo_exempt = has_non_compute_ix
                     && memo_only
-                    && (saw_valid_fair_commit_chunk || saw_valid_fair_reject_memo);
+                    && (saw_valid_fair_commit_chunk
+                        || saw_valid_fair_ack_memo
+                        || saw_valid_fair_reject_memo);
 
                 slot_txs.push(SlotTx {
                     sig0,
@@ -2616,6 +2775,33 @@ impl SolanaCdnHandle {
                 });
             }
         }
+
+        let ack_batches: Option<HashMap<u128, FairAckBatch>> = if self.cfg.tx_fair_slashing_witness {
+            let mut merged: HashMap<u128, FairAckBatch> =
+                offchain_ack_batches.unwrap_or_default();
+            for (batch_id, ack) in onchain_ack_batches.into_iter() {
+                match merged.entry(batch_id) {
+                    std::collections::hash_map::Entry::Occupied(occ) => {
+                        let existing = occ.get();
+                        if existing.origin_pop_id_hash != ack.origin_pop_id_hash
+                            || existing.flow_id != ack.flow_id
+                            || existing.order_start != ack.order_start
+                            || existing.tx_count != ack.tx_count
+                            || existing.tx_merkle_root != ack.tx_merkle_root
+                        {
+                            self.mark_fair_slashed(expected_leader, slot, ack.order_start, now);
+                            return false;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(vac) => {
+                        vac.insert(ack);
+                    }
+                }
+            }
+            (!merged.is_empty()).then_some(merged)
+        } else {
+            None
+        };
 
         let reject_batches: Option<HashMap<u128, FairRejectBatch>> = {
             let mut merged: HashMap<u128, FairRejectBatch> = offchain_reject_batches
@@ -2831,6 +3017,13 @@ impl SolanaCdnHandle {
                 }
             }
         }
+
+        // When we have external receipt evidence for this leader+slot (leader ACKs and/or POP
+        // witnesses), treat the slot audit as strict to punish insertion ahead of the committed
+        // fair prefix and committed drops.
+        let strict = self.cfg.tx_fair_slashing_strict
+            || ack_batches.is_some()
+            || witness_batches.is_some();
 
         if batch_order_start.is_empty() {
             return true;
@@ -7736,6 +7929,20 @@ async fn handle_pop_msg(
 
                 if let Some(slot) = target_slot {
                     if let Some(recent_blockhash) = recent_blockhash {
+                        if let Some(ack_tx_bytes) = build_fair_ledger_ack_memo_tx(
+                            auth,
+                            recent_blockhash,
+                            slot,
+                            &origin_pop_id,
+                            flow_id,
+                            batch_id,
+                            order_start,
+                            expected_tx_count,
+                            tx_merkle_root,
+                        ) {
+                            let _ = udp_inject_tpu.send(&ack_tx_bytes).await;
+                        }
+
                         let commit_txs = build_fair_ledger_commit_memo_txs(
                             auth,
                             recent_blockhash,
@@ -9143,6 +9350,62 @@ mod tests {
     }
 
     #[test]
+    fn fair_ledger_audit_onchain_ack_missing_onchain_commit_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let slot = 42;
+        let origin_pop_id = "pop-test-1";
+        let flow_id = 0u128;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+        let sigs: Vec<[u8; 64]> = vec![[1u8; 64], [2u8; 64]];
+        let tx_count = sigs.len() as u32;
+        let tx_merkle_root = fair_merkle_root(sigs.as_slice());
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        let recent_blockhash = solana_hash::Hash::default();
+        let ack_tx_bytes = build_fair_ledger_ack_memo_tx(
+            &auth,
+            recent_blockhash,
+            slot,
+            origin_pop_id,
+            flow_id,
+            batch_id,
+            order_start,
+            tx_count,
+            tx_merkle_root,
+        )
+        .expect("ack memo tx bytes");
+        let ack_tx: Transaction = bincode::deserialize(&ack_tx_bytes).expect("ack memo tx");
+
+        // No on-chain commit memos in this slot => violation when on-chain leader ACK is present.
+        let signer = Keypair::new();
+        let tx = Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![ack_tx.into(), VersionedTransaction::from(tx).into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
     fn fair_slashing_ack_witness_mismatch_is_violation() {
         let leader_identity = Arc::new(Keypair::new());
         let leader = leader_identity.pubkey();
@@ -9505,6 +9768,101 @@ mod tests {
         let entry = solana_entry::entry::Entry {
             transactions: vec![
                 commit_tx.into(),
+                inserted_tx.into(),
+                tx_a.into(),
+                tx_b.into(),
+            ],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
+    fn fair_ledger_audit_onchain_ack_enables_strict_audit_insertion_ahead_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let slot = 42;
+        let origin_pop_id = "pop-test-1";
+        let flow_id = 0u128;
+        let batch_id = 7u128;
+        let order_start = 0u64;
+        let recent_blockhash = solana_hash::Hash::default();
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let sigs = vec![sig_a, sig_b];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_strict = false;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        let ack_tx_bytes = build_fair_ledger_ack_memo_tx(
+            &auth,
+            recent_blockhash,
+            slot,
+            origin_pop_id,
+            flow_id,
+            batch_id,
+            order_start,
+            sigs.len() as u32,
+            fair_merkle_root(sigs.as_slice()),
+        )
+        .expect("ack memo tx bytes");
+        let ack_tx: Transaction = bincode::deserialize(&ack_tx_bytes).expect("ack memo tx");
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs.as_slice(),
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let inserted_signer = Keypair::new();
+        let inserted_tx = Transaction::new(
+            &[&inserted_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(42)],
+                Some(&inserted_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![
+                commit_tx.into(),
+                ack_tx.into(),
                 inserted_tx.into(),
                 tx_a.into(),
                 tx_b.into(),
