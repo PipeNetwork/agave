@@ -652,7 +652,8 @@ pub fn execute(
         let fair_slashing_strict = matches.is_present("fair_slashing_strict");
         let fair_slashing_witness = matches.is_present("fair_slashing_witness");
         let fair_slashing_nonresponse = matches.is_present("fair_slashing_nonresponse");
-        let fair_slashing_fence = matches.is_present("fair_slashing_fence");
+        let fair_slashing_fence_reads = matches.is_present("fair_slashing_fence_reads");
+        let fair_slashing_fence = matches.is_present("fair_slashing_fence") || fair_slashing_fence_reads;
         let fair_slashing =
             matches.is_present("fair_slashing")
                 || fair_slashing_enforce
@@ -664,7 +665,11 @@ pub fn execute(
         cfg.tx_fair_slashing_strict = fair_slashing_strict;
         cfg.tx_fair_slashing_witness = fair_slashing_witness;
         cfg.tx_fair_slashing_nonresponse = fair_slashing_nonresponse;
+        if let Ok(v) = value_t!(matches, "fair_slashing_witness_quorum", u8) {
+            cfg.tx_fair_slashing_witness_quorum = v.max(1);
+        }
         cfg.tx_fair_slashing_fence = fair_slashing_fence;
+        cfg.tx_fair_slashing_fence_reads = fair_slashing_fence_reads;
         cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
         cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();

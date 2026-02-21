@@ -169,6 +169,8 @@ impl FromClapArgMatches for RunArgs {
             || matches.is_present("fair_slashing_witness")
             || matches.is_present("fair_slashing_nonresponse")
             || matches.is_present("fair_slashing_fence")
+            || matches.is_present("fair_slashing_fence_reads")
+            || matches.is_present("fair_slashing_witness_quorum")
             || matches.is_present("fair_slashing_enforce"))
             && !has_solanacdn_discovery
         {
@@ -1454,6 +1456,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("fair_slashing_witness_quorum")
+            .long("fair-slashing-witness-quorum")
+            .value_name("N")
+            .takes_value(true)
+            .help(
+                "EXPERIMENTAL: Require at least N distinct POP witnesses before using POP witness \
+                 evidence for slashing decisions (ACK↔witness mismatch and non-response slashing). \
+                 Values less than 1 are treated as 1. Takes effect only with \
+                 --fair-slashing-witness and/or --fair-slashing-nonresponse.",
+            ),
+    )
+    .arg(
         Arg::with_name("fair_slashing_fence")
             .long("fair-slashing-fence")
             .takes_value(false)
@@ -1462,6 +1476,16 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  non-fair transactions must not write-lock any non-signer account written by a \
                  committed fair transaction in that slot (implies --fair-slashing). Use with \
                  care; can reduce vote participation if triggered.",
+            ),
+    )
+    .arg(
+        Arg::with_name("fair_slashing_fence_reads")
+            .long("fair-slashing-fence-reads")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Extend the fair account-fence to also include non-signer read-only \
+                 accounts accessed by committed fair transactions (implies --fair-slashing-fence). \
+                 Use with care; can reduce vote participation if triggered.",
             ),
     )
     .arg(
@@ -2020,6 +2044,29 @@ mod tests {
                 "--solanacdn-api-token",
                 "pk_test_dummy",
                 "--fair-slashing-fence",
+            ],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn fair_slashing_fence_reads_requires_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_parse_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--fair-slashing-fence-reads"],
+        );
+    }
+
+    #[test]
+    fn fair_slashing_fence_reads_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-slashing-fence-reads",
             ],
             default_run_args,
         );
