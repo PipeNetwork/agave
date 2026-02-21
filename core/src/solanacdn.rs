@@ -1812,7 +1812,9 @@ pub struct SolanaCdnStatus {
     pub dropped_vote_datagrams_invalid_payload_total: u64,
     pub dropped_vote_datagrams_unexpected_dst_total: u64,
     pub dropped_udp_shreds_unexpected_peer_total: u64,
+    pub dropped_udp_shreds_unexpected_msg_total: u64,
     pub dropped_udp_votes_unexpected_peer_total: u64,
+    pub dropped_udp_votes_unexpected_msg_total: u64,
     pub vote_tunnel_allowed_dsts_len: u64,
     pub last_shred_slot: Option<u64>,
     pub last_shred_timestamp_ms: Option<u64>,
@@ -1886,7 +1888,9 @@ pub struct SolanaCdnHandle {
     dropped_vote_datagrams_invalid_payload: AtomicU64,
     dropped_vote_datagrams_unexpected_dst: AtomicU64,
     dropped_udp_shreds_unexpected_peer: AtomicU64,
+    dropped_udp_shreds_unexpected_msg: AtomicU64,
     dropped_udp_votes_unexpected_peer: AtomicU64,
+    dropped_udp_votes_unexpected_msg: AtomicU64,
     uplink_broadcast_lagged: AtomicU64,
     pop_endpoint_ips: DashSet<IpAddr>,
     pop_egress_ips: DashMap<IpAddr, u64>,
@@ -1957,7 +1961,9 @@ impl SolanaCdnHandle {
             dropped_vote_datagrams_invalid_payload: AtomicU64::new(0),
             dropped_vote_datagrams_unexpected_dst: AtomicU64::new(0),
             dropped_udp_shreds_unexpected_peer: AtomicU64::new(0),
+            dropped_udp_shreds_unexpected_msg: AtomicU64::new(0),
             dropped_udp_votes_unexpected_peer: AtomicU64::new(0),
+            dropped_udp_votes_unexpected_msg: AtomicU64::new(0),
             uplink_broadcast_lagged: AtomicU64::new(0),
             pop_endpoint_ips: DashSet::new(),
             pop_egress_ips: DashMap::new(),
@@ -4057,8 +4063,14 @@ impl SolanaCdnHandle {
         let dropped_udp_shreds_unexpected_peer_total = self
             .dropped_udp_shreds_unexpected_peer
             .load(Ordering::Relaxed);
+        let dropped_udp_shreds_unexpected_msg_total = self
+            .dropped_udp_shreds_unexpected_msg
+            .load(Ordering::Relaxed);
         let dropped_udp_votes_unexpected_peer_total = self
             .dropped_udp_votes_unexpected_peer
+            .load(Ordering::Relaxed);
+        let dropped_udp_votes_unexpected_msg_total = self
+            .dropped_udp_votes_unexpected_msg
             .load(Ordering::Relaxed);
         let vote_tunnel_allowed_dsts_len = self.vote_tunnel_allowed_dsts.len() as u64;
 
@@ -4191,7 +4203,9 @@ impl SolanaCdnHandle {
             dropped_vote_datagrams_invalid_payload_total,
             dropped_vote_datagrams_unexpected_dst_total,
             dropped_udp_shreds_unexpected_peer_total,
+            dropped_udp_shreds_unexpected_msg_total,
             dropped_udp_votes_unexpected_peer_total,
+            dropped_udp_votes_unexpected_msg_total,
             vote_tunnel_allowed_dsts_len,
             last_shred_slot,
             last_shred_timestamp_ms,
@@ -4349,7 +4363,9 @@ impl SolanaCdnHandle {
             "dropped_vote_datagrams_invalid_payload_total": self.dropped_vote_datagrams_invalid_payload.load(Ordering::Relaxed) as i64,
             "dropped_vote_datagrams_unexpected_dst_total": self.dropped_vote_datagrams_unexpected_dst.load(Ordering::Relaxed) as i64,
             "dropped_udp_shreds_unexpected_peer_total": self.dropped_udp_shreds_unexpected_peer.load(Ordering::Relaxed) as i64,
+            "dropped_udp_shreds_unexpected_msg_total": self.dropped_udp_shreds_unexpected_msg.load(Ordering::Relaxed) as i64,
             "dropped_udp_votes_unexpected_peer_total": self.dropped_udp_votes_unexpected_peer.load(Ordering::Relaxed) as i64,
+            "dropped_udp_votes_unexpected_msg_total": self.dropped_udp_votes_unexpected_msg.load(Ordering::Relaxed) as i64,
             "vote_tunnel_allowed_dsts_len": self.vote_tunnel_allowed_dsts.len() as i64,
             "rx_tx_packets_total": self.rx_tx_packets.load(Ordering::Relaxed) as i64,
             "tx_injected_packets_total": self.tx_injected_packets.load(Ordering::Relaxed) as i64,
@@ -6043,11 +6059,25 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.dropped_udp_shreds_unexpected_peer_total
     ));
 
+    out.push_str("# HELP solanacdn_udp_shreds_dropped_unexpected_msg_total UDP shred datagrams dropped due to unexpected message types\n");
+    out.push_str("# TYPE solanacdn_udp_shreds_dropped_unexpected_msg_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_udp_shreds_dropped_unexpected_msg_total {}\n",
+        status.dropped_udp_shreds_unexpected_msg_total
+    ));
+
     out.push_str("# HELP solanacdn_udp_votes_dropped_unexpected_peer_total UDP vote datagrams dropped due to unexpected peer IP\n");
     out.push_str("# TYPE solanacdn_udp_votes_dropped_unexpected_peer_total counter\n");
     out.push_str(&format!(
         "solanacdn_udp_votes_dropped_unexpected_peer_total {}\n",
         status.dropped_udp_votes_unexpected_peer_total
+    ));
+
+    out.push_str("# HELP solanacdn_udp_votes_dropped_unexpected_msg_total UDP vote datagrams dropped due to unexpected message types\n");
+    out.push_str("# TYPE solanacdn_udp_votes_dropped_unexpected_msg_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_udp_votes_dropped_unexpected_msg_total {}\n",
+        status.dropped_udp_votes_unexpected_msg_total
     ));
 
     out.push_str("# HELP solanacdn_tx_fair_ordering_enabled Whether fair transaction ordering is enabled (0/1)\n");
@@ -7851,6 +7881,12 @@ async fn run_pop_session(
                                     Ok(v) => v,
                                     Err(_) => continue,
                                 };
+                            if !matches!(decoded, PopToAgent::PushShredBatch(_)) {
+                                handle
+                                    .dropped_udp_shreds_unexpected_msg
+                                    .fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             handle_pop_msg(
                                 endpoint,
                                 pop_pubkey,
@@ -7872,7 +7908,7 @@ async fn run_pop_session(
                             .await;
                         }
                     }
-                    other => {
+                    other @ PopToAgent::PushShredBatch(_) => {
                         handle_pop_msg(
                             endpoint,
                             pop_pubkey,
@@ -7892,6 +7928,11 @@ async fn run_pop_session(
                             other,
                         )
                         .await;
+                    }
+                    _ => {
+                        handle
+                            .dropped_udp_shreds_unexpected_msg
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
 
@@ -7941,6 +7982,12 @@ async fn run_pop_session(
                 if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
                     handle
                         .dropped_udp_votes_unexpected_peer
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if !matches!(msg, PopToAgent::PushVoteDatagram(_)) {
+                    handle
+                        .dropped_udp_votes_unexpected_msg
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
