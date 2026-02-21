@@ -56,6 +56,9 @@ When `--fair-slashing` is enabled and the batch includes a `target_slot`:
 - The leader also sends a signed `FairBatchCommit` back to the POP (and may attach a receipt commit
   containing `tx_count` and a Merkle root of signatures).
 
+If you want all fair flow to be *slot-bound* (so it is always auditable/slashable), enable
+`--fair-require-target-slot` (implied by `--fair-max-protection`).
+
 The validator audits slots it produced by reading entries from blockstore and checking for
 **overtakes**: a transaction with a higher committed `order_ix` must not appear ahead of one with a
 lower committed `order_ix`.
@@ -131,6 +134,7 @@ If your goal is “best possible outcome for retail” (minimize same-slot front
 fair flow), run auditors with:
 
 - `--fair-max-protection` (recommended), or manually enable:
+- `--fair-require-target-slot` (make all fair batches slot-bound/auditable)
 - `--fair-slashing --fair-slashing-enforce`
 - `--fair-slashing-strict` (no insertion ahead of the fair prefix; no committed drops)
 - `--fair-slashing-witness --fair-slashing-nonresponse` (ACK-required slashing + witnessed

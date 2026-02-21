@@ -164,6 +164,7 @@ impl FromClapArgMatches for RunArgs {
             || solanacdn_race_requested
             || matches.is_present("solanacdn_no_repair")
             || matches.is_present("fair")
+            || matches.is_present("fair_require_target_slot")
             || matches.is_present("fair_slashing")
             || matches.is_present("fair_max_protection")
             || matches.is_present("fair_slashing_strict")
@@ -1411,6 +1412,16 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("fair_require_target_slot")
+            .long("fair-require-target-slot")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Reject fair batches that omit a target_slot hint (implies --fair). \
+                 Slashing/auditing modes rely on target_slot to bind receipts to a specific \
+                 leader slot.",
+            ),
+    )
+    .arg(
         Arg::with_name("fair_slashing")
             .long("fair-slashing")
             .takes_value(false)
@@ -1427,8 +1438,8 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .takes_value(false)
             .help(
                 "EXPERIMENTAL: Enable maximum fair-ordering protections against malicious leaders \
-                 (implies --fair-slashing-enforce, --fair-slashing-strict, --fair-slashing-witness, \
-                 --fair-slashing-nonresponse, --fair-slashing-fence-reads, and \
+                 (implies --fair-require-target-slot, --fair-slashing-enforce, --fair-slashing-strict, \
+                 --fair-slashing-witness, --fair-slashing-nonresponse, --fair-slashing-fence-reads, and \
                  --fair-slashing-publish-witness-memos; defaults witness quorum to 2 unless \
                  explicitly set).",
             ),
@@ -1940,6 +1951,29 @@ mod tests {
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
             vec!["--solanacdn-api-token", "pk_test_dummy", "--fair"],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn fair_require_target_slot_requires_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_parse_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--fair-require-target-slot"],
+        );
+    }
+
+    #[test]
+    fn fair_require_target_slot_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-require-target-slot",
+            ],
             default_run_args,
         );
     }

@@ -649,6 +649,8 @@ pub fn execute(
             cfg.vote_dedup_max_entries = if v == 0 { 0 } else { v.min(2_000_000) };
         }
         let fair_max_protection = matches.is_present("fair_max_protection");
+        let fair_require_target_slot =
+            matches.is_present("fair_require_target_slot") || fair_max_protection;
         let fair_slashing_enforce = matches.is_present("fair_slashing_enforce") || fair_max_protection;
         let fair_slashing_strict = matches.is_present("fair_slashing_strict") || fair_max_protection;
         let fair_slashing_witness = matches.is_present("fair_slashing_witness") || fair_max_protection;
@@ -679,7 +681,9 @@ pub fn execute(
         cfg.tx_fair_slashing_fence = fair_slashing_fence;
         cfg.tx_fair_slashing_fence_reads = fair_slashing_fence_reads;
         cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
-        cfg.tx_fair_ordering = matches.is_present("fair") || fair_slashing;
+        cfg.tx_fair_require_target_slot = fair_require_target_slot;
+        cfg.tx_fair_ordering =
+            matches.is_present("fair") || matches.is_present("fair_require_target_slot") || fair_slashing;
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
 
         cfg.race_enabled = matches

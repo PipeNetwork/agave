@@ -767,10 +767,6 @@ async fn try_send_fair_batch_reject(
     target_slot: Option<u64>,
     reason: FairBatchRejectReason,
 ) {
-    if target_slot.is_none() {
-        return;
-    }
-
     let leader_time_ms = now_ms();
     let payload = FairBatchRejectPayload {
         origin_pop_id: origin_pop_id.to_string(),
@@ -963,6 +959,11 @@ pub struct SolanaCdnConfig {
     pub vote_dedup_max_entries: usize,
     /// If enabled, accept POP fair micro-batches and enforce receipt-based ordering.
     pub tx_fair_ordering: bool,
+    /// If enabled (in addition to `tx_fair_ordering`), reject fair batches that omit a
+    /// `target_slot`.
+    ///
+    /// Slashing/auditing relies on `target_slot` to bind receipts to a specific leader slot.
+    pub tx_fair_require_target_slot: bool,
     /// If enabled, subscribe to leader-signed fair ordering commits and audit the ledger for fair
     /// ordering violations (records evidence/counters only).
     pub tx_fair_slashing: bool,
@@ -1044,6 +1045,7 @@ impl SolanaCdnConfig {
             vote_dedup_ttl_ms: DEFAULT_VOTE_DEDUP_TTL_MS,
             vote_dedup_max_entries: DEFAULT_VOTE_DEDUP_MAX_ENTRIES,
             tx_fair_ordering: false,
+            tx_fair_require_target_slot: false,
             tx_fair_slashing: false,
             tx_fair_slashing_strict: false,
             tx_fair_slashing_witness: false,
@@ -1094,6 +1096,7 @@ impl Default for SolanaCdnConfig {
             vote_dedup_ttl_ms: DEFAULT_VOTE_DEDUP_TTL_MS,
             vote_dedup_max_entries: DEFAULT_VOTE_DEDUP_MAX_ENTRIES,
             tx_fair_ordering: false,
+            tx_fair_require_target_slot: false,
             tx_fair_slashing: false,
             tx_fair_slashing_strict: false,
             tx_fair_slashing_witness: false,
@@ -1605,6 +1608,7 @@ pub struct SolanaCdnStatus {
     pub connected_pops: Vec<String>,
     pub publisher_switches_total: u64,
     pub tx_fair_ordering: bool,
+    pub tx_fair_require_target_slot: bool,
     pub tx_fair_slashing: bool,
     pub tx_fair_slashing_strict: bool,
     pub tx_fair_slashing_witness: bool,
@@ -3781,6 +3785,7 @@ impl SolanaCdnHandle {
         let publisher = self.publisher_endpoint.load_full().map(|p| (*p).clone());
         let publisher_switches_total = self.publisher_switches_total.load(Ordering::Relaxed);
         let tx_fair_ordering = self.cfg.tx_fair_ordering;
+        let tx_fair_require_target_slot = self.cfg.tx_fair_require_target_slot;
         let tx_fair_slashing = self.cfg.tx_fair_slashing;
         let tx_fair_slashing_strict = self.cfg.tx_fair_slashing_strict;
         let tx_fair_slashing_witness = self.cfg.tx_fair_slashing_witness;
@@ -3915,6 +3920,7 @@ impl SolanaCdnHandle {
             connected_pops: pops,
             publisher_switches_total,
             tx_fair_ordering,
+            tx_fair_require_target_slot,
             tx_fair_slashing,
             tx_fair_slashing_strict,
             tx_fair_slashing_witness,
@@ -5744,6 +5750,17 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str(&format!(
         "solanacdn_tx_fair_ordering_enabled {}\n",
         if status.tx_fair_ordering { 1 } else { 0 }
+    ));
+
+    out.push_str("# HELP solanacdn_tx_fair_require_target_slot_enabled Whether fair batches are required to include a target_slot (0/1)\n");
+    out.push_str("# TYPE solanacdn_tx_fair_require_target_slot_enabled gauge\n");
+    out.push_str(&format!(
+        "solanacdn_tx_fair_require_target_slot_enabled {}\n",
+        if status.tx_fair_require_target_slot {
+            1
+        } else {
+            0
+        }
     ));
 
     out.push_str("# HELP solanacdn_tx_fair_batch_received_total Total transactions received in fair batches\n");
@@ -7867,6 +7884,36 @@ async fn handle_pop_msg(
                 // land on-chain.
                 let mut recent_blockhash: Option<solana_hash::Hash> =
                     handle.fair_recent_blockhash();
+
+                if cfg.tx_fair_require_target_slot && target_slot.is_none() {
+                    debug!(
+                        "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; missing target_slot (required)"
+                    );
+                    try_send_fair_batch_reject(
+                        &ctrl_out_tx,
+                        auth,
+                        &origin_pop_id,
+                        flow_id,
+                        batch_id,
+                        tx_seq_start,
+                        target_slot,
+                        FairBatchRejectReason::Unknown,
+                    )
+                    .await;
+                    try_inject_fair_batch_reject_memo(
+                        udp_inject_tpu,
+                        auth,
+                        recent_blockhash,
+                        &origin_pop_id,
+                        flow_id,
+                        batch_id,
+                        tx_seq_start,
+                        target_slot,
+                        FairBatchRejectReason::Unknown,
+                    )
+                    .await;
+                    return;
+                }
 
                 if let Err(e) = attestation.verify(pop_pubkey) {
                     debug!(
@@ -11192,6 +11239,7 @@ mod tests {
         assert!(text.contains("solanacdn_rx_vote_packets_total "));
         assert!(text.contains("solanacdn_dropped_vote_datagrams_total "));
         assert!(text.contains("solanacdn_tx_fair_ordering_enabled "));
+        assert!(text.contains("solanacdn_tx_fair_require_target_slot_enabled "));
         assert!(text.contains("solanacdn_tx_fair_batch_received_total "));
         assert!(text.contains("solanacdn_tx_fair_batch_injected_total "));
         assert!(text.contains("solanacdn_tx_fair_batch_inject_failed_total "));
