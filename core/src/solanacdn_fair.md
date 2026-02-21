@@ -43,10 +43,12 @@ This does **not** attempt to define a cluster-wide total order across leaders.
 - **Observers**: optional third parties that ingest the same evidence streams and/or replay the
   ledger to independently check audits.
 
-## End-to-end workflow (happy path)
+## End-to-end workflows
 
 Under `--fair` in this fork, the fair flow is **slot-bound** (`target_slot` is required), so every
 batch has replayable audit evidence.
+
+### Accept path (commit)
 
 ```text
 Retail client        POP                         Leader (slot S)                Ledger/Blockstore        Auditors
@@ -69,8 +71,45 @@ Retail client        POP                         Leader (slot S)                
     |                 |                                |                              | enforce (votes)   |
 ```
 
-If the leader rejects the batch, it emits a leader-signed `REJECT` (and may also publish an
-on-chain reject memo) instead of committing/injecting the batch.
+### Reject path
+
+```text
+Retail client        POP                         Leader (slot S)                Ledger/Blockstore        Auditors
+    |                 |                                |                              |                   |
+    | submit txs      |                                |                              |                   |
+    |---------------->| build POP-signed FairBatch     |                              |                   |
+    |                 |------------------------------->| verify attestation + wire txs|                   |
+    |                 |                                | decide REJECT (batch-level)  |                   |
+    |                 |<-------------------------------| off-chain REJECT stream       |                   |
+    |                 |                                | inject on-chain REJECT memo   |----> memo ------->|
+    |                 |                                | (no COMMIT chunks, no txs)    |                   |
+    |                 |                                |                              | audit: rejected   |
+    |                 |                                |                              | batch_id must not |
+    |                 |                                |                              | have on-chain commit |
+```
+
+A leader must not both **ACK and REJECT** the same `(leader, slot, batch_id)`, and must not
+REJECT a batch that it also committed on-chain.
+
+### Non-response path (witnessed delivery, no commit/reject)
+
+```text
+Retail client        POP                         Leader (slot S)                Ledger/Blockstore        Auditors
+    |                 |                                |                              |                   |
+    | submit txs      |                                |                              |                   |
+    |---------------->| build POP-signed FairBatch     |                              |                   |
+    |                 |------------------------------->| (delivery attempt)            |                   |
+    |                 |------------------------------->|/auditors: POP Witness stream  |                   |
+    |                 |                                | (leader stays silent)         |                   |
+    |                 |                                | no ACK/REJECT/COMMIT          |                   |
+    |                 |                                |                              | audit slot S: if  |
+    |                 |                                |                              | quorum witness AND|
+    |                 |                                |                              | no commit/reject =>|
+    |                 |                                |                              | vote withhold     |
+```
+
+This is the “ledger can’t prove non-receipt” case: auditors need quorum POP witness receipts to
+slash non-response.
 
 ## Core contract (what is “fair”)
 
@@ -352,6 +391,33 @@ Key metrics (Prometheus) include:
 - `solanacdn_fair_batch_dropped_*`
 - `solanacdn_fair_ledger_audit_*`
 
+## Auditor runbook (alerts + triage)
+
+### Suggested alerts (PromQL examples)
+
+- **Any fair audit failures (page):**
+  - `increase(solanacdn_fair_ledger_audit_failed_total[5m]) > 0`
+- **Fair audit failure ratio (page):**
+  - `increase(solanacdn_fair_ledger_audit_failed_total[10m]) / clamp_min(increase(solanacdn_fair_ledger_audit_checked_total[10m]), 1) > 0`
+- **Blockstore read failures during audit (page):**
+  - `increase(solanacdn_fair_ledger_audit_get_slot_entries_failed_total[5m]) > 0`
+- **Inconclusive audits (should be ~0 under `--fair` because strict is always on in this fork) (ticket):**
+  - `increase(solanacdn_fair_ledger_audit_inconclusive_total[30m]) > 0`
+
+### Triage checklist
+
+- Confirm flags are actually enabled on the auditor:
+  - `solanacdn_tx_fair_ordering_enabled == 1`
+  - `solanacdn_tx_fair_slashing_enabled == 1`
+  - `solanacdn_tx_fair_slashing_enforce_enabled == 1`
+- If `solanacdn_fair_ledger_audit_get_slot_entries_failed_total` is incrementing, treat it as a
+  node health issue (blockstore read failures) rather than leader malice.
+- If `solanacdn_fair_ledger_audit_failed_total` increments:
+  - expect vote withholding (see `solanacdn_fair_votes_withheld_total`) and logs like
+    `solanacdn: detected fair ordering violation; withholding votes ...`
+  - the failure is either (a) real leader misbehavior, or (b) a reliability issue causing missing
+    required metadata/txs under strict rules (e.g., ACK exists but commit chunks didn’t land).
+
 ## Appendix: fair ledger memo formats
 
 SolanaCDN fair slashing metadata is carried as **memo-program** transactions using program id:
@@ -418,3 +484,22 @@ Auditors reconstruct the committed signature list by concatenating chunks in inc
   - `witness_pop_pubkey: [u8; 32]`
   - `witness: FairBatchWitness` (contains POP-signed evidence binding leader identity to an
     attestation and delivery time; verified via `witness.verify(witness_pop_pubkey)`)
+
+### Test vectors (memo instruction `data` hex)
+
+These are **example memo instruction `data` bytes** (the memo instruction payload), encoded as
+`bincode`. They are intended for decoder/interoperability testing.
+
+Parameters used:
+
+- leader signing key: `09` repeated 32 bytes (ed25519), `leader_time_ms=1234567890`
+- witness POP signing key: `07` repeated 32 bytes (ed25519), `created_at_ms=111`, `pop_time_ms=222`
+- `slot=42`, `flow_id=0`, `batch_id=7`, `order_start=0`, `origin_pop_id="pop-test-1"`
+- `tx_sigs=[[01..01] (64 bytes), [02..02] (64 bytes)]`, `tx_count=2`
+
+```text
+SCDNFAIR(commit_chunk_v1)=5343444e46414952012a00000000000000070000000000000000000000000000000000000000000000000001000200000000000000400000000000000001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101400000000000000002020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618d20296490000000040000000000000003beaa6b94d7792c3c49b3730f82787560db22f967bbb764c4b10eebc8ad9daf6123c0a00db63ef369e77983ee59fe8bbc6947b15c747dd5f1716627637357f04
+SCDNACKD(ack_memo_v1)=5343444e41434b44012a000000000000008f486e5f857b7da6b54eed59c8cc8baae0925800b73fba5aaa1aa29bf1d091e90000000000000000000000000000000007000000000000000000000000000000000000000000000002000000df7699a77a088690c7c4c50792be798e1a9f28028b31bf0b9398037733e0d201fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618d20296490000000040000000000000006ef83e8df22ae6d971ac9a6e880f418d15774f8701de2e4ad09e6bf24681377fe472b5e38d567e8168ddf9acbecd19c2b2f212f9b1a437cf63ead036cbb8b405
+SCDNRJCT(reject_memo_v1)=5343444e524a4354012a000000000000008f486e5f857b7da6b54eed59c8cc8baae0925800b73fba5aaa1aa29bf1d091e90000000000000000000000000000000007000000000000000000000000000000000000000000000008000000fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618d202964900000000400000000000000003b767ed173c2a8239533f1adc6837028b17dfcd3e38450494941b9fcf2d022e7c284ad68426805c92531ae032d8347540e9ff644ab1a725434b95baf7b3cd0c
+SCDNWITN(witness_memo_v1)=5343444e5749544e01ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c0a00000000000000706f702d746573742d310000000000000000000000000000000007000000000000000000000000000000000000000000000002000000df7699a77a088690c7c4c50792be798e1a9f28028b31bf0b9398037733e0d2016f000000000000000000012a00000000000000fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618de000000000000004000000000000000039a824e9e7518516f31c9f70dd62894aa204097e8eb915af9bf5b81b29a30c73eaac2aa2f7921568adbac190a1a8a0446350e58c33f7a7b828bcb528032a80d
+```
