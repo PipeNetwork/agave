@@ -168,6 +168,7 @@ impl FromClapArgMatches for RunArgs {
             || matches.is_present("fair_slashing_strict")
             || matches.is_present("fair_slashing_witness")
             || matches.is_present("fair_slashing_nonresponse")
+            || matches.is_present("fair_slashing_publish_witness_memos")
             || matches.is_present("fair_slashing_fence")
             || matches.is_present("fair_slashing_fence_reads")
             || matches.is_present("fair_slashing_witness_quorum")
@@ -1456,6 +1457,17 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("fair_slashing_publish_witness_memos")
+            .long("fair-slashing-publish-witness-memos")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Publish POP witness receipts as on-chain memo transactions for \
+                 replayable audits (implies --fair-slashing). This increases transaction load \
+                 and pays fees from the validator identity keypair. Takes effect only with \
+                 --fair-slashing-witness and/or --fair-slashing-nonresponse.",
+            ),
+    )
+    .arg(
         Arg::with_name("fair_slashing_witness_quorum")
             .long("fair-slashing-witness-quorum")
             .value_name("N")
@@ -1952,7 +1964,11 @@ mod tests {
         let default_run_args = RunArgs::default();
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
-            vec!["--solanacdn-api-token", "pk_test_dummy", "--fair-slashing-enforce"],
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-slashing-enforce",
+            ],
             default_run_args,
         );
     }
@@ -2021,6 +2037,29 @@ mod tests {
                 "--solanacdn-api-token",
                 "pk_test_dummy",
                 "--fair-slashing-nonresponse",
+            ],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn fair_slashing_publish_witness_memos_requires_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_parse_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--fair-slashing-publish-witness-memos"],
+        );
+    }
+
+    #[test]
+    fn fair_slashing_publish_witness_memos_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-slashing-publish-witness-memos",
             ],
             default_run_args,
         );
@@ -2105,7 +2144,11 @@ mod tests {
         let default_run_args = RunArgs::default();
         verify_args_struct_by_command_run_with_identity_setup(
             default_run_args.clone(),
-            vec!["--solanacdn-api-token", "pk_test_dummy", "--solanacdn-hybrid"],
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--solanacdn-hybrid",
+            ],
             default_run_args,
         );
     }

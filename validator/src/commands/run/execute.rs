@@ -34,8 +34,8 @@ use {
         banking_trace::DISABLED_BAKING_TRACE_DIR,
         consensus::tower_storage,
         repair::repair_handler::RepairHandlerType,
-        solanacdn::SolanaCdnConfig,
         snapshot_packager_service::SnapshotPackagerService,
+        solanacdn::SolanaCdnConfig,
         system_monitor_service::SystemMonitorService,
         tpu::MAX_VOTES_PER_SECOND,
         validator::{
@@ -652,6 +652,8 @@ pub fn execute(
         let fair_slashing_strict = matches.is_present("fair_slashing_strict");
         let fair_slashing_witness = matches.is_present("fair_slashing_witness");
         let fair_slashing_nonresponse = matches.is_present("fair_slashing_nonresponse");
+        let fair_slashing_publish_witness_memos =
+            matches.is_present("fair_slashing_publish_witness_memos");
         let fair_slashing_fence_reads = matches.is_present("fair_slashing_fence_reads");
         let fair_slashing_fence = matches.is_present("fair_slashing_fence") || fair_slashing_fence_reads;
         let fair_slashing =
@@ -660,11 +662,13 @@ pub fn execute(
                 || fair_slashing_strict
                 || fair_slashing_witness
                 || fair_slashing_nonresponse
+                || fair_slashing_publish_witness_memos
                 || fair_slashing_fence;
         cfg.tx_fair_slashing = fair_slashing;
         cfg.tx_fair_slashing_strict = fair_slashing_strict;
         cfg.tx_fair_slashing_witness = fair_slashing_witness;
         cfg.tx_fair_slashing_nonresponse = fair_slashing_nonresponse;
+        cfg.tx_fair_slashing_publish_witness_memos = fair_slashing_publish_witness_memos;
         if let Ok(v) = value_t!(matches, "fair_slashing_witness_quorum", u8) {
             cfg.tx_fair_slashing_witness_quorum = v.max(1);
         }

@@ -96,6 +96,8 @@ commits and claim non-receipt). Witness mode adds:
   the POP attestation payload.
 - Optional **on-chain witness memos** (`SCDNWITN`) that allow third parties to publish POP witness
   receipts to the ledger for replayable audits.
+  - Validators can optionally publish these memos when receiving witness receipts via
+    `--fair-slashing-publish-witness-memos`.
 
 Auditors subscribe to both and treat it as a violation if:
 

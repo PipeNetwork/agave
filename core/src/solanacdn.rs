@@ -718,7 +718,6 @@ fn build_fair_ledger_reject_memo_tx(
     bincode::serialize(&tx).ok()
 }
 
-#[cfg(test)]
 fn build_fair_ledger_witness_memo_tx(
     payer: &Keypair,
     recent_blockhash: solana_hash::Hash,
@@ -748,6 +747,13 @@ fn build_fair_ledger_witness_memo_tx(
     let message = Message::new(&[cu_price, memo_ix], Some(&payer.pubkey()));
     let signers = vec![payer];
     let tx = Transaction::new(&signers, message, recent_blockhash);
+    if let Some(sig) = tx
+        .signatures
+        .get(0)
+        .and_then(|s| s.as_ref().try_into().ok())
+    {
+        insert_fair_priority(sig, u64::MAX);
+    }
     bincode::serialize(&tx).ok()
 }
 
@@ -809,6 +815,27 @@ async fn try_inject_fair_batch_reject_memo(
         batch_id,
         order_start,
         reason,
+    ) else {
+        return;
+    };
+    let _ = udp_inject_tpu.send(&tx_bytes).await;
+}
+
+async fn try_inject_fair_ledger_witness_memo(
+    udp_inject_tpu: &UdpSocket,
+    auth: &AuthContext,
+    recent_blockhash: Option<solana_hash::Hash>,
+    witness_pop_pubkey: PubkeyBytes,
+    witness: &solanacdn_protocol::messages::FairBatchWitness,
+) {
+    let Some(recent_blockhash) = recent_blockhash else {
+        return;
+    };
+    let Some(tx_bytes) = build_fair_ledger_witness_memo_tx(
+        auth.identity_keypair.as_ref(),
+        recent_blockhash,
+        witness_pop_pubkey,
+        witness,
     ) else {
         return;
     };
@@ -956,6 +983,11 @@ pub struct SolanaCdnConfig {
     /// This relies on POP-signed witnesses as external evidence of delivery (the ledger alone
     /// cannot prove non-receipt). Use with care: false positives are possible if POPs misbehave.
     pub tx_fair_slashing_nonresponse: bool,
+    /// If enabled (in addition to `tx_fair_slashing_witness` and/or `tx_fair_slashing_nonresponse`),
+    /// publish POP witness receipts as on-chain memo transactions for replayable audits.
+    ///
+    /// This increases transaction load and pays fees from the validator identity keypair.
+    pub tx_fair_slashing_publish_witness_memos: bool,
     /// Minimum number of distinct POP witnesses required before using POP witness evidence for
     /// slashing decisions (ACK↔witness mismatch and non-response slashing).
     ///
@@ -1016,6 +1048,7 @@ impl SolanaCdnConfig {
             tx_fair_slashing_strict: false,
             tx_fair_slashing_witness: false,
             tx_fair_slashing_nonresponse: false,
+            tx_fair_slashing_publish_witness_memos: false,
             tx_fair_slashing_witness_quorum: 1,
             tx_fair_slashing_fence: false,
             tx_fair_slashing_fence_reads: false,
@@ -1065,6 +1098,7 @@ impl Default for SolanaCdnConfig {
             tx_fair_slashing_strict: false,
             tx_fair_slashing_witness: false,
             tx_fair_slashing_nonresponse: false,
+            tx_fair_slashing_publish_witness_memos: false,
             tx_fair_slashing_witness_quorum: 1,
             tx_fair_slashing_fence: false,
             tx_fair_slashing_fence_reads: false,
@@ -1575,6 +1609,7 @@ pub struct SolanaCdnStatus {
     pub tx_fair_slashing_strict: bool,
     pub tx_fair_slashing_witness: bool,
     pub tx_fair_slashing_nonresponse: bool,
+    pub tx_fair_slashing_publish_witness_memos: bool,
     pub tx_fair_slashing_fence: bool,
     pub tx_fair_slashing_enforce: bool,
     pub tx_fair_slashing_enforce_configured: bool,
@@ -2190,14 +2225,16 @@ impl SolanaCdnHandle {
         &self,
         witness_pop_pubkey: PubkeyBytes,
         witness: &solanacdn_protocol::messages::FairBatchWitness,
-    ) {
+    ) -> bool {
         if !self.cfg.tx_fair_slashing
-            || (!self.cfg.tx_fair_slashing_witness && !self.cfg.tx_fair_slashing_nonresponse)
+            || (!self.cfg.tx_fair_slashing_witness
+                && !self.cfg.tx_fair_slashing_nonresponse
+                && !self.cfg.tx_fair_slashing_publish_witness_memos)
         {
-            return;
+            return false;
         }
         let Some(slot) = witness.payload.attestation.target_slot else {
-            return;
+            return false;
         };
 
         if self.fair_batch_witness_slots.len() > FAIR_BATCH_WITNESS_MAX_SLOTS {
@@ -2213,6 +2250,7 @@ impl SolanaCdnHandle {
         let witness_quorum = (self.cfg.tx_fair_slashing_witness_quorum.max(1) as usize)
             .min(FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH);
         let witnessers_len: usize;
+        let mut witnesser_added = false;
 
         let batch_id = witness.payload.attestation.batch_id;
         let origin_pop_id_hash = sha256_bytes(witness.payload.attestation.origin_pop_id.as_bytes());
@@ -2262,7 +2300,7 @@ impl SolanaCdnHandle {
                         );
                         self.fair_batch_witness_invalid
                             .fetch_add(1, Ordering::Relaxed);
-                        return;
+                        return false;
                     }
 
                     existing.pop_time_ms = existing.pop_time_ms.min(batch.pop_time_ms);
@@ -2270,17 +2308,20 @@ impl SolanaCdnHandle {
                         && existing.witnessers.len() < FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH
                     {
                         existing.witnessers.push(witness_pop_pubkey);
+                        witnesser_added = true;
                         state.gen = state.gen.wrapping_add(1);
                     }
                     witnessers_len = existing.witnessers.len();
                 } else {
                     witnessers_len = batch.witnessers.len();
+                    witnesser_added = true;
                     state.gen = state.gen.wrapping_add(1);
                     state.batches.insert(batch_id, batch);
                 }
             }
             Entry::Vacant(vac) => {
                 witnessers_len = batch.witnessers.len();
+                witnesser_added = true;
                 let mut batches = HashMap::new();
                 batches.insert(batch_id, batch);
                 vac.insert(FairWitnessSlotState {
@@ -2293,13 +2334,13 @@ impl SolanaCdnHandle {
 
         // If we have a leader ACK for this batch, it must match the POP witness.
         if witnessers_len < witness_quorum {
-            return;
+            return witnesser_added;
         }
         if let Some(entry) = self.fair_batch_ack_slots.get(&key) {
             if entry.expires_at_ms < now {
                 drop(entry);
                 self.fair_batch_ack_slots.remove(&key);
-                return;
+                return witnesser_added;
             }
             if let Some(ack) = entry.batches.get(&batch_id) {
                 if ack.origin_pop_id_hash != origin_pop_id_hash
@@ -2312,6 +2353,8 @@ impl SolanaCdnHandle {
                 }
             }
         }
+
+        witnesser_added
     }
 
     fn note_fair_batch_reject_for_slashing(&self, reject: &FairBatchReject) {
@@ -3742,6 +3785,8 @@ impl SolanaCdnHandle {
         let tx_fair_slashing_strict = self.cfg.tx_fair_slashing_strict;
         let tx_fair_slashing_witness = self.cfg.tx_fair_slashing_witness;
         let tx_fair_slashing_nonresponse = self.cfg.tx_fair_slashing_nonresponse;
+        let tx_fair_slashing_publish_witness_memos =
+            self.cfg.tx_fair_slashing_publish_witness_memos;
         let tx_fair_slashing_fence = self.cfg.tx_fair_slashing_fence;
         let tx_fair_slashing_enforce = self.tx_fair_slashing_enforce_enabled();
         let tx_fair_slashing_enforce_configured = self.cfg.tx_fair_slashing_enforce;
@@ -3874,6 +3919,7 @@ impl SolanaCdnHandle {
             tx_fair_slashing_strict,
             tx_fair_slashing_witness,
             tx_fair_slashing_nonresponse,
+            tx_fair_slashing_publish_witness_memos,
             tx_fair_slashing_fence,
             tx_fair_slashing_enforce,
             tx_fair_slashing_enforce_configured,
@@ -5829,6 +5875,17 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         }
     ));
 
+    out.push_str("# HELP solanacdn_tx_fair_slashing_publish_witness_memos_enabled Whether POP witness receipts are published as on-chain memos for replayable audits (0/1)\n");
+    out.push_str("# TYPE solanacdn_tx_fair_slashing_publish_witness_memos_enabled gauge\n");
+    out.push_str(&format!(
+        "solanacdn_tx_fair_slashing_publish_witness_memos_enabled {}\n",
+        if status.tx_fair_slashing_publish_witness_memos {
+            1
+        } else {
+            0
+        }
+    ));
+
     out.push_str("# HELP solanacdn_tx_fair_slashing_fence_enabled Whether same-slot account-fence fair slashing rules are enabled (0/1)\n");
     out.push_str("# TYPE solanacdn_tx_fair_slashing_fence_enabled gauge\n");
     out.push_str(&format!(
@@ -7016,7 +7073,11 @@ async fn run_pop_session(
     if cfg.tx_fair_slashing && cfg.tx_fair_slashing_witness {
         write_agent_msg(&mut ctrl_send, &AgentToPop::SubscribeFairAcks).await?;
     }
-    if cfg.tx_fair_slashing && (cfg.tx_fair_slashing_witness || cfg.tx_fair_slashing_nonresponse) {
+    if cfg.tx_fair_slashing
+        && (cfg.tx_fair_slashing_witness
+            || cfg.tx_fair_slashing_nonresponse
+            || cfg.tx_fair_slashing_publish_witness_memos)
+    {
         write_agent_msg(&mut ctrl_send, &AgentToPop::SubscribeFairWitnesses).await?;
     }
     if cfg.tx_fair_slashing && (cfg.tx_fair_slashing_nonresponse || cfg.tx_fair_slashing_witness) {
@@ -8279,7 +8340,9 @@ async fn handle_pop_msg(
         PopToAgent::FairBatchWitness(witness) => {
             handle.fair_batch_witness_rx.fetch_add(1, Ordering::Relaxed);
             if !cfg.tx_fair_slashing
-                || (!cfg.tx_fair_slashing_witness && !cfg.tx_fair_slashing_nonresponse)
+                || (!cfg.tx_fair_slashing_witness
+                    && !cfg.tx_fair_slashing_nonresponse
+                    && !cfg.tx_fair_slashing_publish_witness_memos)
             {
                 return;
             }
@@ -8290,7 +8353,18 @@ async fn handle_pop_msg(
                 debug!("solanacdn: invalid fair witness from {endpoint}: {e}");
                 return;
             }
-            handle.note_fair_batch_witness_for_slashing(pop_pubkey, &witness);
+            let witnesser_added = handle.note_fair_batch_witness_for_slashing(pop_pubkey, &witness);
+            if cfg.tx_fair_slashing_publish_witness_memos && witnesser_added {
+                let recent_blockhash = handle.fair_recent_blockhash();
+                try_inject_fair_ledger_witness_memo(
+                    udp_inject_tpu,
+                    auth,
+                    recent_blockhash,
+                    pop_pubkey,
+                    &witness,
+                )
+                .await;
+            }
         }
         PopToAgent::FairBatchAck(ack) => {
             if !cfg.tx_fair_slashing || !cfg.tx_fair_slashing_witness {
