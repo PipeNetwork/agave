@@ -109,6 +109,15 @@ const FAIR_RECENT_BLOCKHASH_TTL_MS: u64 = 60_000;
 const POP_EGRESS_IP_TTL_MS: u64 = 10 * 60_000;
 const POP_EGRESS_IP_MAX_ENTRIES: usize = 50_000;
 
+// Tighten framing limits beyond the protocol default (16MiB). These are chosen to be generous for
+// expected message sizes while capping per-frame allocations if a POP misbehaves.
+const CTRL_MAX_FRAME_BYTES: usize = 1 * 1024 * 1024;
+const SHREDS_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const VOTES_MAX_FRAME_BYTES: usize = 256 * 1024;
+
+// Bound CPU/memory for decoding large multi-shred batches.
+const PUSH_SHRED_BATCH_MAX_SHREDS: usize = 4_096;
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxFairSlashingEnforceOverride {
@@ -1793,6 +1802,7 @@ pub struct SolanaCdnStatus {
     pub fair_ledger_audited_slots_len: u64,
     pub rx_shred_bytes_total: u64,
     pub rx_shred_payloads_total: u64,
+    pub dropped_shred_batches_oversized_total: u64,
     pub rx_shred_payloads_per_sec: f64,
     pub tunneled_vote_packets_total: u64,
     pub tunneled_vote_packets_per_sec: f64,
@@ -1870,6 +1880,7 @@ pub struct SolanaCdnHandle {
     fair_batch_ack_slots: DashMap<FairSlashedKey, FairAckSlotState>,
     fair_batch_reject_slots: DashMap<FairSlashedKey, FairRejectSlotState>,
     dropped_shred_payloads: AtomicU64,
+    dropped_shred_batches_oversized: AtomicU64,
     dropped_vote_datagrams: AtomicU64,
     dropped_vote_datagrams_oversized_payload: AtomicU64,
     dropped_vote_datagrams_invalid_payload: AtomicU64,
@@ -1940,6 +1951,7 @@ impl SolanaCdnHandle {
             fair_batch_ack_slots: DashMap::new(),
             fair_batch_reject_slots: DashMap::new(),
             dropped_shred_payloads: AtomicU64::new(0),
+            dropped_shred_batches_oversized: AtomicU64::new(0),
             dropped_vote_datagrams: AtomicU64::new(0),
             dropped_vote_datagrams_oversized_payload: AtomicU64::new(0),
             dropped_vote_datagrams_invalid_payload: AtomicU64::new(0),
@@ -3865,13 +3877,37 @@ impl SolanaCdnHandle {
     }
 
     pub fn note_pop_egress_ip(&self, ip: IpAddr) {
-        if !ip.is_loopback() {
-            if self.pop_egress_ips.len() > POP_EGRESS_IP_MAX_ENTRIES {
-                self.pop_egress_ips.clear();
-            }
-            self.pop_egress_ips
-                .insert(ip, now_ms().saturating_add(POP_EGRESS_IP_TTL_MS));
+        if ip.is_loopback() {
+            return;
         }
+
+        let now = now_ms();
+        let expires_at = now.saturating_add(POP_EGRESS_IP_TTL_MS);
+
+        if let Some(mut entry) = self.pop_egress_ips.get_mut(&ip) {
+            *entry = expires_at;
+            return;
+        }
+
+        // Bound memory: best-effort prune of expired entries when full. If still full, skip adding
+        // new keys (but always allow TTL refreshes for existing keys above).
+        if self.pop_egress_ips.len() >= POP_EGRESS_IP_MAX_ENTRIES {
+            let mut expired: Vec<IpAddr> = Vec::new();
+            for entry in self.pop_egress_ips.iter().take(1024) {
+                if *entry.value() < now {
+                    expired.push(*entry.key());
+                }
+            }
+            for key in expired {
+                self.pop_egress_ips.remove(&key);
+            }
+        }
+
+        if self.pop_egress_ips.len() >= POP_EGRESS_IP_MAX_ENTRIES {
+            return;
+        }
+
+        self.pop_egress_ips.insert(ip, expires_at);
     }
 
     fn heartbeat_stats(&self) -> HeartbeatStats {
@@ -4004,6 +4040,8 @@ impl SolanaCdnHandle {
 
         let rx_shred_bytes_total = self.rx_shred_bytes.load(Ordering::Relaxed);
         let rx_shred_payloads_total = self.rx_shred_payloads.load(Ordering::Relaxed);
+        let dropped_shred_batches_oversized_total =
+            self.dropped_shred_batches_oversized.load(Ordering::Relaxed);
         let tunneled_vote_packets_total = self.tunneled_vote_packets.load(Ordering::Relaxed);
         let rx_vote_packets_total = self.rx_vote_packets.load(Ordering::Relaxed);
         let dropped_vote_datagrams_total = self.dropped_vote_datagrams.load(Ordering::Relaxed);
@@ -4143,6 +4181,7 @@ impl SolanaCdnHandle {
             fair_ledger_audited_slots_len,
             rx_shred_bytes_total,
             rx_shred_payloads_total,
+            dropped_shred_batches_oversized_total,
             rx_shred_payloads_per_sec,
             tunneled_vote_packets_total,
             tunneled_vote_packets_per_sec,
@@ -4302,6 +4341,7 @@ impl SolanaCdnHandle {
             "rx_shred_batches_total": self.pushed_shred_batches.load(Ordering::Relaxed) as i64,
             "rx_shred_bytes_total": self.rx_shred_bytes.load(Ordering::Relaxed) as i64,
             "rx_shred_payloads_total": self.rx_shred_payloads.load(Ordering::Relaxed) as i64,
+            "dropped_shred_batches_oversized_total": self.dropped_shred_batches_oversized.load(Ordering::Relaxed) as i64,
             "tunneled_vote_packets_total": self.tunneled_vote_packets.load(Ordering::Relaxed) as i64,
             "rx_vote_packets_total": self.rx_vote_packets.load(Ordering::Relaxed) as i64,
             "dropped_vote_datagrams_total": self.dropped_vote_datagrams.load(Ordering::Relaxed) as i64,
@@ -5560,10 +5600,17 @@ async fn write_len_prefixed<W: AsyncWrite + Unpin>(
 async fn read_len_prefixed<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Vec<u8>, SolanaCdnError> {
+    read_len_prefixed_with_limit(reader, DEFAULT_MAX_FRAME_BYTES).await
+}
+
+async fn read_len_prefixed_with_limit<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, SolanaCdnError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > DEFAULT_MAX_FRAME_BYTES {
+    if len > max_frame_bytes {
         return Err(SolanaCdnError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "frame too large",
@@ -5582,8 +5629,11 @@ async fn write_agent_msg<W: AsyncWrite + Unpin>(
     write_len_prefixed(writer, &payload).await
 }
 
-async fn read_pop_msg<R: AsyncRead + Unpin>(reader: &mut R) -> Result<PopToAgent, SolanaCdnError> {
-    let bytes = read_len_prefixed(reader).await?;
+async fn read_pop_msg<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> Result<PopToAgent, SolanaCdnError> {
+    let bytes = read_len_prefixed_with_limit(reader, max_frame_bytes).await?;
     Ok(decode_envelope(&bytes)?)
 }
 
@@ -5912,6 +5962,13 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str(&format!(
         "solanacdn_rx_shred_payloads_total {}\n",
         status.rx_shred_payloads_total
+    ));
+
+    out.push_str("# HELP solanacdn_shred_batches_dropped_oversized_total PushShredBatch messages dropped due to oversized shred count\n");
+    out.push_str("# TYPE solanacdn_shred_batches_dropped_oversized_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_shred_batches_dropped_oversized_total {}\n",
+        status.dropped_shred_batches_oversized_total
     ));
 
     out.push_str("# HELP solanacdn_rx_shred_payloads_per_sec Recent shred payload receive rate\n");
@@ -7311,7 +7368,7 @@ async fn run_pop_session(
             write_agent_msg(&mut ctrl_send, &AgentToPop::Auth(auth_req)).await?;
         }
     }
-    let auth_ok = match read_pop_msg(&mut ctrl_recv).await? {
+    let auth_ok = match read_pop_msg(&mut ctrl_recv, CTRL_MAX_FRAME_BYTES).await? {
         PopToAgent::AuthOk(ok) => ok,
         PopToAgent::AuthError(err) => {
             if err.message.contains("missing pipe session token") {
@@ -7586,7 +7643,7 @@ async fn run_pop_session(
         let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
-                let msg = match read_pop_msg(&mut ctrl_recv).await {
+                let msg = match read_pop_msg(&mut ctrl_recv, CTRL_MAX_FRAME_BYTES).await {
                     Ok(v) => v,
                     Err(_) => return,
                 };
@@ -7629,7 +7686,7 @@ async fn run_pop_session(
         let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
-                let msg = match read_pop_msg(&mut shreds_recv).await {
+                let msg = match read_pop_msg(&mut shreds_recv, SHREDS_MAX_FRAME_BYTES).await {
                     Ok(v) => v,
                     Err(_) => return,
                 };
@@ -7672,7 +7729,7 @@ async fn run_pop_session(
         let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
-                let msg = match read_pop_msg(&mut votes_recv).await {
+                let msg = match read_pop_msg(&mut votes_recv, VOTES_MAX_FRAME_BYTES).await {
                     Ok(v) => v,
                     Err(_) => return,
                 };
@@ -7781,7 +7838,7 @@ async fn run_pop_session(
                         };
                         if let Some(bytes) = entry.0.push_packet(&chunk.packet) {
                             fec.remove(&chunk.object_id);
-                            if bytes.len() > DEFAULT_MAX_FRAME_BYTES {
+                            if bytes.len() > SHREDS_MAX_FRAME_BYTES {
                                 continue;
                             }
                             let decoded: PopToAgent =
@@ -8035,6 +8092,12 @@ async fn handle_pop_msg(
                 return;
             }
             if *publisher_rx.borrow() != Some(endpoint) {
+                return;
+            }
+            if batch.shreds.len() > PUSH_SHRED_BATCH_MAX_SHREDS {
+                handle
+                    .dropped_shred_batches_oversized
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
             if !shred_deduper.insert_if_new(batch.batch_id) {
