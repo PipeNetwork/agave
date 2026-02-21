@@ -69,7 +69,6 @@ const FAIR_BATCH_MAX_TXS: usize = 512;
 const FAIR_BATCH_MAX_TOTAL_BYTES: usize = 256 * PACKET_DATA_SIZE;
 
 const TX_DEDUP_TTL_MS: u64 = 2_000;
-const RELAY_TX_ID_DEDUP_MAX_ENTRIES: usize = 500_000;
 const TX_SIG_DEDUP_MAX_ENTRIES: usize = 300_000;
 const DEFAULT_VOTE_DEDUP_TTL_MS: u64 = 2_000;
 const DEFAULT_VOTE_DEDUP_MAX_ENTRIES: usize = 200_000;
@@ -1731,9 +1730,6 @@ pub struct SolanaCdnHandle {
     race_state: std::sync::Mutex<RaceTracker>,
     fair_recent_blockhash: std::sync::Mutex<Option<(solana_hash::Hash, u64)>>,
 
-    // Recent transaction deduplication. Used to avoid repeated TPU injection due to POP mesh
-    // forwarding/retries.
-    recent_relay_tx_ids: DashMap<u64, u64>,
     recent_tx_sigs: DashMap<[u8; 64], u64>,
     recent_vote_payloads: DashMap<u128, u64>,
     vote_tunnel_allowed_dsts: DashMap<SocketAddr, u64>,
@@ -1800,7 +1796,6 @@ impl SolanaCdnHandle {
             rate_state: std::sync::Mutex::new(RateState::default()),
             race_state: std::sync::Mutex::new(RaceTracker::new()),
             fair_recent_blockhash: std::sync::Mutex::new(None),
-            recent_relay_tx_ids: DashMap::new(),
             recent_tx_sigs: DashMap::new(),
             recent_vote_payloads: DashMap::new(),
             vote_tunnel_allowed_dsts: DashMap::new(),
@@ -1830,26 +1825,6 @@ impl SolanaCdnHandle {
         };
         let (hash, updated_at_ms) = state.as_ref().copied()?;
         (now.saturating_sub(updated_at_ms) <= FAIR_RECENT_BLOCKHASH_TTL_MS).then_some(hash)
-    }
-
-    fn should_dedup_relay_tx_id(&self, tx_id: u64, now: u64) -> bool {
-        if tx_id == 0 {
-            return false;
-        }
-        if self.recent_relay_tx_ids.len() > RELAY_TX_ID_DEDUP_MAX_ENTRIES {
-            self.recent_relay_tx_ids.clear();
-        }
-        if let Some(entry) = self.recent_relay_tx_ids.get(&tx_id) {
-            let expired = *entry < now;
-            drop(entry);
-            if !expired {
-                return true;
-            }
-            self.recent_relay_tx_ids.remove(&tx_id);
-        }
-        self.recent_relay_tx_ids
-            .insert(tx_id, now.saturating_add(TX_DEDUP_TTL_MS));
-        false
     }
 
     fn should_dedup_tx_sig(&self, sig: [u8; 64], now: u64) -> bool {
@@ -1912,23 +1887,6 @@ impl SolanaCdnHandle {
             dst,
             now.saturating_add(VOTE_TUNNEL_ALLOWED_DST_TTL_MS),
         );
-    }
-
-    fn is_vote_tunnel_allowed_dst(&self, dst: SocketAddr, now: u64) -> bool {
-        if VOTE_TUNNEL_ALLOWED_DST_TTL_MS == 0 || VOTE_TUNNEL_ALLOWED_DST_MAX_ENTRIES == 0 {
-            return true;
-        }
-        match self.vote_tunnel_allowed_dsts.entry(dst) {
-            Entry::Occupied(entry) => {
-                if *entry.get() >= now {
-                    true
-                } else {
-                    entry.remove();
-                    false
-                }
-            }
-            Entry::Vacant(_) => false,
-        }
     }
 
     pub fn is_connected(&self) -> bool {
@@ -4273,6 +4231,7 @@ pub fn init(
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
+    inject_vote: SocketAddr,
 ) {
     if vote_use_quic && cfg.vote_tunnel {
         warn!("solanacdn: vote tunneling requires UDP votes; disabling (vote_use_quic=true)");
@@ -4325,6 +4284,7 @@ pub fn init(
                     inject_tpu,
                     inject_tvu,
                     inject_gossip,
+                    inject_vote,
                 )
                 .await
                 {
@@ -6552,6 +6512,7 @@ async fn run(
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
+    inject_vote: SocketAddr,
 ) -> Result<(), SolanaCdnError> {
     let mut cfg = cfg;
 
@@ -6673,6 +6634,7 @@ async fn run(
         inject_tpu,
         inject_tvu,
         inject_gossip,
+        inject_vote,
         shred_deduper,
         pipe_session_token_rx,
         pipe_pop_endpoints_rx,
@@ -6697,6 +6659,7 @@ async fn manage_pop_sessions(
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
+    inject_vote: SocketAddr,
     shred_deduper: ShredBatchDeduper,
     pipe_session_token_rx: Option<watch::Receiver<Option<String>>>,
     mut pipe_pop_endpoints_rx: Option<watch::Receiver<Vec<SocketAddr>>>,
@@ -6744,6 +6707,7 @@ async fn manage_pop_sessions(
             inject_tpu,
             inject_tvu,
             inject_gossip,
+            inject_vote,
             shred_deduper.clone(),
             pipe_session_token_rx.clone(),
             publisher_rx.clone(),
@@ -6870,6 +6834,7 @@ async fn manage_pop_sessions(
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
+                inject_vote,
                 shred_deduper.clone(),
                 pipe_session_token_rx.clone(),
                 publisher_rx.clone(),
@@ -6965,6 +6930,7 @@ fn spawn_session(
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
+    inject_vote: SocketAddr,
     shred_deduper: ShredBatchDeduper,
     pipe_session_token_rx: Option<watch::Receiver<Option<String>>>,
     publisher_rx: watch::Receiver<Option<SocketAddr>>,
@@ -6984,6 +6950,7 @@ fn spawn_session(
         inject_tpu,
         inject_tvu,
         inject_gossip,
+        inject_vote,
         shred_deduper,
         pipe_session_token_rx,
         publisher_rx,
@@ -7010,6 +6977,7 @@ async fn run_pop_session_forever(
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
+    inject_vote: SocketAddr,
     shred_deduper: ShredBatchDeduper,
     pipe_session_token_rx: Option<watch::Receiver<Option<String>>>,
     publisher_rx: watch::Receiver<Option<SocketAddr>>,
@@ -7031,6 +6999,7 @@ async fn run_pop_session_forever(
             inject_tpu,
             inject_tvu,
             inject_gossip,
+            inject_vote,
             shred_deduper.clone(),
             pipe_session_token_rx.clone(),
             publisher_rx.clone(),
@@ -7087,6 +7056,7 @@ async fn run_pop_session(
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
+    inject_vote: SocketAddr,
     shred_deduper: ShredBatchDeduper,
     mut pipe_session_token_rx: Option<watch::Receiver<Option<String>>>,
     publisher_rx: watch::Receiver<Option<SocketAddr>>,
@@ -7423,6 +7393,7 @@ async fn run_pop_session(
                     &udp_inject_tpu,
                     &udp_inject_tvu,
                     &udp_inject_gossip,
+                    inject_vote,
                     &udp_inject_votes,
                     &session_events_tx,
                     &last_hb_sent_ms,
@@ -7465,6 +7436,7 @@ async fn run_pop_session(
                     &udp_inject_tpu,
                     &udp_inject_tvu,
                     &udp_inject_gossip,
+                    inject_vote,
                     &udp_inject_votes,
                     &session_events_tx,
                     &last_hb_sent_ms,
@@ -7507,6 +7479,7 @@ async fn run_pop_session(
                     &udp_inject_tpu,
                     &udp_inject_tvu,
                     &udp_inject_gossip,
+                    inject_vote,
                     &udp_inject_votes,
                     &session_events_tx,
                     &last_hb_sent_ms,
@@ -7611,6 +7584,7 @@ async fn run_pop_session(
                                 &udp_inject_tpu,
                                 &udp_inject_tvu,
                                 &udp_inject_gossip,
+                                inject_vote,
                                 &udp_inject_votes,
                                 &session_events_tx,
                                 &last_hb_sent_ms,
@@ -7632,6 +7606,7 @@ async fn run_pop_session(
                             &udp_inject_tpu,
                             &udp_inject_tvu,
                             &udp_inject_gossip,
+                            inject_vote,
                             &udp_inject_votes,
                             &session_events_tx,
                             &last_hb_sent_ms,
@@ -7694,6 +7669,7 @@ async fn run_pop_session(
                     &udp_inject_tpu,
                     &udp_inject_tvu,
                     &udp_inject_gossip,
+                    inject_vote,
                     &udp_inject_votes,
                     &session_events_tx,
                     &last_hb_sent_ms,
@@ -7815,6 +7791,7 @@ async fn handle_pop_msg(
     udp_inject_tpu: &UdpSocket,
     udp_inject_tvu: &UdpSocket,
     udp_inject_gossip: &UdpSocket,
+    inject_vote: SocketAddr,
     udp_inject_votes: &VoteInjectSockets,
     session_events_tx: &mpsc::UnboundedSender<SessionEvent>,
     last_hb_sent_ms: &AtomicU64,
@@ -7885,7 +7862,7 @@ async fn handle_pop_msg(
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            if !handle.is_vote_tunnel_allowed_dst(dg.dst, now) {
+            if dg.dst.port() != inject_vote.port() {
                 handle
                     .dropped_vote_datagrams
                     .fetch_add(1, Ordering::Relaxed);
@@ -7894,13 +7871,17 @@ async fn handle_pop_msg(
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            if handle.should_dedup_vote_payload(dg.dst, &dg.payload, now) {
+            if handle.should_dedup_vote_payload(inject_vote, &dg.payload, now) {
                 handle
                     .dropped_vote_datagrams
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            if udp_inject_votes.send_to(&dg.payload, dg.dst).await.is_err() {
+            if udp_inject_votes
+                .send_to(&dg.payload, inject_vote)
+                .await
+                .is_err()
+            {
                 handle
                     .dropped_vote_datagrams
                     .fetch_add(1, Ordering::Relaxed);
@@ -7914,13 +7895,22 @@ async fn handle_pop_msg(
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            if tx.payload.is_empty() || tx.payload.len() > PACKET_DATA_SIZE {
+                handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             // Transactions may be routed via multiple POPs (home-POP forwarding, multi-POP, etc),
             // so do not gate this on the current shred/vote publisher selection.
             let now = now_ms();
-            if handle.should_dedup_relay_tx_id(tx.tx_id, now) {
+            let Some(sig) = try_first_signature_bytes_from_wire_tx(tx.payload.as_slice()) else {
+                handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if handle.should_dedup_tx_sig(sig, now) {
                 handle.tx_deduped_packets.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            handle.note_dedup_tx_sig(sig, now);
             if udp_inject_tpu.send(&tx.payload).await.is_ok() {
                 handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -11131,6 +11121,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -11179,6 +11170,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -11261,6 +11253,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -11639,6 +11632,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -11742,6 +11736,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -11853,6 +11848,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -11965,6 +11961,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -12068,6 +12065,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -12549,6 +12547,7 @@ mod tests {
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
+                inject_tpu,
                 ShredBatchDeduper::new(64),
                 None,
                 publisher_rx,
@@ -12692,7 +12691,6 @@ mod tests {
 
         let cfg = Arc::new(cfg);
         let handle = Arc::new(SolanaCdnHandle::new((*cfg).clone()));
-        handle.note_vote_tunnel_allowed_dst(vote_sink_addr, now_ms());
         let handle_for_client = Arc::clone(&handle);
 
         let identity_keypair = Arc::new(Keypair::new());
@@ -12718,6 +12716,7 @@ mod tests {
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
+                vote_sink_addr,
                 ShredBatchDeduper::new(64),
                 None,
                 publisher_rx,
@@ -12877,7 +12876,6 @@ mod tests {
 
         let cfg = Arc::new(cfg);
         let handle = Arc::new(SolanaCdnHandle::new((*cfg).clone()));
-        handle.note_vote_tunnel_allowed_dst(vote_sink_addr, now_ms());
         let handle_for_client = Arc::clone(&handle);
 
         let identity_keypair = Arc::new(Keypair::new());
@@ -12903,6 +12901,7 @@ mod tests {
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
+                vote_sink_addr,
                 ShredBatchDeduper::new(64),
                 None,
                 publisher_rx,
@@ -12964,10 +12963,11 @@ mod tests {
         let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_inject_votes = VoteInjectSockets::bind().await.unwrap();
 
+        let wrong_dst = SocketAddr::new(vote_sink_addr.ip(), vote_sink_addr.port() ^ 1);
         let dg = VoteDatagram {
-            flow_id: vote_flow_id(&vote_sink_addr),
+            flow_id: vote_flow_id(&wrong_dst),
             src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            dst: vote_sink_addr,
+            dst: wrong_dst,
             payload: b"vote_payload".to_vec(),
         };
 
@@ -12983,6 +12983,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            vote_sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -13028,8 +13029,6 @@ mod tests {
         let udp_inject_gossip = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_inject_votes = VoteInjectSockets::bind().await.unwrap();
 
-        handle.note_vote_tunnel_allowed_dst(vote_sink_addr, now_ms());
-
         let dg = VoteDatagram {
             flow_id: vote_flow_id(&vote_sink_addr),
             src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -13049,6 +13048,7 @@ mod tests {
             &udp_inject_tpu,
             &udp_inject_tvu,
             &udp_inject_gossip,
+            vote_sink_addr,
             &udp_inject_votes,
             &events_tx,
             &last_hb_sent_ms,
@@ -13214,6 +13214,7 @@ mod tests {
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
+                inject_tpu,
                 ShredBatchDeduper::new(64),
                 None,
                 publisher_rx,
@@ -13403,6 +13404,7 @@ mod tests {
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
+                inject_tpu,
             )
             .await
             .unwrap();

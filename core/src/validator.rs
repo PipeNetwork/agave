@@ -734,6 +734,16 @@ impl Validator {
                 .local_addr()
                 .map_err(|e| ValidatorError::Other(format!("failed to read TPU socket addr: {e}")))?
                 .port();
+            let tpu_vote_port = node
+                .sockets
+                .tpu_vote
+                .first()
+                .ok_or_else(|| ValidatorError::Other("missing TPU vote socket".to_string()))?
+                .local_addr()
+                .map_err(|e| {
+                    ValidatorError::Other(format!("failed to read TPU vote socket addr: {e}"))
+                })?
+                .port();
             let tvu_port = node
                 .sockets
                 .tvu
@@ -755,6 +765,7 @@ impl Validator {
             let inject_tpu = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tpu_port);
             let inject_tvu = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tvu_port);
             let inject_gossip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gossip_port);
+            let inject_vote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tpu_vote_port);
             crate::solanacdn::init(
                 solanacdn_cfg,
                 identity_keypair.clone(),
@@ -763,6 +774,7 @@ impl Validator {
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
+                inject_vote,
             );
         }
 
