@@ -1647,6 +1647,7 @@ pub struct SolanaCdnStatus {
     pub rx_vote_packets_total: u64,
     pub dropped_vote_datagrams_total: u64,
     pub dropped_vote_datagrams_oversized_payload_total: u64,
+    pub dropped_vote_datagrams_invalid_payload_total: u64,
     pub dropped_vote_datagrams_unexpected_dst_total: u64,
     pub vote_tunnel_allowed_dsts_len: u64,
     pub last_shred_slot: Option<u64>,
@@ -1717,6 +1718,7 @@ pub struct SolanaCdnHandle {
     dropped_shred_payloads: AtomicU64,
     dropped_vote_datagrams: AtomicU64,
     dropped_vote_datagrams_oversized_payload: AtomicU64,
+    dropped_vote_datagrams_invalid_payload: AtomicU64,
     dropped_vote_datagrams_unexpected_dst: AtomicU64,
     uplink_broadcast_lagged: AtomicU64,
     pop_endpoint_ips: DashSet<IpAddr>,
@@ -1784,6 +1786,7 @@ impl SolanaCdnHandle {
             dropped_shred_payloads: AtomicU64::new(0),
             dropped_vote_datagrams: AtomicU64::new(0),
             dropped_vote_datagrams_oversized_payload: AtomicU64::new(0),
+            dropped_vote_datagrams_invalid_payload: AtomicU64::new(0),
             dropped_vote_datagrams_unexpected_dst: AtomicU64::new(0),
             uplink_broadcast_lagged: AtomicU64::new(0),
             pop_endpoint_ips: DashSet::new(),
@@ -3837,6 +3840,9 @@ impl SolanaCdnHandle {
         let dropped_vote_datagrams_oversized_payload_total = self
             .dropped_vote_datagrams_oversized_payload
             .load(Ordering::Relaxed);
+        let dropped_vote_datagrams_invalid_payload_total = self
+            .dropped_vote_datagrams_invalid_payload
+            .load(Ordering::Relaxed);
         let dropped_vote_datagrams_unexpected_dst_total = self
             .dropped_vote_datagrams_unexpected_dst
             .load(Ordering::Relaxed);
@@ -3967,6 +3973,7 @@ impl SolanaCdnHandle {
             rx_vote_packets_total,
             dropped_vote_datagrams_total,
             dropped_vote_datagrams_oversized_payload_total,
+            dropped_vote_datagrams_invalid_payload_total,
             dropped_vote_datagrams_unexpected_dst_total,
             vote_tunnel_allowed_dsts_len,
             last_shred_slot,
@@ -4121,6 +4128,7 @@ impl SolanaCdnHandle {
             "rx_vote_packets_total": self.rx_vote_packets.load(Ordering::Relaxed) as i64,
             "dropped_vote_datagrams_total": self.dropped_vote_datagrams.load(Ordering::Relaxed) as i64,
             "dropped_vote_datagrams_oversized_payload_total": self.dropped_vote_datagrams_oversized_payload.load(Ordering::Relaxed) as i64,
+            "dropped_vote_datagrams_invalid_payload_total": self.dropped_vote_datagrams_invalid_payload.load(Ordering::Relaxed) as i64,
             "dropped_vote_datagrams_unexpected_dst_total": self.dropped_vote_datagrams_unexpected_dst.load(Ordering::Relaxed) as i64,
             "vote_tunnel_allowed_dsts_len": self.vote_tunnel_allowed_dsts.len() as i64,
             "rx_tx_packets_total": self.rx_tx_packets.load(Ordering::Relaxed) as i64,
@@ -5768,6 +5776,13 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
     out.push_str(&format!(
         "solanacdn_vote_tunnel_dropped_oversized_payload_total {}\n",
         status.dropped_vote_datagrams_oversized_payload_total
+    ));
+
+    out.push_str("# HELP solanacdn_vote_tunnel_dropped_invalid_payload_total Vote datagrams dropped due to invalid payloads\n");
+    out.push_str("# TYPE solanacdn_vote_tunnel_dropped_invalid_payload_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_vote_tunnel_dropped_invalid_payload_total {}\n",
+        status.dropped_vote_datagrams_invalid_payload_total
     ));
 
     out.push_str("# HELP solanacdn_vote_tunnel_dropped_unexpected_dst_total Vote datagrams dropped due to unexpected destinations\n");
@@ -7871,6 +7886,15 @@ async fn handle_pop_msg(
                     .fetch_add(1, Ordering::Relaxed);
                 handle
                     .dropped_vote_datagrams_unexpected_dst
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if try_first_signature_bytes_from_wire_tx(dg.payload.as_slice()).is_none() {
+                handle
+                    .dropped_vote_datagrams
+                    .fetch_add(1, Ordering::Relaxed);
+                handle
+                    .dropped_vote_datagrams_invalid_payload
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -12601,6 +12625,19 @@ mod tests {
         let vote_sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let vote_sink_addr = vote_sink.local_addr().unwrap();
 
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+        let vote_payload = bincode::serialize(&VersionedTransaction::from(Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        )))
+        .unwrap();
+        let vote_payload_for_pop = vote_payload.clone();
+
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let pop_task = tokio::spawn(async move {
             let Some(connecting) = endpoint.accept().await else {
@@ -12667,7 +12704,7 @@ mod tests {
                 flow_id: vote_flow_id(&vote_sink_addr),
                 src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
                 dst: vote_sink_addr,
-                payload: b"vote_payload".to_vec(),
+                payload: vote_payload_for_pop,
             };
             let msg = PopToAgent::PushVoteDatagram(dg);
             let bytes = solanacdn_protocol::udp::encode_udp_datagram(udp_token, &msg).unwrap();
@@ -12738,7 +12775,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        assert_eq!(&buf[..len], b"vote_payload");
+        assert_eq!(&buf[..len], vote_payload.as_slice());
 
         let second =
             tokio::time::timeout(Duration::from_millis(200), vote_sink.recv_from(&mut buf)).await;
@@ -12773,6 +12810,19 @@ mod tests {
         if !vote_sink_addr.is_ipv6() {
             return;
         }
+
+        let signer = Keypair::new();
+        let recent_blockhash = solana_hash::Hash::new_unique();
+        let vote_payload = bincode::serialize(&VersionedTransaction::from(Transaction::new(
+            &[&signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&signer.pubkey()),
+            ),
+            recent_blockhash,
+        )))
+        .unwrap();
+        let vote_payload_for_pop = vote_payload.clone();
 
         let pop_udp_shreds = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let pop_udp_votes = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -12853,7 +12903,7 @@ mod tests {
                 flow_id: vote_flow_id(&vote_sink_addr),
                 src: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
                 dst: vote_sink_addr,
-                payload: b"vote_payload_v6".to_vec(),
+                payload: vote_payload_for_pop,
             };
             let msg = PopToAgent::PushVoteDatagram(dg);
             let bytes = solanacdn_protocol::udp::encode_udp_datagram(udp_token, &msg).unwrap();
@@ -12930,7 +12980,7 @@ mod tests {
                 handle.status_snapshot()
             ),
         };
-        assert_eq!(&buf[..len], b"vote_payload_v6");
+        assert_eq!(&buf[..len], vote_payload.as_slice());
 
         let _ = stop_tx.send(true);
         tokio::time::timeout(Duration::from_secs(5), client_task)
