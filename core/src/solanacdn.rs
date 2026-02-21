@@ -2601,15 +2601,11 @@ impl SolanaCdnHandle {
                             memo_only = false;
                             continue;
                         }
-                        if chunk.payload.slot != slot {
-                            memo_only = false;
-                            continue;
-                        }
-                        if chunk.payload.leader_pubkey != expected_leader {
-                            memo_only = false;
-                            continue;
-                        }
                         saw_valid_fair_commit_chunk = true;
+                        if chunk.payload.slot != slot || chunk.payload.leader_pubkey != expected_leader
+                        {
+                            continue;
+                        }
 
                         let batch_id = chunk.payload.batch_id;
                         if let Some(prev_order_start) =
@@ -2669,15 +2665,11 @@ impl SolanaCdnHandle {
                             memo_only = false;
                             continue;
                         }
-                        if memo.payload.slot != slot {
-                            memo_only = false;
-                            continue;
-                        }
-                        if memo.payload.leader_pubkey != expected_leader {
-                            memo_only = false;
-                            continue;
-                        }
                         saw_valid_fair_ack_memo = true;
+                        if memo.payload.slot != slot || memo.payload.leader_pubkey != expected_leader
+                        {
+                            continue;
+                        }
 
                         if self.cfg.tx_fair_slashing_witness {
                             let batch_id = memo.payload.batch_id;
@@ -2720,16 +2712,11 @@ impl SolanaCdnHandle {
                             memo_only = false;
                             continue;
                         }
-                        if memo.payload.slot != slot {
-                            memo_only = false;
-                            continue;
-                        }
-                        if memo.payload.leader_pubkey != expected_leader {
-                            memo_only = false;
-                            continue;
-                        }
-
                         saw_valid_fair_reject_memo = true;
+                        if memo.payload.slot != slot || memo.payload.leader_pubkey != expected_leader
+                        {
+                            continue;
+                        }
                         let batch_id = memo.payload.batch_id;
                         let reject = FairRejectBatch {
                             origin_pop_id_hash: memo.payload.origin_pop_id_hash,
@@ -9873,6 +9860,104 @@ mod tests {
 
         assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
         assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
+    fn fair_ledger_audit_strict_ignores_ack_memo_for_other_slot() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let slot = 43;
+        let other_slot = 42;
+        let origin_pop_id = "pop-test-1".to_string();
+        let batch_id = 7u128;
+        let order_start = 0u64;
+        let recent_blockhash = solana_hash::Hash::default();
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let sigs = vec![sig_a, sig_b];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_strict = false;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        // Enable strict audit for this slot via an off-chain leader ACK.
+        let leader_time_ms = now_ms();
+        let payload = FairBatchReceiptCommitPayload {
+            origin_pop_id: origin_pop_id.clone(),
+            flow_id: 0,
+            batch_id,
+            order_start,
+            target_slot: Some(slot),
+            leader_pubkey: auth.validator_pubkey,
+            leader_time_ms,
+            tx_count: sigs.len() as u32,
+            tx_merkle_root: fair_merkle_root(sigs.as_slice()),
+        };
+        let ack = FairBatchReceiptCommit::sign(payload, &auth.signing_key).expect("sign ack");
+        ack.verify().expect("verify ack");
+        handle.note_fair_batch_ack_for_slashing(&ack);
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs.as_slice(),
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        // A valid on-chain ACK memo for a different slot should be treated as exempt metadata and
+        // must not trip strict insertion-ahead rules for this slot.
+        let ack_tx_bytes = build_fair_ledger_ack_memo_tx(
+            &auth,
+            recent_blockhash,
+            other_slot,
+            &origin_pop_id,
+            0,
+            batch_id,
+            order_start,
+            sigs.len() as u32,
+            fair_merkle_root(sigs.as_slice()),
+        )
+        .expect("ack memo tx bytes");
+        let ack_tx: Transaction = bincode::deserialize(&ack_tx_bytes).expect("ack memo tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into(), ack_tx.into(), tx_a.into(), tx_b.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 0);
     }
 
     #[test]
