@@ -7823,6 +7823,9 @@ async fn handle_pop_msg(
                 if shred.payload.is_empty() {
                     continue;
                 }
+                if shred.payload.len() > PACKET_DATA_SIZE {
+                    continue;
+                }
                 if handle.race_enabled() {
                     if let Some(shred_id) =
                         solana_ledger::shred::layout::get_shred_id(shred.payload.as_slice())
