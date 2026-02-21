@@ -2475,6 +2475,7 @@ impl ReplayStage {
         first_alpenglow_slot: &mut Option<Slot>,
         tbft_structs: &mut TowerBFTStructures,
     ) {
+        crate::solanacdn::fair_note_recent_blockhash(bank.last_blockhash());
         crate::solanacdn::fair_slashing_audit_slot_with_bank(
             blockstore,
             bank,

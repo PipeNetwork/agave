@@ -102,6 +102,7 @@ const FAIR_BATCH_ACK_MAX_BATCHES_PER_SLOT: usize = 8_192;
 const FAIR_BATCH_REJECT_TTL_MS: u64 = 10 * 60_000;
 const FAIR_BATCH_REJECT_MAX_SLOTS: usize = 50_000;
 const FAIR_BATCH_REJECT_MAX_BATCHES_PER_SLOT: usize = 8_192;
+const FAIR_RECENT_BLOCKHASH_TTL_MS: u64 = 60_000;
 const POP_EGRESS_IP_TTL_MS: u64 = 10 * 60_000;
 const POP_EGRESS_IP_MAX_ENTRIES: usize = 50_000;
 
@@ -1618,6 +1619,7 @@ pub struct SolanaCdnHandle {
     publisher_uplink: ArcSwapOption<SessionUplink>,
     rate_state: std::sync::Mutex<RateState>,
     race_state: std::sync::Mutex<RaceTracker>,
+    fair_recent_blockhash: std::sync::Mutex<Option<(solana_hash::Hash, u64)>>,
 
     // Recent transaction deduplication. Used to avoid repeated TPU injection due to POP mesh
     // forwarding/retries.
@@ -1684,10 +1686,36 @@ impl SolanaCdnHandle {
             publisher_uplink: ArcSwapOption::const_empty(),
             rate_state: std::sync::Mutex::new(RateState::default()),
             race_state: std::sync::Mutex::new(RaceTracker::new()),
+            fair_recent_blockhash: std::sync::Mutex::new(None),
             recent_relay_tx_ids: DashMap::new(),
             recent_tx_sigs: DashMap::new(),
             recent_vote_payloads: DashMap::new(),
         }
+    }
+
+    fn note_fair_recent_blockhash(&self, blockhash: solana_hash::Hash) {
+        if !(self.cfg.tx_fair_ordering || self.cfg.tx_fair_slashing) {
+            return;
+        }
+        let now = now_ms();
+        let mut state = match self.fair_recent_blockhash.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *state = Some((blockhash, now));
+    }
+
+    fn fair_recent_blockhash(&self) -> Option<solana_hash::Hash> {
+        if !(self.cfg.tx_fair_ordering || self.cfg.tx_fair_slashing) {
+            return None;
+        }
+        let now = now_ms();
+        let state = match self.fair_recent_blockhash.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let (hash, updated_at_ms) = state.as_ref().copied()?;
+        (now.saturating_sub(updated_at_ms) <= FAIR_RECENT_BLOCKHASH_TTL_MS).then_some(hash)
     }
 
     fn should_dedup_relay_tx_id(&self, tx_id: u64, now: u64) -> bool {
@@ -3912,6 +3940,13 @@ pub fn fair_slashing_note_vote_withheld(leader: &Pubkey, slot: u64) {
         return;
     };
     handle.note_fair_vote_withheld(leader, slot);
+}
+
+pub fn fair_note_recent_blockhash(blockhash: solana_hash::Hash) {
+    let Some(handle) = global() else {
+        return;
+    };
+    handle.note_fair_recent_blockhash(blockhash);
 }
 
 pub fn init(
@@ -7560,9 +7595,10 @@ async fn handle_pop_msg(
             let now = now_ms();
 
             if cfg.tx_fair_ordering {
-                // Best-effort recent blockhash for injecting on-chain reject memos (if we end up
-                // rejecting after validating at least one wire tx).
-                let mut recent_blockhash: Option<solana_hash::Hash> = None;
+                // Best-effort recent blockhash for injecting on-chain ack/reject memos. Seed from
+                // a bank-provided cache so early rejects (before validating any wire tx) can still
+                // land on-chain.
+                let mut recent_blockhash: Option<solana_hash::Hash> = handle.fair_recent_blockhash();
 
                 if let Err(e) = attestation.verify(pop_pubkey) {
                     debug!(
