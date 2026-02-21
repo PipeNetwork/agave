@@ -7792,7 +7792,12 @@ async fn run_pop_session(
                     continue;
                 }
                 if let PopToAgent::DirectShredsProbe { .. } = msg {
-                    handle.note_pop_egress_ip(peer.ip());
+                    // Only learn/update egress IPs when direct POP→validator injection is enabled
+                    // for the current publisher session. This avoids letting non-publisher sessions
+                    // expand the allowlist.
+                    if cfg.direct_shreds_from_pop && *publisher_rx.borrow() == Some(endpoint) {
+                        handle.note_pop_egress_ip(peer.ip());
+                    }
                     continue;
                 }
 
