@@ -17,12 +17,14 @@ When `--fair` is enabled, the validator assigns each verified SolanaCDN-delivere
 monotonically increasing ordering index `order_ix`. Earlier `order_ix` always gets a higher
 priority override than later `order_ix`.
 
-`order_ix` is defined by the validator’s own processing order:
+`order_ix` is defined by the POP-signed `FairBatch` attestation:
 
-- Only **verified** transactions (deserialize + sanitize + strict signature verification) consume
-  ordering space.
-- Duplicate transactions (by signature) are ignored for ordering.
-- Invalid transactions do not “burn” ordering indices.
+- `order_ix = tx_seq_start + leaf_index` where `tx_seq_start` is a POP-provided monotonic sequence
+  per `(origin_pop_id, flow_id)` and `leaf_index` is the transaction’s 0-based position in the
+  attested batch.
+- In fair mode, the leader must **accept or reject the entire attested batch**. Partial filtering
+  (dropping/rewriting/reordering the tx list) is treated as a contract violation when paired with
+  the appropriate evidence streams (see `--fair-slashing-witness`).
 
 ## Validator behavior (FairBatch ingestion)
 
@@ -32,14 +34,16 @@ payload }` where `payload` is the wire transaction bytes.
 For each batch, the validator:
 
 1. **Applies cost bounds** (tx count cap + total payload bytes cap) to prevent CPU/memory abuse.
-2. **Validates each candidate tx**:
+2. **Verifies the POP attestation** signature and checks that the attested `(tx_count, Merkle
+   root)` matches the ordered `tx.sig` list.
+3. **Validates each candidate tx**:
    - The first signature parsed from `payload` must exist and match `FairTx.sig`.
    - The wire transaction must deserialize, sanitize, and pass strict ed25519 signature
      verification.
-3. **Deduplicates** recent tx signatures using a short TTL cache (to avoid repeated injection).
-4. **Allocates ordering indices** for the remaining verified txs (`order_start..order_start+N`).
-5. **Overrides scheduler priority** for each tx signature so that earlier `order_ix` is scheduled
-   ahead of later `order_ix` within the validator’s banking stage.
+4. **Rejects the entire batch** if any tx fails validation (no partial accept/filtering).
+5. **Allocates ordering indices** using the POP-provided sequence (`tx_seq_start..tx_seq_start+N`).
+6. **Overrides scheduler priority** for each tx signature so that earlier `order_ix` is scheduled
+  ahead of later `order_ix` within the validator’s banking stage.
 
 The validator then injects the verified wire transactions into TPU.
 
@@ -74,17 +78,22 @@ When strict mode is enabled, the leader’s ledger commit becomes a stronger con
 ### Witness mode (`--fair-slashing-witness`)
 
 The ledger alone cannot prove that a leader *received* a fair batch (a leader can always omit
-commits and claim non-receipt). Witness mode adds an **external witness stream**:
+commits and claim non-receipt). Witness mode adds:
 
-- POPs broadcast a POP-signed `FairBatchWitness` containing an attestation payload
-  (`batch_id`, `tx_count`, Merkle root of signatures, `target_slot`) and the intended
-  `leader_pubkey`.
-- Auditors subscribe to this witness stream and, during ledger audit, treat it as a violation if a
-  witnessed batch has **no matching on-chain commit** (or the commit's signature list does not
-  match the witnessed `tx_count`/Merkle root).
+- A **leader-signed ACK stream** (`FairBatchAck`, protocol v7+) containing a compact receipt commit
+  (`tx_count`, Merkle root, `target_slot`, `order_start`).
+- A **POP-signed witness stream** (`FairBatchWitness`, protocol v6+) binding the leader identity to
+  the POP attestation payload.
 
-This mode requires POP support (protocol v6+) and shifts trust to the POP witness signer: a
-malicious POP can falsely accuse a leader.
+Auditors subscribe to both and treat it as a violation if:
+
+- A leader **ACKs** a batch for a target slot but that slot has **no matching on-chain commit**
+  (or the on-chain commit’s signature list does not match the ACK’s `tx_count`/Merkle root).
+- A leader ACK and POP witness **disagree** on `tx_count`/Merkle root for the same batch (immediate
+  violation; prevents leader-side insertion/dropping/rewrite of the attested list).
+
+This mode shifts trust assumptions: slashing requires leader-signed ACK evidence, so a malicious
+POP witness alone cannot frame a leader, but witnesses remain necessary for cross-checking ACKs.
 
 ## Optional: enforcement (`--fair-slashing-enforce`)
 

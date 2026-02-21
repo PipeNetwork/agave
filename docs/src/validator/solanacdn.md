@@ -83,8 +83,9 @@ transactions and commit-memo transactions ahead of it):
 
 - `--fair-slashing-strict`
 
-Witness mode (implies `--fair-slashing`; subscribes to POP-signed batch witnesses so auditors can
-punish “leader received a fair batch but never committed it”; requires POP support, protocol v6+):
+Witness mode (implies `--fair-slashing`; subscribes to leader-signed batch ACKs and POP-signed
+batch witnesses so auditors can punish “leader ACKed but never committed it” and detect
+ACK↔witness mismatches; requires POP support, protocol v7+):
 
 - `--fair-slashing-witness`
 

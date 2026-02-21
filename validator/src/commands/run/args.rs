@@ -1432,9 +1432,10 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("fair-slashing-witness")
             .takes_value(false)
             .help(
-                "EXPERIMENTAL: Subscribe to POP-signed fair batch witnesses so auditors can \
-                 punish “leader received a fair batch but never committed it”. This requires a \
-                 POP witness stream (protocol v6+) and implies --fair-slashing.",
+                "EXPERIMENTAL: Subscribe to leader-signed fair batch ACKs and POP-signed fair \
+                 batch witnesses so auditors can punish “leader ACKed but never committed it” \
+                 and detect ACK↔witness mismatches. This requires protocol v7+ and implies \
+                 --fair-slashing.",
             ),
     )
     .arg(
