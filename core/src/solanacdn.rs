@@ -7062,6 +7062,7 @@ async fn run_pop_session(
         &mut ctrl_send,
         &AgentToPop::Capabilities(AgentCapabilities {
             tx_fair_ordering: cfg.tx_fair_ordering,
+            tx_fair_fifo_per_origin_flow: cfg.tx_fair_ordering,
             ..AgentCapabilities::default()
         }),
     )

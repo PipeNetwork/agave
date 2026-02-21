@@ -111,10 +111,32 @@ Auditors subscribe to both and treat it as a violation if:
 This mode shifts trust assumptions: slashing requires leader-signed ACK evidence, so a malicious
 POP witness alone cannot frame a leader, but witnesses remain necessary for cross-checking ACKs.
 
+### Non-response mode (`--fair-slashing-nonresponse`)
+
+If you also want to punish “POP witnessed delivery but leader never committed nor rejected”, enable
+`--fair-slashing-nonresponse` (protocol v8+). This relies on POP-signed witness receipts as
+external evidence of delivery; the ledger alone cannot prove non-receipt.
+
+To reduce the risk of false positives from a single POP, use `--fair-slashing-witness-quorum N` to
+require at least `N` distinct witnesses before using witness evidence for non-response slashing.
+
 ## Optional: enforcement (`--fair-slashing-enforce`)
 
 When `--fair-slashing-enforce` is enabled, fair-ordering violations (ledger audit failure or commit
 equivocation) trigger vote withholding for the violating leader/slot.
+
+## Recommended: maximum protection vs malicious leaders
+
+If your goal is “best possible outcome for retail” (minimize same-slot front-run/back-run around
+fair flow), run auditors with:
+
+- `--fair-slashing --fair-slashing-enforce`
+- `--fair-slashing-strict` (no insertion ahead of the fair prefix; no committed drops)
+- `--fair-slashing-witness --fair-slashing-nonresponse` (ACK-required slashing + witnessed
+  non-receipt)
+- `--fair-slashing-witness-quorum N` (recommended `N>=2` when multiple POP witnesses exist)
+- `--fair-slashing-fence --fair-slashing-fence-reads` (same-slot account fence)
+- `--fair-slashing-publish-witness-memos` (optional replayable witness evidence on-chain)
 
 ## Limitations / non-goals
 
