@@ -94,6 +94,8 @@ commits and claim non-receipt). Witness mode adds:
   (`tx_count`, Merkle root, `target_slot`, `order_start`).
 - A **POP-signed witness stream** (`FairBatchWitness`, protocol v6+) binding the leader identity to
   the POP attestation payload.
+- Optional **on-chain witness memos** (`SCDNWITN`) that allow third parties to publish POP witness
+  receipts to the ledger for replayable audits.
 
 Auditors subscribe to both and treat it as a violation if:
 
