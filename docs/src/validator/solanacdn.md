@@ -89,6 +89,11 @@ ACK↔witness mismatches (and enforce strict audit on ACKed slots); requires POP
 
 - `--fair-slashing-witness`
 
+Account-fence mode (implies `--fair-slashing`; treats any same-slot non-fair transaction that writes
+to a non-signer account written by a committed fair transaction as a violation):
+
+- `--fair-slashing-fence`
+
 Enforcement mode (implies `--fair-slashing`; withholds votes when a fair ordering violation is observed):
 
 - `--fair-slashing-enforce`

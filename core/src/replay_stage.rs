@@ -2475,7 +2475,12 @@ impl ReplayStage {
         first_alpenglow_slot: &mut Option<Slot>,
         tbft_structs: &mut TowerBFTStructures,
     ) {
-        crate::solanacdn::fair_slashing_audit_slot(blockstore, bank.collector_id(), bank.slot());
+        crate::solanacdn::fair_slashing_audit_slot_with_bank(
+            blockstore,
+            bank,
+            bank.collector_id(),
+            bank.slot(),
+        );
         if crate::solanacdn::fair_slashing_is_slashed_leader(bank.collector_id(), bank.slot()) {
             crate::solanacdn::fair_slashing_note_vote_withheld(bank.collector_id(), bank.slot());
             datapoint_info!(

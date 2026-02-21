@@ -75,6 +75,16 @@ When strict mode is enabled, the leader’s ledger commit becomes a stronger con
   (missing tail is a violation).
 - **Missing commit chunks are violations:** partial/fragmented ledger commits do not pass audit.
 
+### Account fence (`--fair-slashing-fence`)
+
+When account-fence mode is enabled, the audit additionally enforces a same-slot “account fence”:
+
+- For a slot with committed fair batches, **transactions not in the committed fair list** must not
+  write-lock any **non-signer account** written by a committed fair transaction in that slot.
+
+This aims to prevent same-slot sandwich/back-run transactions that touch the same writable DEX
+state/vault accounts as the fair flow.
+
 ### Witness mode (`--fair-slashing-witness`)
 
 The ledger alone cannot prove that a leader *received* a fair batch (a leader can always omit
