@@ -542,6 +542,158 @@ fn parse_shortvec_len(input: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+fn wire_tx_has_program_id(payload: &[u8], program_id: &[u8; 32]) -> bool {
+    // Wire tx format:
+    // - signatures: shortvec len + 64-byte signatures
+    // - message (legacy) OR versioned message (v0) with version prefix byte.
+    let (sig_count, consumed) = match parse_shortvec_len(payload) {
+        Some(v) => v,
+        None => return false,
+    };
+    if sig_count == 0 {
+        return false;
+    }
+    let sig_bytes = match sig_count.checked_mul(64) {
+        Some(v) => v,
+        None => return false,
+    };
+    let msg_start = match consumed.checked_add(sig_bytes) {
+        Some(v) => v,
+        None => return false,
+    };
+    let msg = match payload.get(msg_start..) {
+        Some(v) => v,
+        None => return false,
+    };
+    if msg.is_empty() {
+        return false;
+    }
+
+    // Message header: legacy starts immediately; v0 starts with 0x80|version.
+    let mut cursor: usize = 0;
+    if msg[0] & 0x80 != 0 {
+        let version = msg[0] & 0x7f;
+        if version != 0 {
+            return false;
+        }
+        cursor = 1;
+    }
+
+    cursor = match cursor.checked_add(3) {
+        Some(v) => v,
+        None => return false,
+    };
+    if msg.len() < cursor {
+        return false;
+    }
+
+    let (key_count, consumed) = match parse_shortvec_len(msg.get(cursor..).unwrap_or(&[])) {
+        Some(v) => v,
+        None => return false,
+    };
+    cursor = match cursor.checked_add(consumed) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let keys_start = cursor;
+    let keys_bytes = match key_count.checked_mul(32) {
+        Some(v) => v,
+        None => return false,
+    };
+    cursor = match keys_start.checked_add(keys_bytes) {
+        Some(v) => v,
+        None => return false,
+    };
+    if msg.len() < cursor {
+        return false;
+    }
+
+    // recent_blockhash
+    cursor = match cursor.checked_add(32) {
+        Some(v) => v,
+        None => return false,
+    };
+    if msg.len() < cursor {
+        return false;
+    }
+
+    let (ix_count, consumed) = match parse_shortvec_len(msg.get(cursor..).unwrap_or(&[])) {
+        Some(v) => v,
+        None => return false,
+    };
+    cursor = match cursor.checked_add(consumed) {
+        Some(v) => v,
+        None => return false,
+    };
+    if msg.len() < cursor {
+        return false;
+    }
+
+    for _ in 0..ix_count {
+        let program_id_index = match msg.get(cursor) {
+            Some(v) => *v as usize,
+            None => return false,
+        };
+        cursor = match cursor.checked_add(1) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        let (account_count, consumed) = match parse_shortvec_len(msg.get(cursor..).unwrap_or(&[])) {
+            Some(v) => v,
+            None => return false,
+        };
+        cursor = match cursor.checked_add(consumed) {
+            Some(v) => v,
+            None => return false,
+        };
+        cursor = match cursor.checked_add(account_count) {
+            Some(v) => v,
+            None => return false,
+        };
+        if cursor > msg.len() {
+            return false;
+        }
+
+        let (data_len, consumed) = match parse_shortvec_len(msg.get(cursor..).unwrap_or(&[])) {
+            Some(v) => v,
+            None => return false,
+        };
+        cursor = match cursor.checked_add(consumed) {
+            Some(v) => v,
+            None => return false,
+        };
+        cursor = match cursor.checked_add(data_len) {
+            Some(v) => v,
+            None => return false,
+        };
+        if cursor > msg.len() {
+            return false;
+        }
+
+        if program_id_index < key_count {
+            let start = match keys_start.checked_add(program_id_index.saturating_mul(32)) {
+                Some(v) => v,
+                None => return false,
+            };
+            let end = match start.checked_add(32) {
+                Some(v) => v,
+                None => return false,
+            };
+            let key_bytes = match msg.get(start..end) {
+                Some(v) => v,
+                None => return false,
+            };
+            if key_bytes == program_id.as_slice() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn build_fair_ledger_commit_memo_txs(
     auth: &AuthContext,
     recent_blockhash: solana_hash::Hash,
@@ -5778,7 +5930,7 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.dropped_vote_datagrams_oversized_payload_total
     ));
 
-    out.push_str("# HELP solanacdn_vote_tunnel_dropped_invalid_payload_total Vote datagrams dropped due to invalid payloads\n");
+    out.push_str("# HELP solanacdn_vote_tunnel_dropped_invalid_payload_total Vote datagrams dropped due to invalid payloads (not a vote transaction)\n");
     out.push_str("# TYPE solanacdn_vote_tunnel_dropped_invalid_payload_total counter\n");
     out.push_str(&format!(
         "solanacdn_vote_tunnel_dropped_invalid_payload_total {}\n",
@@ -7889,7 +8041,8 @@ async fn handle_pop_msg(
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            if try_first_signature_bytes_from_wire_tx(dg.payload.as_slice()).is_none() {
+            let vote_program_id = solana_vote_program::id().to_bytes();
+            if !wire_tx_has_program_id(dg.payload.as_slice(), &vote_program_id) {
                 handle
                     .dropped_vote_datagrams
                     .fetch_add(1, Ordering::Relaxed);
@@ -12627,10 +12780,18 @@ mod tests {
 
         let signer = Keypair::new();
         let recent_blockhash = solana_hash::Hash::new_unique();
+        let vote_ix = Instruction {
+            program_id: solana_vote_program::id(),
+            accounts: Vec::new(),
+            data: vec![0],
+        };
         let vote_payload = bincode::serialize(&VersionedTransaction::from(Transaction::new(
             &[&signer],
             Message::new(
-                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                &[
+                    ComputeBudgetInstruction::set_compute_unit_limit(1),
+                    vote_ix,
+                ],
                 Some(&signer.pubkey()),
             ),
             recent_blockhash,
@@ -12813,10 +12974,18 @@ mod tests {
 
         let signer = Keypair::new();
         let recent_blockhash = solana_hash::Hash::new_unique();
+        let vote_ix = Instruction {
+            program_id: solana_vote_program::id(),
+            accounts: Vec::new(),
+            data: vec![0],
+        };
         let vote_payload = bincode::serialize(&VersionedTransaction::from(Transaction::new(
             &[&signer],
             Message::new(
-                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                &[
+                    ComputeBudgetInstruction::set_compute_unit_limit(1),
+                    vote_ix,
+                ],
                 Some(&signer.pubkey()),
             ),
             recent_blockhash,
