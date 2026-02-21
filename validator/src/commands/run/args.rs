@@ -167,6 +167,7 @@ impl FromClapArgMatches for RunArgs {
             || matches.is_present("fair_slashing")
             || matches.is_present("fair_slashing_strict")
             || matches.is_present("fair_slashing_witness")
+            || matches.is_present("fair_slashing_nonresponse")
             || matches.is_present("fair_slashing_fence")
             || matches.is_present("fair_slashing_enforce"))
             && !has_solanacdn_discovery
@@ -1441,6 +1442,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             ),
     )
     .arg(
+        Arg::with_name("fair_slashing_nonresponse")
+            .long("fair-slashing-nonresponse")
+            .takes_value(false)
+            .help(
+                "EXPERIMENTAL: Subscribe to POP-signed fair batch witnesses and leader-signed \
+                 fair batch rejects so auditors can punish “POP witnessed delivery but leader \
+                 never committed nor rejected”. This relies on POP witnesses as external \
+                 evidence of delivery (the ledger alone cannot prove non-receipt). This requires \
+                 protocol v8+ and implies --fair-slashing.",
+            ),
+    )
+    .arg(
         Arg::with_name("fair_slashing_fence")
             .long("fair-slashing-fence")
             .takes_value(false)
@@ -1961,6 +1974,29 @@ mod tests {
                 "--solanacdn-api-token",
                 "pk_test_dummy",
                 "--fair-slashing-witness",
+            ],
+            default_run_args,
+        );
+    }
+
+    #[test]
+    fn fair_slashing_nonresponse_requires_discovery_config() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_parse_is_error_with_identity_setup(
+            default_run_args,
+            vec!["--fair-slashing-nonresponse"],
+        );
+    }
+
+    #[test]
+    fn fair_slashing_nonresponse_accepts_api_token() {
+        let default_run_args = RunArgs::default();
+        verify_args_struct_by_command_run_with_identity_setup(
+            default_run_args.clone(),
+            vec![
+                "--solanacdn-api-token",
+                "pk_test_dummy",
+                "--fair-slashing-nonresponse",
             ],
             default_run_args,
         );
