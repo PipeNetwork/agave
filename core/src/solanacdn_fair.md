@@ -91,6 +91,8 @@ Auditors subscribe to both and treat it as a violation if:
   (or the on-chain commit’s signature list does not match the ACK’s `tx_count`/Merkle root).
 - A leader ACK and POP witness **disagree** on `tx_count`/Merkle root for the same batch (immediate
   violation; prevents leader-side insertion/dropping/rewrite of the attested list).
+- When an ACK is present for a leader+slot, auditors apply **strict** ledger audit rules for that
+  slot (no non-vote insertion ahead of the committed fair prefix; no committed drops).
 
 This mode shifts trust assumptions: slashing requires leader-signed ACK evidence, so a malicious
 POP witness alone cannot frame a leader, but witnesses remain necessary for cross-checking ACKs.

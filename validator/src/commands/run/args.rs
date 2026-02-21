@@ -1434,7 +1434,8 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help(
                 "EXPERIMENTAL: Subscribe to leader-signed fair batch ACKs and POP-signed fair \
                  batch witnesses so auditors can punish “leader ACKed but never committed it” \
-                 and detect ACK↔witness mismatches. This requires protocol v7+ and implies \
+                 (including committed drops/insertion in ACKed slots) and detect ACK↔witness \
+                 mismatches. This requires protocol v7+ and implies \
                  --fair-slashing.",
             ),
     )

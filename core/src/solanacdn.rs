@@ -1866,7 +1866,6 @@ impl SolanaCdnHandle {
         let memo_program_id = FAIR_LEDGER_COMMIT_MEMO_PROGRAM_ID;
         let compute_budget_program_id = solana_compute_budget_interface::id();
         let vote_program_id = solana_vote_program::id();
-        let strict = self.cfg.tx_fair_slashing_strict;
         let ack_batches: Option<HashMap<u128, FairAckBatch>> =
             self.cfg.tx_fair_slashing_witness.then(|| {
                 let key = FairSlashedKey {
@@ -1886,6 +1885,10 @@ impl SolanaCdnHandle {
                 }
                 Some(entry.batches.clone())
             }).flatten();
+        // In witness mode, the presence of a leader-signed ACK implies the leader explicitly
+        // accepted responsibility for the fair batch contents. Treat the slot audit as strict in
+        // that case to punish insertion ahead of the fair prefix and committed drops.
+        let strict = self.cfg.tx_fair_slashing_strict || ack_batches.is_some();
 
         let mut slot_txs: Vec<SlotTx> = Vec::new();
         let mut batch_order_start: HashMap<u128, u64> = HashMap::new();
@@ -7740,7 +7743,31 @@ mod tests {
         let batch_id = 7u128;
         let order_start = 0u64;
 
-        let sigs = vec![[1u8; 64], [2u8; 64]];
+        let recent_blockhash = solana_hash::Hash::default();
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let sigs = vec![sig_a, sig_b];
 
         let mut cfg = SolanaCdnConfig::default();
         cfg.tx_fair_slashing = true;
@@ -7764,7 +7791,6 @@ mod tests {
         ack.verify().expect("verify ack");
         handle.note_fair_batch_ack_for_slashing(&ack);
 
-        let recent_blockhash = solana_hash::Hash::default();
         let commit_txs = build_fair_ledger_commit_memo_txs(
             &auth,
             recent_blockhash,
@@ -7777,13 +7803,188 @@ mod tests {
         let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
 
         let entry = solana_entry::entry::Entry {
-            transactions: vec![commit_tx.into()],
+            transactions: vec![commit_tx.into(), tx_a.into(), tx_b.into()],
             ..solana_entry::entry::Entry::default()
         };
         let entries = vec![entry];
 
         assert!(handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
         assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 0);
+    }
+
+    #[test]
+    fn fair_ledger_audit_ack_enables_strict_audit_committed_drop_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let slot = 42;
+        let origin_pop_id = "pop-test-1".to_string();
+        let batch_id = 7u128;
+        let order_start = 0u64;
+        let recent_blockhash = solana_hash::Hash::default();
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let sigs = vec![sig_a, sig_b];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_strict = false;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        let leader_time_ms = now_ms();
+        let payload = FairBatchReceiptCommitPayload {
+            origin_pop_id,
+            flow_id: 0,
+            batch_id,
+            order_start,
+            target_slot: Some(slot),
+            leader_pubkey: auth.validator_pubkey,
+            leader_time_ms,
+            tx_count: sigs.len() as u32,
+            tx_merkle_root: fair_merkle_root(sigs.as_slice()),
+        };
+        let ack = FairBatchReceiptCommit::sign(payload, &auth.signing_key).expect("sign ack");
+        ack.verify().expect("verify ack");
+        handle.note_fair_batch_ack_for_slashing(&ack);
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs.as_slice(),
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![commit_tx.into(), tx_a.into()],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
+    }
+
+    #[test]
+    fn fair_ledger_audit_ack_enables_strict_audit_insertion_ahead_is_violation() {
+        let leader_identity = Arc::new(Keypair::new());
+        let leader = leader_identity.pubkey();
+        let auth = AuthContext::new(leader_identity).expect("auth context");
+
+        let slot = 42;
+        let origin_pop_id = "pop-test-1".to_string();
+        let batch_id = 7u128;
+        let order_start = 0u64;
+        let recent_blockhash = solana_hash::Hash::default();
+
+        let tx_a_signer = Keypair::new();
+        let tx_a = Transaction::new(
+            &[&tx_a_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(1)],
+                Some(&tx_a_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_a: [u8; 64] = tx_a.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let tx_b_signer = Keypair::new();
+        let tx_b = Transaction::new(
+            &[&tx_b_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(2)],
+                Some(&tx_b_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+        let sig_b: [u8; 64] = tx_b.signatures[0].as_ref().try_into().expect("sig bytes");
+
+        let sigs = vec![sig_a, sig_b];
+
+        let mut cfg = SolanaCdnConfig::default();
+        cfg.tx_fair_slashing = true;
+        cfg.tx_fair_slashing_witness = true;
+        cfg.tx_fair_slashing_strict = false;
+        cfg.tx_fair_slashing_enforce = false;
+        let handle = SolanaCdnHandle::new(cfg);
+
+        let leader_time_ms = now_ms();
+        let payload = FairBatchReceiptCommitPayload {
+            origin_pop_id,
+            flow_id: 0,
+            batch_id,
+            order_start,
+            target_slot: Some(slot),
+            leader_pubkey: auth.validator_pubkey,
+            leader_time_ms,
+            tx_count: sigs.len() as u32,
+            tx_merkle_root: fair_merkle_root(sigs.as_slice()),
+        };
+        let ack = FairBatchReceiptCommit::sign(payload, &auth.signing_key).expect("sign ack");
+        ack.verify().expect("verify ack");
+        handle.note_fair_batch_ack_for_slashing(&ack);
+
+        let commit_txs = build_fair_ledger_commit_memo_txs(
+            &auth,
+            recent_blockhash,
+            slot,
+            batch_id,
+            order_start,
+            sigs.as_slice(),
+        );
+        assert_eq!(commit_txs.len(), 1);
+        let commit_tx: Transaction = bincode::deserialize(&commit_txs[0]).expect("commit tx");
+
+        let inserted_signer = Keypair::new();
+        let inserted_tx = Transaction::new(
+            &[&inserted_signer],
+            Message::new(
+                &[ComputeBudgetInstruction::set_compute_unit_limit(42)],
+                Some(&inserted_signer.pubkey()),
+            ),
+            recent_blockhash,
+        );
+
+        let entry = solana_entry::entry::Entry {
+            transactions: vec![
+                commit_tx.into(),
+                inserted_tx.into(),
+                tx_a.into(),
+                tx_b.into(),
+            ],
+            ..solana_entry::entry::Entry::default()
+        };
+        let entries = vec![entry];
+
+        assert!(!handle.audit_fair_ledger_commits_in_entries(entries.as_slice(), &leader, slot));
+        assert_eq!(handle.status_snapshot().fair_slashed_leaders_len, 1);
     }
 
     #[test]

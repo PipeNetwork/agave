@@ -85,7 +85,7 @@ transactions and commit-memo transactions ahead of it):
 
 Witness mode (implies `--fair-slashing`; subscribes to leader-signed batch ACKs and POP-signed
 batch witnesses so auditors can punish “leader ACKed but never committed it” and detect
-ACK↔witness mismatches; requires POP support, protocol v7+):
+ACK↔witness mismatches (and enforce strict audit on ACKed slots); requires POP support, protocol v7+):
 
 - `--fair-slashing-witness`
 
