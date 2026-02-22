@@ -7762,29 +7762,46 @@ async fn run_pop_session(
         let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
-                let msg = match read_pop_msg(&mut shreds_recv, SHREDS_MAX_FRAME_BYTES).await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                handle_pop_msg(
-                    endpoint,
-                    pop_pubkey,
-                    &cfg,
-                    auth.as_ref(),
-                    &handle,
-                    &ctrl_out_tx,
-                    &mut publisher_rx,
-                    &shred_deduper,
-                    &udp_inject_tpu,
-                    &udp_inject_tvu,
-                    &udp_inject_gossip,
-                    inject_vote,
-                    &udp_inject_votes,
-                    &session_events_tx,
-                    &last_hb_sent_ms,
-                    msg,
-                )
-                .await;
+                // Avoid processing shreds when not the selected publisher (reduces attack surface
+                // and CPU for non-publisher sessions).
+                while *publisher_rx.borrow() != Some(endpoint) {
+                    if publisher_rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+
+                tokio::select! {
+                    res = read_pop_msg(&mut shreds_recv, SHREDS_MAX_FRAME_BYTES) => {
+                        let msg = match res {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        handle_pop_msg(
+                            endpoint,
+                            pop_pubkey,
+                            &cfg,
+                            auth.as_ref(),
+                            &handle,
+                            &ctrl_out_tx,
+                            &mut publisher_rx,
+                            &shred_deduper,
+                            &udp_inject_tpu,
+                            &udp_inject_tvu,
+                            &udp_inject_gossip,
+                            inject_vote,
+                            &udp_inject_votes,
+                            &session_events_tx,
+                            &last_hb_sent_ms,
+                            msg,
+                        )
+                        .await;
+                    }
+                    changed = publisher_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
         })
     };
@@ -7805,29 +7822,45 @@ async fn run_pop_session(
         let ctrl_out_tx = ctrl_out_tx.clone();
         tokio::spawn(async move {
             loop {
-                let msg = match read_pop_msg(&mut votes_recv, VOTES_MAX_FRAME_BYTES).await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                handle_pop_msg(
-                    endpoint,
-                    pop_pubkey,
-                    &cfg,
-                    auth.as_ref(),
-                    &handle,
-                    &ctrl_out_tx,
-                    &mut publisher_rx,
-                    &shred_deduper,
-                    &udp_inject_tpu,
-                    &udp_inject_tvu,
-                    &udp_inject_gossip,
-                    inject_vote,
-                    &udp_inject_votes,
-                    &session_events_tx,
-                    &last_hb_sent_ms,
-                    msg,
-                )
-                .await;
+                // Avoid processing vote downlink when not the selected publisher.
+                while *publisher_rx.borrow() != Some(endpoint) {
+                    if publisher_rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+
+                tokio::select! {
+                    res = read_pop_msg(&mut votes_recv, VOTES_MAX_FRAME_BYTES) => {
+                        let msg = match res {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        handle_pop_msg(
+                            endpoint,
+                            pop_pubkey,
+                            &cfg,
+                            auth.as_ref(),
+                            &handle,
+                            &ctrl_out_tx,
+                            &mut publisher_rx,
+                            &shred_deduper,
+                            &udp_inject_tpu,
+                            &udp_inject_tvu,
+                            &udp_inject_gossip,
+                            inject_vote,
+                            &udp_inject_votes,
+                            &session_events_tx,
+                            &last_hb_sent_ms,
+                            msg,
+                        )
+                        .await;
+                    }
+                    changed = publisher_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
             }
         })
     };
@@ -7854,140 +7887,152 @@ async fn run_pop_session(
             const FEC_MAX_OBJECTS: usize = 1024;
             const FEC_EXPIRE_MS: u64 = 5_000;
             loop {
-                let (len, peer) = match sock.recv_from(&mut buf).await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                let bytes = &buf[..len];
-                if !bytes.starts_with(&udp_token) {
-                    continue;
-                }
-                let msg: PopToAgent =
-                    match solanacdn_protocol::frame::decode_envelope(&bytes
-                        [solanacdn_protocol::udp::UDP_TOKEN_LEN..])
-                    {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                if let PopToAgent::DirectShredsProbe { .. } = msg {
-                    // Only learn/update egress IPs when direct POP→validator injection is enabled
-                    // for the current publisher session. This avoids letting non-publisher sessions
-                    // expand the allowlist.
-                    if cfg.direct_shreds_from_pop && *publisher_rx.borrow() == Some(endpoint) {
-                        handle.note_pop_egress_ip(peer.ip());
+                // Avoid spending CPU on shreds UDP downlink when not the selected publisher.
+                while *publisher_rx.borrow() != Some(endpoint) {
+                    fec.clear();
+                    if publisher_rx.changed().await.is_err() {
+                        return;
                     }
-                    continue;
                 }
 
-                let now = now_ms();
-                let peer_ip = peer.ip();
-                if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
-                    handle
-                        .dropped_udp_shreds_unexpected_peer
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // Avoid building FEC state for non-publisher sessions.
-                if *publisher_rx.borrow() != Some(endpoint) {
-                    continue;
-                }
-
-                match msg {
-                    PopToAgent::PushShredFecChunk(chunk) => {
-                        if !cfg.inject_shreds {
+                tokio::select! {
+                    res = sock.recv_from(&mut buf) => {
+                        let (len, peer) = match res {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        let bytes = &buf[..len];
+                        if !bytes.starts_with(&udp_token) {
                             continue;
                         }
-                        if chunk.packet.len() > 2048 {
-                            continue;
-                        }
-
-                        if !fec.contains_key(&chunk.object_id) && fec.len() >= FEC_MAX_OBJECTS {
-                            continue;
-                        }
-                        let entry = match fec.entry(chunk.object_id) {
-                            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                                entry.get_mut().1 = now;
-                                entry.into_mut()
+                        let msg_bytes = match bytes.get(solanacdn_protocol::udp::UDP_TOKEN_LEN..) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let msg: PopToAgent = match solanacdn_protocol::frame::decode_envelope(msg_bytes) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if let PopToAgent::DirectShredsProbe { .. } = msg {
+                            // Only learn/update egress IPs when direct POP→validator injection is enabled
+                            // for the current publisher session. This avoids letting non-publisher sessions
+                            // expand the allowlist.
+                            if cfg.direct_shreds_from_pop && *publisher_rx.borrow() == Some(endpoint) {
+                                handle.note_pop_egress_ip(peer.ip());
                             }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                let dec =
-                                    match solanacdn_protocol::fec::RaptorqDecoder::new(chunk.oti) {
+                            continue;
+                        }
+
+                        let now = now_ms();
+                        let peer_ip = peer.ip();
+                        if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
+                            handle
+                                .dropped_udp_shreds_unexpected_peer
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        match msg {
+                            PopToAgent::PushShredFecChunk(chunk) => {
+                                if !cfg.inject_shreds {
+                                    continue;
+                                }
+                                if chunk.packet.len() > 2048 {
+                                    continue;
+                                }
+
+                                if !fec.contains_key(&chunk.object_id) && fec.len() >= FEC_MAX_OBJECTS {
+                                    continue;
+                                }
+                                let entry = match fec.entry(chunk.object_id) {
+                                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                        entry.get_mut().1 = now;
+                                        entry.into_mut()
+                                    }
+                                    std::collections::hash_map::Entry::Vacant(entry) => {
+                                        let dec = match solanacdn_protocol::fec::RaptorqDecoder::new(chunk.oti) {
+                                            Ok(v) => v,
+                                            Err(_) => continue,
+                                        };
+                                        entry.insert((dec, now))
+                                    }
+                                };
+                                if let Some(bytes) = entry.0.push_packet(&chunk.packet) {
+                                    fec.remove(&chunk.object_id);
+                                    if bytes.len() > SHREDS_MAX_FRAME_BYTES {
+                                        continue;
+                                    }
+                                    let decoded: PopToAgent = match solanacdn_protocol::frame::decode_envelope(&bytes) {
                                         Ok(v) => v,
                                         Err(_) => continue,
                                     };
-                                entry.insert((dec, now))
+                                    if !matches!(decoded, PopToAgent::PushShredBatch(_)) {
+                                        handle
+                                            .dropped_udp_shreds_unexpected_msg
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    handle_pop_msg(
+                                        endpoint,
+                                        pop_pubkey,
+                                        &cfg,
+                                        auth.as_ref(),
+                                        &handle,
+                                        &ctrl_out_tx,
+                                        &mut publisher_rx,
+                                        &shred_deduper,
+                                        &udp_inject_tpu,
+                                        &udp_inject_tvu,
+                                        &udp_inject_gossip,
+                                        inject_vote,
+                                        &udp_inject_votes,
+                                        &session_events_tx,
+                                        &last_hb_sent_ms,
+                                        decoded,
+                                    )
+                                    .await;
+                                }
                             }
-                        };
-                        if let Some(bytes) = entry.0.push_packet(&chunk.packet) {
-                            fec.remove(&chunk.object_id);
-                            if bytes.len() > SHREDS_MAX_FRAME_BYTES {
-                                continue;
+                            other @ PopToAgent::PushShredBatch(_) => {
+                                handle_pop_msg(
+                                    endpoint,
+                                    pop_pubkey,
+                                    &cfg,
+                                    auth.as_ref(),
+                                    &handle,
+                                    &ctrl_out_tx,
+                                    &mut publisher_rx,
+                                    &shred_deduper,
+                                    &udp_inject_tpu,
+                                    &udp_inject_tvu,
+                                    &udp_inject_gossip,
+                                    inject_vote,
+                                    &udp_inject_votes,
+                                    &session_events_tx,
+                                    &last_hb_sent_ms,
+                                    other,
+                                )
+                                .await;
                             }
-                            let decoded: PopToAgent =
-                                match solanacdn_protocol::frame::decode_envelope(&bytes) {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
-                                };
-                            if !matches!(decoded, PopToAgent::PushShredBatch(_)) {
+                            _ => {
                                 handle
                                     .dropped_udp_shreds_unexpected_msg
                                     .fetch_add(1, Ordering::Relaxed);
-                                continue;
                             }
-                            handle_pop_msg(
-                                endpoint,
-                                pop_pubkey,
-                                &cfg,
-                                auth.as_ref(),
-                                &handle,
-                                &ctrl_out_tx,
-                                &mut publisher_rx,
-                                &shred_deduper,
-                                &udp_inject_tpu,
-                                &udp_inject_tvu,
-                                &udp_inject_gossip,
-                                inject_vote,
-                                &udp_inject_votes,
-                                &session_events_tx,
-                                &last_hb_sent_ms,
-                                decoded,
-                            )
-                            .await;
+                        }
+
+                        if now.saturating_sub(last_cleanup_ms) > 1_000 {
+                            last_cleanup_ms = now;
+                            let expire_before = now.saturating_sub(FEC_EXPIRE_MS);
+                            fec.retain(|_, (_, last)| *last >= expire_before);
                         }
                     }
-                    other @ PopToAgent::PushShredBatch(_) => {
-                        handle_pop_msg(
-                            endpoint,
-                            pop_pubkey,
-                            &cfg,
-                            auth.as_ref(),
-                            &handle,
-                            &ctrl_out_tx,
-                            &mut publisher_rx,
-                            &shred_deduper,
-                            &udp_inject_tpu,
-                            &udp_inject_tvu,
-                            &udp_inject_gossip,
-                            inject_vote,
-                            &udp_inject_votes,
-                            &session_events_tx,
-                            &last_hb_sent_ms,
-                            other,
-                        )
-                        .await;
+                    changed = publisher_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        fec.clear();
                     }
-                    _ => {
-                        handle
-                            .dropped_udp_shreds_unexpected_msg
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-
-                if now.saturating_sub(last_cleanup_ms) > 1_000 {
-                    last_cleanup_ms = now;
-                    let expire_before = now.saturating_sub(FEC_EXPIRE_MS);
-                    fec.retain(|_, (_, last)| *last >= expire_before);
                 }
             }
         }))
@@ -8012,54 +8057,71 @@ async fn run_pop_session(
         Some(tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
-                let (len, peer) = match sock.recv_from(&mut buf).await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                let bytes = &buf[..len];
-                if !bytes.starts_with(&udp_token) {
-                    continue;
+                // Avoid spending CPU on votes UDP downlink when not the selected publisher.
+                while *publisher_rx.borrow() != Some(endpoint) {
+                    if publisher_rx.changed().await.is_err() {
+                        return;
+                    }
                 }
-                let msg: PopToAgent =
-                    match solanacdn_protocol::frame::decode_envelope(&bytes
-                        [solanacdn_protocol::udp::UDP_TOKEN_LEN..])
-                    {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    };
-                let now = now_ms();
-                let peer_ip = peer.ip();
-                if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
-                    handle
-                        .dropped_udp_votes_unexpected_peer
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
+
+                tokio::select! {
+                    res = sock.recv_from(&mut buf) => {
+                        let (len, peer) = match res {
+                            Ok(v) => v,
+                            Err(_) => return,
+                        };
+                        let bytes = &buf[..len];
+                        if !bytes.starts_with(&udp_token) {
+                            continue;
+                        }
+                        let msg_bytes = match bytes.get(solanacdn_protocol::udp::UDP_TOKEN_LEN..) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let msg: PopToAgent = match solanacdn_protocol::frame::decode_envelope(msg_bytes) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let now = now_ms();
+                        let peer_ip = peer.ip();
+                        if peer_ip != endpoint.ip() && !handle.is_pop_egress_ip_fresh(peer_ip, now) {
+                            handle
+                                .dropped_udp_votes_unexpected_peer
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        if !matches!(msg, PopToAgent::PushVoteDatagram(_)) {
+                            handle
+                                .dropped_udp_votes_unexpected_msg
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        handle_pop_msg(
+                            endpoint,
+                            pop_pubkey,
+                            &cfg,
+                            auth.as_ref(),
+                            &handle,
+                            &ctrl_out_tx,
+                            &mut publisher_rx,
+                            &shred_deduper,
+                            &udp_inject_tpu,
+                            &udp_inject_tvu,
+                            &udp_inject_gossip,
+                            inject_vote,
+                            &udp_inject_votes,
+                            &session_events_tx,
+                            &last_hb_sent_ms,
+                            msg,
+                        )
+                        .await;
+                    }
+                    changed = publisher_rx.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
                 }
-                if !matches!(msg, PopToAgent::PushVoteDatagram(_)) {
-                    handle
-                        .dropped_udp_votes_unexpected_msg
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                handle_pop_msg(
-                    endpoint,
-                    pop_pubkey,
-                    &cfg,
-                    auth.as_ref(),
-                    &handle,
-                    &ctrl_out_tx,
-                    &mut publisher_rx,
-                    &shred_deduper,
-                    &udp_inject_tpu,
-                    &udp_inject_tvu,
-                    &udp_inject_gossip,
-                    inject_vote,
-                    &udp_inject_votes,
-                    &session_events_tx,
-                    &last_hb_sent_ms,
-                    msg,
-                )
-                .await;
             }
         }))
     } else {
