@@ -118,6 +118,18 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --wen-restart-coordinator ]]; then
       args+=("$1" "$2")
       shift 2
+    elif [[ $1 == --fair ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-pop ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 == --solanacdn-tls-insecure-skip-verify ]]; then
+      args+=("$1")
+      shift
+    elif [[ $1 == --solanacdn-metrics-addr ]]; then
+      args+=("$1" "$2")
+      shift 2
     else
       echo "Unknown argument: $1"
       $program --help

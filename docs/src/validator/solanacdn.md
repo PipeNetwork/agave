@@ -188,14 +188,27 @@ For a repeatable local-cluster `--fair` smoke test, use the lightweight POP stub
 2. In a second terminal, run the stub (sends one fair batch by default):
 
    ```bash
-   cargo run -p solana-core --bin solanacdn-pop-stub -- --listen 127.0.0.1:9002
+   cargo run -p solana-core --bin solanacdn-pop-stub -- \\
+     --listen 127.0.0.1:9002 \\
+     --rpc-url http://127.0.0.1:8899 \\
+     --target-slot-offset 20
    ```
+
+   Notes:
+   - In this fork, `--fair` implies `--fair-require-target-slot`, so the stub must supply a
+     `target_slot`. If `--rpc-url` is provided, the stub will auto-pick a `target_slot` using
+     `current_slot + --target-slot-offset`.
+   - For local clusters, the stub attempts to `requestAirdrop` funds for its tx payer by default.
+     Disable with `--airdrop-lamports 0` if needed.
 
    To emit repeated batches:
 
    ```bash
    cargo run -p solana-core --bin solanacdn-pop-stub -- \\
-     --listen 127.0.0.1:9002 --batches 0 --interval-ms 200 --exit-after-ms 0
+     --listen 127.0.0.1:9002 \\
+     --rpc-url http://127.0.0.1:8899 \\
+     --target-slot-offset 20 \\
+     --batches 0 --interval-ms 200 --exit-after-ms 0
    ```
 
 3. Verify fair-batch counters moved:
@@ -204,24 +217,37 @@ For a repeatable local-cluster `--fair` smoke test, use the lightweight POP stub
    curl -s http://127.0.0.1:9100/metrics | rg 'solanacdn_tx_fair_batch_(received|injected)_total'
    ```
 
-4. Fair-slashing smoke test (optional):
+4. Multi-POP witness quorum smoke test (optional):
 
-   - Start the validator with `--fair-slashing` or `--fair-slashing-enforce`.
-   - Run the stub with a target slot and RPC URL so commit memos use a recent blockhash:
+   To exercise witness quorum (default `N=2` under `--fair` in this fork) and evidence broadcast,
+   run the stub with 2 POP listeners:
 
    ```bash
    cargo run -p solana-core --bin solanacdn-pop-stub -- \\
      --listen 127.0.0.1:9002 \\
-     --target-slot 1 \\
+     --listen 127.0.0.1:9003 \\
      --rpc-url http://127.0.0.1:8899 \\
-     --echo-commits
+     --target-slot-offset 20 \\
+     --broadcast-evidence \\
+     --emit-witnesses
    ```
 
-   Then watch the fair-slashing counters:
+   Then watch the fair counters:
 
    ```bash
    curl -s http://127.0.0.1:9100/metrics | rg 'solanacdn_fair_(commits_rx_total|ledger_commits_seen_total|ledger_audit_checked_total)'
    ```
+
+5. Multinode + load test helper (optional):
+
+   To validate `--fair` across multiple validator processes and generate background load, run:
+
+   ```bash
+   scripts/solanacdn-fair-multinode-smoke.sh
+   ```
+
+   This helper runs validators as separate OS processes (not in-process `solana-local-cluster`)
+   because the SolanaCDN integration currently uses process-global state.
 
 ## Notes / limitations
 

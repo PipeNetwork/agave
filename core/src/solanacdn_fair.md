@@ -415,6 +415,17 @@ Key metrics (Prometheus) include:
 The SolanaCDN metrics server also exposes a read-only JSON snapshot of recent fair evidence at
 `/solanacdn/fair-evidence` (recent ACK/witness/reject keys and in-memory slashing state).
 
+## Local validation
+
+Recommended local smoke tests in this repo:
+
+- Single validator: `scripts/solanacdn-fair-smoke.sh` (uses `scripts/run.sh` + `solanacdn-pop-stub`)
+- Multinode + load: `scripts/solanacdn-fair-multinode-smoke.sh` (uses `multinode-demo/*` to run
+  validators as separate OS processes)
+
+Note: the SolanaCDN integration currently uses process-global state, so multi-validator
+in-process harnesses like `solana-local-cluster` are not suitable for testing SolanaCDN fair mode.
+
 ## Auditor runbook (alerts + triage)
 
 ### Suggested alerts (PromQL examples)
