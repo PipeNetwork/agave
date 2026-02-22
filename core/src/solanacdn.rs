@@ -7737,6 +7737,7 @@ async fn run_pop_session(
 
     // Control stream reader.
     let ctrl_reader_task = {
+        let conn = conn.clone();
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
@@ -7753,7 +7754,14 @@ async fn run_pop_session(
             loop {
                 let msg = match read_pop_msg(&mut ctrl_recv, CTRL_MAX_FRAME_BYTES).await {
                     Ok(v) => v,
-                    Err(_) => return,
+                    Err(e) => {
+                        debug!("solanacdn: control stream read error from {endpoint}: {e}");
+                        conn.close(
+                            quinn::VarInt::from_u32(SCDN_PROTOCOL_VIOLATION_CLOSE_CODE),
+                            b"control stream read error",
+                        );
+                        return;
+                    }
                 };
                 handle_pop_msg(
                     endpoint,
@@ -7807,7 +7815,14 @@ async fn run_pop_session(
                     res = read_pop_msg(&mut shreds_recv, SHREDS_MAX_FRAME_BYTES) => {
                         let msg = match res {
                             Ok(v) => v,
-                            Err(_) => return,
+                            Err(e) => {
+                                debug!("solanacdn: shreds stream read error from {endpoint}: {e}");
+                                conn.close(
+                                    quinn::VarInt::from_u32(SCDN_PROTOCOL_VIOLATION_CLOSE_CODE),
+                                    b"shreds stream read error",
+                                );
+                                return;
+                            }
                         };
                         if !matches!(msg, PopToAgent::PushShredBatch(_)) {
                             handle
@@ -7878,7 +7893,14 @@ async fn run_pop_session(
                     res = read_pop_msg(&mut votes_recv, VOTES_MAX_FRAME_BYTES) => {
                         let msg = match res {
                             Ok(v) => v,
-                            Err(_) => return,
+                            Err(e) => {
+                                debug!("solanacdn: votes stream read error from {endpoint}: {e}");
+                                conn.close(
+                                    quinn::VarInt::from_u32(SCDN_PROTOCOL_VIOLATION_CLOSE_CODE),
+                                    b"votes stream read error",
+                                );
+                                return;
+                            }
                         };
                         if !matches!(msg, PopToAgent::PushVoteDatagram(_)) {
                             handle
