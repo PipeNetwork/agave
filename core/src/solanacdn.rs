@@ -108,6 +108,7 @@ const FAIR_BATCH_REJECT_MAX_BATCHES_PER_SLOT: usize = 8_192;
 const FAIR_RECENT_BLOCKHASH_TTL_MS: u64 = 60_000;
 const POP_EGRESS_IP_TTL_MS: u64 = 10 * 60_000;
 const POP_EGRESS_IP_MAX_ENTRIES: usize = 50_000;
+const PIPE_API_VERIFY_MAX_POP_ENDPOINTS: usize = 32;
 
 // Tighten framing limits beyond the protocol default (16MiB). These are chosen to be generous for
 // expected message sizes while capping per-frame allocations if a POP misbehaves.
@@ -1052,6 +1053,19 @@ pub enum DataPlaneMode {
     Always,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopPubkeyPinningMode {
+    Off,
+    Warn,
+    Enforce,
+}
+
+impl Default for PopPubkeyPinningMode {
+    fn default() -> Self {
+        Self::Warn
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TvuShredIngestMode {
     /// Always ingest turbine TVU shreds from any peer (normal validator behavior).
@@ -1083,6 +1097,9 @@ pub struct SolanaCdnConfig {
     pub server_name: String,
     pub tls_insecure_skip_verify: bool,
     pub tls_ca_cert_path: Option<PathBuf>,
+    /// If Pipe-managed discovery returns a POP pubkey for a given endpoint, optionally enforce that
+    /// the connected POP presents the expected pubkey during auth.
+    pub pop_pubkey_pinning: PopPubkeyPinningMode,
 
     pub udp_mode: DataPlaneMode,
 
@@ -1186,6 +1203,7 @@ impl SolanaCdnConfig {
             server_name: "solanacdn-pop".to_string(),
             tls_insecure_skip_verify: false,
             tls_ca_cert_path: None,
+            pop_pubkey_pinning: PopPubkeyPinningMode::Warn,
             udp_mode: DataPlaneMode::Auto,
             pipe_api_base_url: "https://api.pipedev.network".to_string(),
             pipe_api_token: None,
@@ -1237,6 +1255,7 @@ impl Default for SolanaCdnConfig {
             server_name: "solanacdn-pop".to_string(),
             tls_insecure_skip_verify: false,
             tls_ca_cert_path: None,
+            pop_pubkey_pinning: PopPubkeyPinningMode::Warn,
             udp_mode: DataPlaneMode::Auto,
             pipe_api_base_url: "https://api.pipedev.network".to_string(),
             pipe_api_token: None,
@@ -1900,6 +1919,7 @@ pub struct SolanaCdnHandle {
     uplink_broadcast_lagged: AtomicU64,
     pop_endpoint_ips: DashSet<IpAddr>,
     pop_egress_ips: DashMap<IpAddr, u64>,
+    pipe_pop_expected_pubkeys: DashMap<SocketAddr, PubkeyBytes>,
     connected_pops: DashSet<SocketAddr>,
     publisher_endpoint: ArcSwapOption<String>,
     publisher_switches_total: AtomicU64,
@@ -1975,6 +1995,7 @@ impl SolanaCdnHandle {
             uplink_broadcast_lagged: AtomicU64::new(0),
             pop_endpoint_ips: DashSet::new(),
             pop_egress_ips: DashMap::new(),
+            pipe_pop_expected_pubkeys: DashMap::new(),
             connected_pops: DashSet::new(),
             publisher_endpoint: ArcSwapOption::const_empty(),
             publisher_switches_total: AtomicU64::new(0),
@@ -3932,6 +3953,17 @@ impl SolanaCdnHandle {
         }
     }
 
+    fn note_pipe_pop_expected_pubkeys(&self, expected: &HashMap<SocketAddr, PubkeyBytes>) {
+        self.pipe_pop_expected_pubkeys.clear();
+        for (ep, pk) in expected {
+            self.pipe_pop_expected_pubkeys.insert(*ep, *pk);
+        }
+    }
+
+    fn expected_pipe_pop_pubkey(&self, endpoint: SocketAddr) -> Option<PubkeyBytes> {
+        self.pipe_pop_expected_pubkeys.get(&endpoint).map(|v| *v)
+    }
+
     pub fn note_pop_endpoint(&self, endpoint: SocketAddr) {
         self.pop_endpoint_ips.insert(endpoint.ip());
     }
@@ -4820,6 +4852,18 @@ fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     out
 }
 
+fn pop_assign_score(seed: &str, key: &str) -> u64 {
+    let digest = sha256_hasher::hashv(&[
+        b"solanacdn_pop_assign_v1|",
+        seed.as_bytes(),
+        b"|",
+        key.as_bytes(),
+    ]);
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest.as_ref()[..8]);
+    u64::from_be_bytes(head)
+}
+
 #[derive(Debug, Deserialize)]
 struct PipeApiSolanaCdnTlsResponse {
     ok: bool,
@@ -5024,6 +5068,17 @@ struct PipeApiVerifyResponse {
     /// POP endpoints for the agent to connect to (provided by control plane).
     #[serde(default)]
     pop_endpoints: Vec<String>,
+    /// POP endpoints with metadata (preferred; additive field).
+    #[serde(default)]
+    pop_endpoints_v2: Vec<PipeApiPopEndpointV2>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PipeApiPopEndpointV2 {
+    id: String,
+    quic_endpoint: String,
+    #[serde(default)]
+    node_pubkey: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5042,6 +5097,7 @@ struct PipeApiVerifyResult {
     heartbeat_schema_version: u32,
     ingest: PipeApiIngestConfig,
     pop_endpoints: Vec<SocketAddr>,
+    pop_expected_pubkeys: HashMap<SocketAddr, PubkeyBytes>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5139,19 +5195,95 @@ async fn pipe_api_verify(
         )));
     }
 
-    let mut pop_endpoints: Vec<SocketAddr> = parsed
-        .pop_endpoints
-        .iter()
-        .filter_map(|s| match s.parse::<SocketAddr>() {
-            Ok(addr) => Some(addr),
-            Err(e) => {
-                warn!("solanacdn: ignoring invalid pop_endpoint from Pipe API verify ({s}): {e}");
-                None
+    let mut pop_expected_pubkeys: HashMap<SocketAddr, PubkeyBytes> = HashMap::new();
+
+    let mut pop_endpoints: Vec<SocketAddr> = Vec::new();
+    if !parsed.pop_endpoints_v2.is_empty() {
+        use std::str::FromStr;
+
+        let mut candidates: HashMap<SocketAddr, (String, Option<PubkeyBytes>)> = HashMap::new();
+        for pop in parsed.pop_endpoints_v2.iter() {
+            let addr = match pop.quic_endpoint.parse::<SocketAddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!(
+                        "solanacdn: ignoring invalid pop_endpoint from Pipe API verify v2 ({}): {e}",
+                        pop.quic_endpoint
+                    );
+                    continue;
+                }
+            };
+            let expected_pubkey = match pop
+                .node_pubkey
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(b58) => match Pubkey::from_str(b58) {
+                    Ok(pk) => Some(PubkeyBytes(pk.to_bytes())),
+                    Err(e) => {
+                        warn!(
+                            "solanacdn: ignoring invalid pop node_pubkey from Pipe API verify v2 ({b58}): {e}"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            match candidates.entry(addr) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((pop.id.clone(), expected_pubkey));
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    if o.get().1.is_none() && expected_pubkey.is_some() {
+                        o.insert((pop.id.clone(), expected_pubkey));
+                    }
+                }
             }
-        })
-        .collect();
+        }
+
+        let mut scored: Vec<(u64, SocketAddr, String, Option<PubkeyBytes>)> = candidates
+            .into_iter()
+            .map(|(addr, (id, pk))| (pop_assign_score(&req.validator_pubkey, &id), addr, id, pk))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)).then_with(|| a.1.cmp(&b.1)));
+        if scored.len() > PIPE_API_VERIFY_MAX_POP_ENDPOINTS {
+            scored.truncate(PIPE_API_VERIFY_MAX_POP_ENDPOINTS);
+        }
+
+        for (_score, addr, _id, pk) in scored {
+            pop_endpoints.push(addr);
+            if let Some(pk) = pk {
+                pop_expected_pubkeys.insert(addr, pk);
+            }
+        }
+    }
+
+    if pop_endpoints.is_empty() {
+        let mut candidates: Vec<(String, SocketAddr)> = Vec::new();
+        for s in parsed.pop_endpoints.iter() {
+            match s.parse::<SocketAddr>() {
+                Ok(addr) => candidates.push((s.trim().to_string(), addr)),
+                Err(e) => {
+                    warn!("solanacdn: ignoring invalid pop_endpoint from Pipe API verify ({s}): {e}");
+                }
+            }
+        }
+
+        candidates.sort_by(|(a_raw, a_addr), (b_raw, b_addr)| {
+            let sa = pop_assign_score(&req.validator_pubkey, a_raw);
+            let sb = pop_assign_score(&req.validator_pubkey, b_raw);
+            sb.cmp(&sa).then_with(|| a_raw.cmp(b_raw)).then_with(|| a_addr.cmp(b_addr))
+        });
+        if candidates.len() > PIPE_API_VERIFY_MAX_POP_ENDPOINTS {
+            candidates.truncate(PIPE_API_VERIFY_MAX_POP_ENDPOINTS);
+        }
+        pop_endpoints = candidates.into_iter().map(|(_raw, addr)| addr).collect();
+    }
     pop_endpoints.sort();
     pop_endpoints.dedup();
+    pop_expected_pubkeys.retain(|ep, _| pop_endpoints.binary_search(ep).is_ok());
 
     Ok(PipeApiVerifyResult {
         agent_id: parsed.agent_id,
@@ -5160,6 +5292,7 @@ async fn pipe_api_verify(
         heartbeat_schema_version: parsed.heartbeat_schema_version.unwrap_or(0),
         ingest: parsed.ingest,
         pop_endpoints,
+        pop_expected_pubkeys,
     })
 }
 
@@ -5213,6 +5346,7 @@ fn spawn_pipe_pop_session_token_refresher(
     cfg: PipeApiClientConfig,
     validator_pubkey_base58: String,
     direct_shreds_from_pop: bool,
+    handle: Arc<SolanaCdnHandle>,
 ) -> PipeApiRefresher {
     let (token_tx, token_rx) = watch::channel::<Option<String>>(None);
     let (pops_tx, pops_rx) = watch::channel::<Vec<SocketAddr>>(Vec::new());
@@ -5255,6 +5389,7 @@ fn spawn_pipe_pop_session_token_refresher(
                 }
             };
 
+            handle.note_pipe_pop_expected_pubkeys(&verify.pop_expected_pubkeys);
             verify_tx.send_replace(Some(verify.clone()));
 
             if verify.pop_endpoints.is_empty() {
@@ -6955,6 +7090,7 @@ async fn run(
                 },
                 validator_pubkey_base58.clone(),
                 cfg.direct_shreds_from_pop,
+                handle.clone(),
             )
         });
 
@@ -7496,6 +7632,24 @@ async fn run_pop_session(
         }
     };
     let pop_pubkey = auth_ok.pop_pubkey;
+
+    if let Some(expected) = handle.expected_pipe_pop_pubkey(endpoint) {
+        if expected != pop_pubkey {
+            let expected_b58 = expected.to_base58();
+            let actual_b58 = pop_pubkey.to_base58();
+            match cfg.pop_pubkey_pinning {
+                PopPubkeyPinningMode::Off => {}
+                PopPubkeyPinningMode::Warn => {
+                    warn!("solanacdn: POP pubkey mismatch for {endpoint}: expected={expected_b58} actual={actual_b58} (continuing)");
+                }
+                PopPubkeyPinningMode::Enforce => {
+                    return Err(SolanaCdnError::AuthFailed(format!(
+                        "POP pubkey mismatch for {endpoint}: expected={expected_b58} actual={actual_b58}"
+                    )));
+                }
+            }
+        }
+    }
 
     // Advertise per-session capabilities so POPs can decide whether to use fair TX ordering.
     write_agent_msg(
@@ -12833,6 +12987,7 @@ mod tests {
                 max_events: 100,
             },
             pop_endpoints: Vec::new(),
+            pop_expected_pubkeys: HashMap::new(),
         };
 
         let (body, consumed) = build_pipe_ingest_body(&v, &handle, &cfg, "validator", 123);
@@ -13889,12 +14044,16 @@ mod tests {
             )
             .await;
 
+            // Keep the shreds/votes bi streams open so the client doesn't treat early EOF as a
+            // protocol violation.
+            let mut held_streams = Vec::new();
             for _ in 0..2 {
-                if let Ok(Ok((mut _send, mut recv))) =
+                if let Ok(Ok((send, mut recv))) =
                     tokio::time::timeout(Duration::from_secs(2), conn.accept_bi()).await
                 {
                     let _ = tokio::time::timeout(Duration::from_secs(2), read_agent_msg(&mut recv))
                         .await;
+                    held_streams.push((send, recv));
                 }
             }
 

@@ -1571,6 +1571,15 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .help("TLS server name (SNI) for SolanaCDN POP QUIC connections"),
     )
     .arg(
+        Arg::with_name("solanacdn_pop_pubkey_pinning")
+            .long("solanacdn-pop-pubkey-pinning")
+            .value_name("MODE")
+            .takes_value(true)
+            .possible_values(&["off", "warn", "enforce"])
+            .default_value("warn")
+            .help("When Pipe API POP discovery provides POP pubkeys, validate the connected POP pubkey during auth: off|warn|enforce"),
+    )
+    .arg(
         Arg::with_name("solanacdn_tls_ca_cert_path")
             .long("solanacdn-tls-ca-cert-path")
             .value_name("FILE")

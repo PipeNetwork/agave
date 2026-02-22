@@ -561,6 +561,14 @@ pub fn execute(
         if let Some(server_name) = matches.value_of("solanacdn_server_name") {
             cfg.server_name = server_name.to_string();
         }
+        cfg.pop_pubkey_pinning = match matches
+            .value_of("solanacdn_pop_pubkey_pinning")
+            .unwrap_or("warn")
+        {
+            "off" => solana_core::solanacdn::PopPubkeyPinningMode::Off,
+            "enforce" => solana_core::solanacdn::PopPubkeyPinningMode::Enforce,
+            _ => solana_core::solanacdn::PopPubkeyPinningMode::Warn,
+        };
         cfg.tls_ca_cert_path = matches
             .value_of("solanacdn_tls_ca_cert_path")
             .map(PathBuf::from);

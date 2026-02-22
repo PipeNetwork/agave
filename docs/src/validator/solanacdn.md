@@ -35,6 +35,16 @@ If you have a Pipe API key, you can enable SolanaCDN without specifying POP endp
 
 The validator verifies the API key via `POST /v1/solanacdn-agent/verify` and uses the returned POP list.
 
+For scalability and blast-radius reduction, the Pipe API can return a **per-node assigned subset** of
+active POPs (instead of returning all POPs globally to every client). The validator will only
+connect to the returned subset.
+
+If the Pipe API returns POP pubkeys (`pop_endpoints_v2`), the validator can pin the expected POP
+pubkey during auth:
+
+- `--solanacdn-pop-pubkey-pinning warn` (default): log mismatch, continue
+- `--solanacdn-pop-pubkey-pinning enforce`: treat mismatch as fatal and disconnect
+
 ## Enable (explicit POP list / private CA)
 
 If you self-host POPs (or want to point at a specific POP directly), configure:
