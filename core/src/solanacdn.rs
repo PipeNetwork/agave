@@ -7454,6 +7454,17 @@ async fn handle_metrics_conn(mut stream: TcpStream, handle: Arc<SolanaCdnHandle>
             )
             .await;
         }
+        "/solanacdn/fair-evidence" | "/fair-evidence" => {
+            let evidence = handle.fair_evidence_snapshot();
+            let body = serde_json::to_vec(&evidence).unwrap_or_else(|_| b"{}".to_vec());
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await;
+        }
         _ => {
             write_http_response(
                 &mut stream,
@@ -9541,6 +9552,77 @@ async fn handle_pop_msg(
                 }
 
                 let order_start = tx_seq_start;
+                let strict_onchain_required =
+                    cfg.tx_fair_slashing && cfg.tx_fair_slashing_strict && target_slot.is_some();
+
+                let (ack_tx_bytes, commit_txs): (Option<Vec<u8>>, Vec<Vec<u8>>) =
+                    if let Some(slot) = target_slot {
+                        if let Some(recent_blockhash) = recent_blockhash {
+                            let ack_tx_bytes = build_fair_ledger_ack_memo_tx(
+                                auth,
+                                recent_blockhash,
+                                slot,
+                                &origin_pop_id,
+                                flow_id,
+                                batch_id,
+                                order_start,
+                                expected_tx_count,
+                                tx_merkle_root,
+                            );
+                            let commit_txs = build_fair_ledger_commit_memo_txs(
+                                auth,
+                                recent_blockhash,
+                                slot,
+                                batch_id,
+                                order_start,
+                                sig_bytes.as_slice(),
+                            );
+                            (ack_tx_bytes, commit_txs)
+                        } else {
+                            (None, Vec::new())
+                        }
+                    } else {
+                        (None, Vec::new())
+                    };
+
+                if strict_onchain_required {
+                    let chunk_size = FAIR_LEDGER_COMMIT_MAX_SIGS_PER_CHUNK.max(1);
+                    let expected_chunk_total =
+                        sig_bytes.len().div_ceil(chunk_size).min(u16::MAX as usize);
+                    if ack_tx_bytes.is_none()
+                        || commit_txs.is_empty()
+                        || commit_txs.len() != expected_chunk_total
+                    {
+                        debug!(
+                            "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; strict mode requires on-chain ACK+COMMIT memos (recent_blockhash present)"
+                        );
+                        try_send_fair_batch_reject(
+                            &ctrl_out_tx,
+                            auth,
+                            &origin_pop_id,
+                            flow_id,
+                            batch_id,
+                            tx_seq_start,
+                            target_slot,
+                            FairBatchRejectReason::InternalError,
+                        )
+                        .await;
+                        try_inject_fair_batch_reject_memo(
+                            udp_inject_tpu,
+                            auth,
+                            recent_blockhash,
+                            &origin_pop_id,
+                            flow_id,
+                            batch_id,
+                            tx_seq_start,
+                            target_slot,
+                            FairBatchRejectReason::InternalError,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+
                 for (idx, tx) in incoming_txs.iter().enumerate() {
                     // `should_dedup_tx_sig()` is authoritative for the fair ordering contract, so
                     // only mark as seen after the full batch is accepted.
@@ -9550,33 +9632,12 @@ async fn handle_pop_msg(
                     insert_fair_priority(tx.sig.0, priority);
                 }
 
-                if let Some(slot) = target_slot {
-                    if let Some(recent_blockhash) = recent_blockhash {
-                        if let Some(ack_tx_bytes) = build_fair_ledger_ack_memo_tx(
-                            auth,
-                            recent_blockhash,
-                            slot,
-                            &origin_pop_id,
-                            flow_id,
-                            batch_id,
-                            order_start,
-                            expected_tx_count,
-                            tx_merkle_root,
-                        ) {
-                            let _ = udp_inject_tpu.send(&ack_tx_bytes).await;
-                        }
-
-                        let commit_txs = build_fair_ledger_commit_memo_txs(
-                            auth,
-                            recent_blockhash,
-                            slot,
-                            batch_id,
-                            order_start,
-                            sig_bytes.as_slice(),
-                        );
-                        for tx_bytes in commit_txs {
-                            let _ = udp_inject_tpu.send(&tx_bytes).await;
-                        }
+                if target_slot.is_some() {
+                    if let Some(ack_tx_bytes) = ack_tx_bytes {
+                        let _ = udp_inject_tpu.send(&ack_tx_bytes).await;
+                    }
+                    for tx_bytes in commit_txs {
+                        let _ = udp_inject_tpu.send(&tx_bytes).await;
                     }
                 }
 
