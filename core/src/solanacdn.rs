@@ -7945,6 +7945,7 @@ async fn run_pop_session(
 
     // UDP shreds downlink (PushShredBatch + PushShredFecChunk + DirectShredsProbe).
     let udp_shreds_task = if let Some(sock) = udp_shreds.clone() {
+        let conn = conn.clone();
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
@@ -8048,7 +8049,14 @@ async fn run_pop_session(
                                         handle
                                             .dropped_udp_shreds_unexpected_msg
                                             .fetch_add(1, Ordering::Relaxed);
-                                        continue;
+                                        warn!("solanacdn: protocol violation from {endpoint}: unexpected msg type after FEC decode; closing session");
+                                        conn.close(
+                                            quinn::VarInt::from_u32(
+                                                SCDN_PROTOCOL_VIOLATION_CLOSE_CODE,
+                                            ),
+                                            b"unexpected msg on udp shreds port (fec)",
+                                        );
+                                        return;
                                     }
                                     handle_pop_msg(
                                         endpoint,
@@ -8096,6 +8104,12 @@ async fn run_pop_session(
                                 handle
                                     .dropped_udp_shreds_unexpected_msg
                                     .fetch_add(1, Ordering::Relaxed);
+                                warn!("solanacdn: protocol violation from {endpoint}: unexpected msg type on udp shreds port; closing session");
+                                conn.close(
+                                    quinn::VarInt::from_u32(SCDN_PROTOCOL_VIOLATION_CLOSE_CODE),
+                                    b"unexpected msg on udp shreds port",
+                                );
+                                return;
                             }
                         }
 
@@ -8120,6 +8134,7 @@ async fn run_pop_session(
 
     // UDP votes downlink.
     let udp_votes_task = if let Some(sock) = udp_votes.clone() {
+        let conn = conn.clone();
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
@@ -8172,7 +8187,12 @@ async fn run_pop_session(
                             handle
                                 .dropped_udp_votes_unexpected_msg
                                 .fetch_add(1, Ordering::Relaxed);
-                            continue;
+                            warn!("solanacdn: protocol violation from {endpoint}: unexpected msg type on udp votes port; closing session");
+                            conn.close(
+                                quinn::VarInt::from_u32(SCDN_PROTOCOL_VIOLATION_CLOSE_CODE),
+                                b"unexpected msg on udp votes port",
+                            );
+                            return;
                         }
                         handle_pop_msg(
                             endpoint,
