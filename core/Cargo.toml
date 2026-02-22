@@ -89,7 +89,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_bytes = { workspace = true }
 slab = { workspace = true }
-solanacdn-protocol = { git = "https://github.com/PipeNetwork/solanacdn-protocol", rev = "7e2ebc2ad7b6984d8c5e137f29e27926e16679ec" }
+solanacdn-protocol = { git = "https://github.com/PipeNetwork/solanacdn-protocol", rev = "a2440e5f2b088e82faa63e70a3d94818c18ba806" }
 solana-account = { workspace = true }
 solana-accounts-db = { workspace = true }
 solana-address-lookup-table-interface = { workspace = true }
