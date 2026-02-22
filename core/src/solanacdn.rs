@@ -105,6 +105,7 @@ const FAIR_BATCH_ACK_MAX_BATCHES_PER_SLOT: usize = 8_192;
 const FAIR_BATCH_REJECT_TTL_MS: u64 = 10 * 60_000;
 const FAIR_BATCH_REJECT_MAX_SLOTS: usize = 50_000;
 const FAIR_BATCH_REJECT_MAX_BATCHES_PER_SLOT: usize = 8_192;
+const FAIR_RECENT_BATCH_EVENT_MAX_ENTRIES: usize = 8_192;
 const FAIR_RECENT_BLOCKHASH_TTL_MS: u64 = 60_000;
 const POP_EGRESS_IP_TTL_MS: u64 = 10 * 60_000;
 const POP_EGRESS_IP_MAX_ENTRIES: usize = 50_000;
@@ -469,6 +470,19 @@ struct FairLedgerAuditSlotEntry {
     witness_gen: u64,
     reject_gen: u64,
     audited_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FairRecentBatchKey {
+    leader: PubkeyBytes,
+    slot: u64,
+    batch_id: u128,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FairRecentBatchEvent {
+    key: FairRecentBatchKey,
+    seen_at_ms: u64,
 }
 
 static FAIR_PRIORITIES: OnceLock<DashMap<[u8; 64], FairPriorityEntry>> = OnceLock::new();
@@ -1900,6 +1914,9 @@ pub struct SolanaCdnFairEvidenceSnapshot {
     pub slashed: Vec<SolanaCdnFairSlashedLeaderEvidence>,
     pub ledger_audits: Vec<SolanaCdnFairLedgerAuditEvidence>,
     pub fair_batch_witness_diversity_failed_total: u64,
+    pub recent_acks: Vec<SolanaCdnFairAckBatchEvidence>,
+    pub recent_witnesses: Vec<SolanaCdnFairWitnessBatchEvidence>,
+    pub recent_rejects: Vec<SolanaCdnFairRejectBatchEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1923,6 +1940,51 @@ pub struct SolanaCdnFairLedgerAuditEvidence {
     pub witness_gen: u64,
     pub reject_gen: u64,
     pub audited_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolanaCdnFairAckBatchEvidence {
+    pub seen_at_ms: u64,
+    pub leader: String,
+    pub slot: u64,
+    pub origin_pop_id_hash: String,
+    pub flow_id: String,
+    pub batch_id: String,
+    pub order_start: u64,
+    pub tx_count: u32,
+    pub tx_merkle_root: String,
+    pub leader_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolanaCdnFairWitnessBatchEvidence {
+    pub seen_at_ms: u64,
+    pub leader: String,
+    pub slot: u64,
+    pub origin_pop_id_hash: String,
+    pub flow_id: String,
+    pub batch_id: String,
+    pub order_start: u64,
+    pub tx_count: u32,
+    pub tx_merkle_root: String,
+    pub pop_time_ms: u64,
+    pub witness_quorum: u8,
+    pub witness_quorum_met: bool,
+    pub diversity_ok: bool,
+    pub witnessers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SolanaCdnFairRejectBatchEvidence {
+    pub seen_at_ms: u64,
+    pub leader: String,
+    pub slot: u64,
+    pub origin_pop_id_hash: String,
+    pub flow_id: String,
+    pub batch_id: String,
+    pub order_start: u64,
+    pub reason: FairBatchRejectReason,
+    pub leader_time_ms: u64,
 }
 
 #[derive(Debug)]
@@ -1969,6 +2031,9 @@ pub struct SolanaCdnHandle {
     fair_batch_witness_slots: DashMap<FairSlashedKey, FairWitnessSlotState>,
     fair_batch_ack_slots: DashMap<FairSlashedKey, FairAckSlotState>,
     fair_batch_reject_slots: DashMap<FairSlashedKey, FairRejectSlotState>,
+    fair_recent_ack_batches: std::sync::Mutex<VecDeque<FairRecentBatchEvent>>,
+    fair_recent_witness_batches: std::sync::Mutex<VecDeque<FairRecentBatchEvent>>,
+    fair_recent_reject_batches: std::sync::Mutex<VecDeque<FairRecentBatchEvent>>,
     dropped_shred_payloads: AtomicU64,
     dropped_shred_batches_oversized: AtomicU64,
     dropped_vote_datagrams: AtomicU64,
@@ -2048,6 +2113,9 @@ impl SolanaCdnHandle {
             fair_batch_witness_slots: DashMap::new(),
             fair_batch_ack_slots: DashMap::new(),
             fair_batch_reject_slots: DashMap::new(),
+            fair_recent_ack_batches: std::sync::Mutex::new(VecDeque::new()),
+            fair_recent_witness_batches: std::sync::Mutex::new(VecDeque::new()),
+            fair_recent_reject_batches: std::sync::Mutex::new(VecDeque::new()),
             dropped_shred_payloads: AtomicU64::new(0),
             dropped_shred_batches_oversized: AtomicU64::new(0),
             dropped_vote_datagrams: AtomicU64::new(0),
@@ -2433,14 +2501,7 @@ impl SolanaCdnHandle {
         }
     }
 
-    fn fair_witness_quorum_met(&self, witnessers: &[PubkeyBytes], witness_quorum: usize) -> bool {
-        if witnessers.len() < witness_quorum {
-            return false;
-        }
-        if witness_quorum < 2 {
-            return true;
-        }
-
+    fn fair_witness_diversity_ok(&self, witnessers: &[PubkeyBytes]) -> bool {
         // Require at least 2 distinct “network domains” (region/ASN) when metadata is available.
         // Fall back to POP id or pubkey when discovery metadata is missing.
         let mut keys: HashSet<(Option<u32>, Option<String>)> = HashSet::new();
@@ -2464,12 +2525,34 @@ impl SolanaCdnHandle {
             }
         }
 
-        let ok = keys.len() >= 2;
+        keys.len() >= 2
+    }
+
+    fn fair_witness_quorum_met(&self, witnessers: &[PubkeyBytes], witness_quorum: usize) -> bool {
+        if witnessers.len() < witness_quorum {
+            return false;
+        }
+        if witness_quorum < 2 {
+            return true;
+        }
+
+        let ok = self.fair_witness_diversity_ok(witnessers);
         if !ok {
             self.fair_batch_witness_diversity_failed
                 .fetch_add(1, Ordering::Relaxed);
         }
         ok
+    }
+
+    fn push_recent_fair_batch_event(
+        queue: &std::sync::Mutex<VecDeque<FairRecentBatchEvent>>,
+        event: FairRecentBatchEvent,
+    ) {
+        let mut queue = queue.lock().unwrap();
+        while queue.len() >= FAIR_RECENT_BATCH_EVENT_MAX_ENTRIES {
+            queue.pop_front();
+        }
+        queue.push_back(event);
     }
 
     fn note_fair_batch_ack_for_slashing(&self, ack: &FairBatchReceiptCommit) {
@@ -2555,6 +2638,18 @@ impl SolanaCdnHandle {
                 });
             }
         }
+
+        Self::push_recent_fair_batch_event(
+            &self.fair_recent_ack_batches,
+            FairRecentBatchEvent {
+                key: FairRecentBatchKey {
+                    leader,
+                    slot,
+                    batch_id,
+                },
+                seen_at_ms: now,
+            },
+        );
 
         // If we have a POP witness for this batch, it must match the leader ACK.
         if let Some(entry) = self.fair_batch_witness_slots.get(&key) {
@@ -2759,6 +2854,20 @@ impl SolanaCdnHandle {
             }
         }
 
+        if witnesser_added {
+            Self::push_recent_fair_batch_event(
+                &self.fair_recent_witness_batches,
+                FairRecentBatchEvent {
+                    key: FairRecentBatchKey {
+                        leader: key.leader,
+                        slot,
+                        batch_id,
+                    },
+                    seen_at_ms: now,
+                },
+            );
+        }
+
         // If we have a leader ACK for this batch, it must match the POP witness.
         if !witness_quorum_met {
             return witnesser_added;
@@ -2869,6 +2978,18 @@ impl SolanaCdnHandle {
                 });
             }
         }
+
+        Self::push_recent_fair_batch_event(
+            &self.fair_recent_reject_batches,
+            FairRecentBatchEvent {
+                key: FairRecentBatchKey {
+                    leader,
+                    slot,
+                    batch_id,
+                },
+                seen_at_ms: now,
+            },
+        );
 
         // Reject and ACK for the same leader+slot+batch_id is an equivocation (or a POP bug).
         if let Some(entry) = self.fair_batch_ack_slots.get(&key) {
@@ -4435,8 +4556,14 @@ impl SolanaCdnHandle {
     pub fn fair_evidence_snapshot(&self) -> SolanaCdnFairEvidenceSnapshot {
         const MAX_SLASHED_ENTRIES: usize = 512;
         const MAX_LEDGER_AUDIT_ENTRIES: usize = 512;
+        const MAX_RECENT_ACK_BATCHES: usize = 256;
+        const MAX_RECENT_WITNESS_BATCHES: usize = 256;
+        const MAX_RECENT_REJECT_BATCHES: usize = 256;
+        const RECENT_SCAN_MULTIPLIER: usize = 4;
 
         let now = now_ms();
+        let witness_quorum = (self.cfg.tx_fair_slashing_witness_quorum.max(1) as usize)
+            .min(FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH);
 
         let mut slashed: Vec<SolanaCdnFairSlashedLeaderEvidence> = Vec::new();
         for entry in self.fair_slashed_leaders.iter().take(MAX_SLASHED_ENTRIES) {
@@ -4483,6 +4610,154 @@ impl SolanaCdnHandle {
         }
         ledger_audits.sort_by(|a, b| b.slot.cmp(&a.slot));
 
+        let recent_ack_events: Vec<FairRecentBatchEvent> = self
+            .fair_recent_ack_batches
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(MAX_RECENT_ACK_BATCHES.saturating_mul(RECENT_SCAN_MULTIPLIER))
+            .copied()
+            .collect();
+        let mut recent_acks: Vec<SolanaCdnFairAckBatchEvidence> = Vec::new();
+        let mut seen_acks: HashSet<FairRecentBatchKey> = HashSet::new();
+        for ev in recent_ack_events {
+            if recent_acks.len() >= MAX_RECENT_ACK_BATCHES {
+                break;
+            }
+            if !seen_acks.insert(ev.key) {
+                continue;
+            }
+            let key = FairSlashedKey {
+                leader: ev.key.leader,
+                slot: ev.key.slot,
+            };
+            let Some(entry) = self.fair_batch_ack_slots.get(&key) else {
+                continue;
+            };
+            if entry.expires_at_ms < now {
+                drop(entry);
+                self.fair_batch_ack_slots.remove(&key);
+                continue;
+            }
+            let Some(batch) = entry.batches.get(&ev.key.batch_id) else {
+                continue;
+            };
+            recent_acks.push(SolanaCdnFairAckBatchEvidence {
+                seen_at_ms: ev.seen_at_ms,
+                leader: key.leader.to_base58(),
+                slot: key.slot,
+                origin_pop_id_hash: hex_string(&batch.origin_pop_id_hash),
+                flow_id: batch.flow_id.to_string(),
+                batch_id: ev.key.batch_id.to_string(),
+                order_start: batch.order_start,
+                tx_count: batch.tx_count,
+                tx_merkle_root: hex_string(&batch.tx_merkle_root),
+                leader_time_ms: batch.leader_time_ms,
+            });
+        }
+
+        let recent_witness_events: Vec<FairRecentBatchEvent> = self
+            .fair_recent_witness_batches
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(MAX_RECENT_WITNESS_BATCHES.saturating_mul(RECENT_SCAN_MULTIPLIER))
+            .copied()
+            .collect();
+        let mut recent_witnesses: Vec<SolanaCdnFairWitnessBatchEvidence> = Vec::new();
+        let mut seen_witnesses: HashSet<FairRecentBatchKey> = HashSet::new();
+        for ev in recent_witness_events {
+            if recent_witnesses.len() >= MAX_RECENT_WITNESS_BATCHES {
+                break;
+            }
+            if !seen_witnesses.insert(ev.key) {
+                continue;
+            }
+            let key = FairSlashedKey {
+                leader: ev.key.leader,
+                slot: ev.key.slot,
+            };
+            let Some(entry) = self.fair_batch_witness_slots.get(&key) else {
+                continue;
+            };
+            if entry.expires_at_ms < now {
+                drop(entry);
+                self.fair_batch_witness_slots.remove(&key);
+                continue;
+            }
+            let Some(batch) = entry.batches.get(&ev.key.batch_id) else {
+                continue;
+            };
+            let witnessers: Vec<String> = batch.witnessers.iter().map(PubkeyBytes::to_base58).collect();
+            let diversity_ok = witness_quorum < 2 || self.fair_witness_diversity_ok(batch.witnessers.as_slice());
+            let witness_quorum_met = batch.witnessers.len() >= witness_quorum
+                && (witness_quorum < 2 || diversity_ok);
+            recent_witnesses.push(SolanaCdnFairWitnessBatchEvidence {
+                seen_at_ms: ev.seen_at_ms,
+                leader: key.leader.to_base58(),
+                slot: key.slot,
+                origin_pop_id_hash: hex_string(&batch.origin_pop_id_hash),
+                flow_id: batch.flow_id.to_string(),
+                batch_id: ev.key.batch_id.to_string(),
+                order_start: batch.order_start,
+                tx_count: batch.tx_count,
+                tx_merkle_root: hex_string(&batch.tx_merkle_root),
+                pop_time_ms: batch.pop_time_ms,
+                witness_quorum: witness_quorum as u8,
+                witness_quorum_met,
+                diversity_ok,
+                witnessers,
+            });
+        }
+
+        let recent_reject_events: Vec<FairRecentBatchEvent> = self
+            .fair_recent_reject_batches
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .take(MAX_RECENT_REJECT_BATCHES.saturating_mul(RECENT_SCAN_MULTIPLIER))
+            .copied()
+            .collect();
+        let mut recent_rejects: Vec<SolanaCdnFairRejectBatchEvidence> = Vec::new();
+        let mut seen_rejects: HashSet<FairRecentBatchKey> = HashSet::new();
+        for ev in recent_reject_events {
+            if recent_rejects.len() >= MAX_RECENT_REJECT_BATCHES {
+                break;
+            }
+            if !seen_rejects.insert(ev.key) {
+                continue;
+            }
+            let key = FairSlashedKey {
+                leader: ev.key.leader,
+                slot: ev.key.slot,
+            };
+            let Some(entry) = self.fair_batch_reject_slots.get(&key) else {
+                continue;
+            };
+            if entry.expires_at_ms < now {
+                drop(entry);
+                self.fair_batch_reject_slots.remove(&key);
+                continue;
+            }
+            let Some(batch) = entry.batches.get(&ev.key.batch_id) else {
+                continue;
+            };
+            recent_rejects.push(SolanaCdnFairRejectBatchEvidence {
+                seen_at_ms: ev.seen_at_ms,
+                leader: key.leader.to_base58(),
+                slot: key.slot,
+                origin_pop_id_hash: hex_string(&batch.origin_pop_id_hash),
+                flow_id: batch.flow_id.to_string(),
+                batch_id: ev.key.batch_id.to_string(),
+                order_start: batch.order_start,
+                reason: batch.reason,
+                leader_time_ms: batch.leader_time_ms,
+            });
+        }
+
         SolanaCdnFairEvidenceSnapshot {
             now_ms: now,
             slashed,
@@ -4490,6 +4765,9 @@ impl SolanaCdnHandle {
             fair_batch_witness_diversity_failed_total: self
                 .fair_batch_witness_diversity_failed
                 .load(Ordering::Relaxed),
+            recent_acks,
+            recent_witnesses,
+            recent_rejects,
         }
     }
 
@@ -5257,6 +5535,16 @@ fn parse_hex_32(raw: &str) -> Option<[u8; 32]> {
         out[i] = (hi << 4) | lo;
     }
     Some(out)
+}
+
+fn hex_string(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (i, b) in bytes.iter().enumerate() {
+        out[2 * i] = HEX[(b >> 4) as usize];
+        out[2 * i + 1] = HEX[(b & 0x0f) as usize];
+    }
+    String::from_utf8(out.to_vec()).unwrap_or_default()
 }
 
 fn sha256_bytes(data: &[u8]) -> [u8; 32] {
@@ -7695,6 +7983,9 @@ async fn manage_pop_sessions(
     let mut status_tick = tokio::time::interval(Duration::from_secs(30));
     status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut last_fair_witness_quorum_warn_ms: u64 = 0;
+    let mut last_fair_witness_quorum_warn_connected: usize = usize::MAX;
+
     // Spawn initial sessions.
     for endpoint in desired.iter().copied() {
         spawn_session(
@@ -7768,6 +8059,30 @@ async fn manage_pop_sessions(
                     handle.rx_vote_packets.load(Ordering::Relaxed),
                     handle.rx_tx_packets.load(Ordering::Relaxed),
                 );
+
+                let witness_features_enabled = cfg.tx_fair_slashing
+                    && (cfg.tx_fair_slashing_witness
+                        || cfg.tx_fair_slashing_nonresponse
+                        || cfg.tx_fair_slashing_publish_witness_memos);
+                if witness_features_enabled {
+                    let witness_quorum = (cfg.tx_fair_slashing_witness_quorum.max(1) as usize)
+                        .min(FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH);
+                    if witness_quorum >= 2 && pops.len() < witness_quorum {
+                        let now = now_ms();
+                        let should_warn = pops.len() != last_fair_witness_quorum_warn_connected
+                            || now.saturating_sub(last_fair_witness_quorum_warn_ms)
+                                >= 5 * 60_000;
+                        if should_warn {
+                            warn!(
+                                "solanacdn: fair witness quorum={} but connected_pops={}; witness quorum cannot be met (slashing proofs may be incomplete until more POPs connect)",
+                                witness_quorum,
+                                pops.len()
+                            );
+                            last_fair_witness_quorum_warn_ms = now;
+                            last_fair_witness_quorum_warn_connected = pops.len();
+                        }
+                    }
+                }
             }
             _ = async {
                 if let Some(rx) = pipe_pop_endpoints_rx.as_mut() {
@@ -9755,6 +10070,48 @@ async fn handle_pop_msg(
                     auth,
                     recent_blockhash,
                     pop_pubkey,
+                    &witness,
+                )
+                .await;
+            }
+        }
+        PopToAgent::FairBatchWitnessV2 {
+            witness_pop_pubkey,
+            witness,
+        } => {
+            handle.fair_batch_witness_rx.fetch_add(1, Ordering::Relaxed);
+            if !cfg.tx_fair_slashing
+                || (!cfg.tx_fair_slashing_witness
+                    && !cfg.tx_fair_slashing_nonresponse
+                    && !cfg.tx_fair_slashing_publish_witness_memos)
+            {
+                return;
+            }
+            if witness_pop_pubkey != pop_pubkey
+                && handle.pipe_pop_meta_by_pubkey.get(&witness_pop_pubkey).is_none()
+            {
+                debug!(
+                    "solanacdn: dropping forwarded fair witness from {endpoint}: unknown witness_pop_pubkey={}",
+                    witness_pop_pubkey.to_base58()
+                );
+                return;
+            }
+            if let Err(e) = witness.verify(witness_pop_pubkey) {
+                handle
+                    .fair_batch_witness_invalid
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!("solanacdn: invalid fair witness from {endpoint}: {e}");
+                return;
+            }
+            let witnesser_added =
+                handle.note_fair_batch_witness_for_slashing(witness_pop_pubkey, &witness);
+            if cfg.tx_fair_slashing_publish_witness_memos && witnesser_added {
+                let recent_blockhash = handle.fair_recent_blockhash();
+                try_inject_fair_ledger_witness_memo(
+                    udp_inject_tpu,
+                    auth,
+                    recent_blockhash,
+                    witness_pop_pubkey,
                     &witness,
                 )
                 .await;

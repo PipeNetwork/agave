@@ -1250,6 +1250,9 @@ mod tests {
             assert!(result.get("now_ms").is_some());
             assert!(result.get("slashed").is_some());
             assert!(result.get("ledger_audits").is_some());
+            assert!(result.get("recent_acks").is_some());
+            assert!(result.get("recent_witnesses").is_some());
+            assert!(result.get("recent_rejects").is_some());
         } else {
             assert!(result.is_null());
         }
