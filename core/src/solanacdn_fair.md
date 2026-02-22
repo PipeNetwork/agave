@@ -189,6 +189,15 @@ metadata includes `region` and/or `asn`, witnessers must span at least two disti
 domains” (region/ASN) when `N >= 2`. If metadata is missing, auditors fall back to unique POP
 pubkeys.
 
+To avoid framing via arbitrary third-party keys, auditors only count witness receipts from POP
+pubkeys they recognize (via Pipe discovery signer metadata and/or POP pubkey pinning data). If you
+connect to only a subset of POP endpoints, discovery should still provide the full POP signer
+registry so forwarded witnesses can be verified.
+
+In particular, on-chain witness memos (`SCDNWITN`) are permissionless: anyone can post a memo that
+contains a “witness” signed by an arbitrary keypair. Auditors therefore only treat witness memos as
+evidence when the `witness_pop_pubkey` is known/allowlisted.
+
 ### ACK-gated vs witness-gated slashing
 
 There are two “acceptance” signals that can trigger slashing:
@@ -281,16 +290,22 @@ non-fair transaction writes a fenced account).
 The ledger alone cannot prove that a leader *received* a fair batch (a leader can always omit
 commits and claim non-receipt). Witness mode adds:
 
-- A **leader-signed ACK stream** (`FairBatchAck`, protocol v7+) containing a compact receipt commit
+- A **leader-signed ACK stream** (`FairBatchAck`, protocol v9+) containing a compact receipt commit
   (`tx_count`, Merkle root, `target_slot`, `order_start`).
-- A **POP-signed witness stream** (`FairBatchWitness`, protocol v6+) binding the leader identity to
+- A **POP-signed witness stream** (`FairBatchWitness`, protocol v9+) binding the leader identity to
   the POP attestation payload.
+  - For deployments that forward/gossip witness receipts across the POP mesh, protocol v9 adds
+    `FairBatchWitnessV2 { witness_pop_pubkey, witness }` so observers can verify forwarded witness
+    receipts without relying on session-level POP pubkey context.
 - **On-chain ACK memos** (`SCDNACKD`) and **REJECT memos** (`SCDNRJCT`) that make receipt evidence
   replayable from the ledger.
 - **On-chain witness memos** (`SCDNWITN`) that allow third parties to publish POP witness receipts
   to the ledger for replayable audits (enabled by default under `--fair` in this fork).
   - Validators can optionally publish these memos when receiving witness receipts via
     `--fair-slashing-publish-witness-memos` (implied by `--fair` in this fork).
+  - To bound load/fees, validators cap witness memo publication to **at most N memos per
+    (leader,slot,batch_id)** where `N = --fair-slashing-witness-quorum` (default `2` under
+    `--fair`).
 
 Auditors subscribe to both and treat it as a violation if:
 
@@ -308,7 +323,7 @@ POP witness alone cannot frame a leader, but witnesses remain necessary for cros
 ### Non-response mode (`--fair-slashing-nonresponse`)
 
 If you also want to punish “POP witnessed delivery but leader never committed nor rejected”, enable
-`--fair-slashing-nonresponse` (protocol v8+). This relies on POP-signed witness receipts as
+`--fair-slashing-nonresponse` (protocol v9+). This relies on POP-signed witness receipts as
 external evidence of delivery; the ledger alone cannot prove non-receipt.
 
 To reduce the risk of false positives from a single POP, use `--fair-slashing-witness-quorum N` to
@@ -396,6 +411,9 @@ Key metrics (Prometheus) include:
 - `solanacdn_tx_fair_batch_injected_total`
 - `solanacdn_fair_batch_dropped_*`
 - `solanacdn_fair_ledger_audit_*`
+
+The SolanaCDN metrics server also exposes a read-only JSON snapshot of recent fair evidence at
+`/solanacdn/fair-evidence` (recent ACK/witness/reject keys and in-memory slashing state).
 
 ## Auditor runbook (alerts + triage)
 

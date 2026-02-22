@@ -99,6 +99,7 @@ const FAIR_BATCH_WITNESS_TTL_MS: u64 = 10 * 60_000;
 const FAIR_BATCH_WITNESS_MAX_SLOTS: usize = 50_000;
 const FAIR_BATCH_WITNESS_MAX_BATCHES_PER_SLOT: usize = 8_192;
 const FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH: usize = 8;
+const FAIR_WITNESS_MEMO_PUBLISH_MAX_ENTRIES: usize = 200_000;
 const FAIR_BATCH_ACK_TTL_MS: u64 = 10 * 60_000;
 const FAIR_BATCH_ACK_MAX_SLOTS: usize = 50_000;
 const FAIR_BATCH_ACK_MAX_BATCHES_PER_SLOT: usize = 8_192;
@@ -483,6 +484,12 @@ struct FairRecentBatchKey {
 struct FairRecentBatchEvent {
     key: FairRecentBatchKey,
     seen_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FairWitnessMemoPublishEntry {
+    published: u8,
+    expires_at_ms: u64,
 }
 
 static FAIR_PRIORITIES: OnceLock<DashMap<[u8; 64], FairPriorityEntry>> = OnceLock::new();
@@ -1864,7 +1871,11 @@ pub struct SolanaCdnStatus {
     pub fair_ledger_audit_get_slot_entries_failed_total: u64,
     pub fair_ledger_commits_seen_total: u64,
     pub fair_ledger_commits_invalid_total: u64,
+    pub fair_batch_witness_forwarded_unknown_total: u64,
+    pub fair_ledger_witness_memo_unknown_pop_pubkey_total: u64,
     pub fair_batch_witness_diversity_failed_total: u64,
+    pub fair_witness_memos_published_total: u64,
+    pub fair_witness_memos_publish_skipped_total: u64,
     pub fair_order_witnesses_len: u64,
     pub fair_slashed_leaders_len: u64,
     pub fair_ledger_audited_slots_len: u64,
@@ -2027,13 +2038,18 @@ pub struct SolanaCdnHandle {
     fair_slashed_leaders: DashMap<FairSlashedKey, FairSlashedEntry>,
     fair_batch_witness_rx: AtomicU64,
     fair_batch_witness_invalid: AtomicU64,
+    fair_batch_witness_forwarded_unknown: AtomicU64,
     fair_batch_witness_diversity_failed: AtomicU64,
+    fair_ledger_witness_memo_unknown_pop_pubkey: AtomicU64,
     fair_batch_witness_slots: DashMap<FairSlashedKey, FairWitnessSlotState>,
     fair_batch_ack_slots: DashMap<FairSlashedKey, FairAckSlotState>,
     fair_batch_reject_slots: DashMap<FairSlashedKey, FairRejectSlotState>,
     fair_recent_ack_batches: std::sync::Mutex<VecDeque<FairRecentBatchEvent>>,
     fair_recent_witness_batches: std::sync::Mutex<VecDeque<FairRecentBatchEvent>>,
     fair_recent_reject_batches: std::sync::Mutex<VecDeque<FairRecentBatchEvent>>,
+    fair_witness_memos_published: AtomicU64,
+    fair_witness_memos_publish_skipped: AtomicU64,
+    fair_witness_memo_publish: DashMap<FairRecentBatchKey, FairWitnessMemoPublishEntry>,
     dropped_shred_payloads: AtomicU64,
     dropped_shred_batches_oversized: AtomicU64,
     dropped_vote_datagrams: AtomicU64,
@@ -2109,13 +2125,18 @@ impl SolanaCdnHandle {
             fair_slashed_leaders: DashMap::new(),
             fair_batch_witness_rx: AtomicU64::new(0),
             fair_batch_witness_invalid: AtomicU64::new(0),
+            fair_batch_witness_forwarded_unknown: AtomicU64::new(0),
             fair_batch_witness_diversity_failed: AtomicU64::new(0),
+            fair_ledger_witness_memo_unknown_pop_pubkey: AtomicU64::new(0),
             fair_batch_witness_slots: DashMap::new(),
             fair_batch_ack_slots: DashMap::new(),
             fair_batch_reject_slots: DashMap::new(),
             fair_recent_ack_batches: std::sync::Mutex::new(VecDeque::new()),
             fair_recent_witness_batches: std::sync::Mutex::new(VecDeque::new()),
             fair_recent_reject_batches: std::sync::Mutex::new(VecDeque::new()),
+            fair_witness_memos_published: AtomicU64::new(0),
+            fair_witness_memos_publish_skipped: AtomicU64::new(0),
+            fair_witness_memo_publish: DashMap::new(),
             dropped_shred_payloads: AtomicU64::new(0),
             dropped_shred_batches_oversized: AtomicU64::new(0),
             dropped_vote_datagrams: AtomicU64::new(0),
@@ -2553,6 +2574,53 @@ impl SolanaCdnHandle {
             queue.pop_front();
         }
         queue.push_back(event);
+    }
+
+    fn should_publish_fair_witness_memo(
+        &self,
+        key: FairRecentBatchKey,
+        max_per_batch: u8,
+        now: u64,
+    ) -> bool {
+        if max_per_batch == 0 {
+            return false;
+        }
+        if !self.cfg.tx_fair_slashing_publish_witness_memos {
+            return false;
+        }
+
+        if self.fair_witness_memo_publish.len() > FAIR_WITNESS_MEMO_PUBLISH_MAX_ENTRIES {
+            self.fair_witness_memo_publish.clear();
+        }
+
+        let expires_at_ms = now.saturating_add(FAIR_BATCH_WITNESS_TTL_MS);
+        match self.fair_witness_memo_publish.entry(key) {
+            Entry::Occupied(mut occ) => {
+                let entry = occ.get_mut();
+                if entry.expires_at_ms < now {
+                    entry.published = 0;
+                }
+                entry.expires_at_ms = expires_at_ms;
+                if entry.published >= max_per_batch {
+                    self.fair_witness_memos_publish_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                entry.published = entry.published.saturating_add(1);
+                self.fair_witness_memos_published
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Entry::Vacant(vac) => {
+                vac.insert(FairWitnessMemoPublishEntry {
+                    published: 1,
+                    expires_at_ms,
+                });
+                self.fair_witness_memos_published
+                    .fetch_add(1, Ordering::Relaxed);
+                true
+            }
+        }
     }
 
     fn note_fair_batch_ack_for_slashing(&self, ack: &FairBatchReceiptCommit) {
@@ -3421,6 +3489,16 @@ impl SolanaCdnHandle {
                             continue;
                         }
 
+                        let witness_pop_pubkey = memo.payload.witness_pop_pubkey;
+                        if self.pipe_pop_meta_by_pubkey.get(&witness_pop_pubkey).is_none() {
+                            // Defense-in-depth: witness memos are permissionless (anyone can post),
+                            // so only accept them as slashing evidence when the POP pubkey is
+                            // recognized via discovery/pinning metadata.
+                            self.fair_ledger_witness_memo_unknown_pop_pubkey
+                                .fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+
                         let witness = &memo.payload.witness;
                         let Some(target_slot) = witness.payload.attestation.target_slot else {
                             continue;
@@ -3440,7 +3518,7 @@ impl SolanaCdnHandle {
                             tx_merkle_root: witness.payload.attestation.tx_merkle_root,
                             order_start: witness.payload.attestation.tx_seq_start,
                             pop_time_ms: witness.payload.pop_time_ms,
-                            witnessers: vec![memo.payload.witness_pop_pubkey],
+                            witnessers: vec![witness_pop_pubkey],
                         };
 
                         if let Some(existing) = onchain_witness_batches.get_mut(&batch_id) {
@@ -4406,6 +4484,18 @@ impl SolanaCdnHandle {
         }
     }
 
+    fn note_pipe_pop_signer_metadata(&self, meta_by_pubkey: &HashMap<PubkeyBytes, PipePopMeta>) {
+        if meta_by_pubkey.is_empty() {
+            return;
+        }
+        for (pk, meta) in meta_by_pubkey {
+            if meta.id.trim().is_empty() && meta.region.is_none() && meta.asn.is_none() {
+                continue;
+            }
+            self.pipe_pop_meta_by_pubkey.insert(*pk, meta.clone());
+        }
+    }
+
     fn note_pipe_pop_metadata(&self, meta: &HashMap<SocketAddr, PipePopMeta>) {
         self.pipe_pop_meta_by_endpoint.clear();
         for (ep, m) in meta {
@@ -4811,8 +4901,19 @@ impl SolanaCdnHandle {
         let fair_ledger_commits_seen_total = self.fair_ledger_commits_seen.load(Ordering::Relaxed);
         let fair_ledger_commits_invalid_total =
             self.fair_ledger_commits_invalid.load(Ordering::Relaxed);
+        let fair_batch_witness_forwarded_unknown_total = self
+            .fair_batch_witness_forwarded_unknown
+            .load(Ordering::Relaxed);
+        let fair_ledger_witness_memo_unknown_pop_pubkey_total = self
+            .fair_ledger_witness_memo_unknown_pop_pubkey
+            .load(Ordering::Relaxed);
         let fair_batch_witness_diversity_failed_total = self
             .fair_batch_witness_diversity_failed
+            .load(Ordering::Relaxed);
+        let fair_witness_memos_published_total =
+            self.fair_witness_memos_published.load(Ordering::Relaxed);
+        let fair_witness_memos_publish_skipped_total = self
+            .fair_witness_memos_publish_skipped
             .load(Ordering::Relaxed);
         let fair_order_witnesses_len = self.fair_order_witnesses.len() as u64;
         let fair_slashed_leaders_len = self.fair_slashed_leaders.len() as u64;
@@ -4971,7 +5072,11 @@ impl SolanaCdnHandle {
             fair_ledger_audit_get_slot_entries_failed_total,
             fair_ledger_commits_seen_total,
             fair_ledger_commits_invalid_total,
+            fair_batch_witness_forwarded_unknown_total,
+            fair_ledger_witness_memo_unknown_pop_pubkey_total,
             fair_batch_witness_diversity_failed_total,
+            fair_witness_memos_published_total,
+            fair_witness_memos_publish_skipped_total,
             fair_order_witnesses_len,
             fair_slashed_leaders_len,
             fair_ledger_audited_slots_len,
@@ -5170,6 +5275,10 @@ impl SolanaCdnHandle {
             "fair_ledger_audit_get_slot_entries_failed_total": self.fair_ledger_audit_get_slot_entries_failed.load(Ordering::Relaxed) as i64,
             "fair_ledger_commits_seen_total": self.fair_ledger_commits_seen.load(Ordering::Relaxed) as i64,
             "fair_ledger_commits_invalid_total": self.fair_ledger_commits_invalid.load(Ordering::Relaxed) as i64,
+            "fair_batch_witness_forwarded_unknown_total": self.fair_batch_witness_forwarded_unknown.load(Ordering::Relaxed) as i64,
+            "fair_ledger_witness_memo_unknown_pop_pubkey_total": self.fair_ledger_witness_memo_unknown_pop_pubkey.load(Ordering::Relaxed) as i64,
+            "fair_witness_memos_published_total": self.fair_witness_memos_published.load(Ordering::Relaxed) as i64,
+            "fair_witness_memos_publish_skipped_total": self.fair_witness_memos_publish_skipped.load(Ordering::Relaxed) as i64,
             "uplink_dropped_shred_batches_total": self.dropped_shred_payloads.load(Ordering::Relaxed) as i64,
             "uplink_broadcast_lagged_total": self.uplink_broadcast_lagged.load(Ordering::Relaxed) as i64,
         })
@@ -5773,12 +5882,27 @@ struct PipeApiVerifyResponse {
     /// POP endpoints with metadata (preferred; additive field).
     #[serde(default)]
     pop_endpoints_v2: Vec<PipeApiPopEndpointV2>,
+    /// Optional signer registry (POP pubkeys + metadata) used to validate forwarded messages even
+    /// when the validator connects to only a subset of POP endpoints.
+    #[serde(default)]
+    pop_signers_v1: Vec<PipeApiPopSignerV1>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct PipeApiPopEndpointV2 {
     id: String,
     quic_endpoint: String,
+    #[serde(default)]
+    node_pubkey: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    asn: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PipeApiPopSignerV1 {
+    id: String,
     #[serde(default)]
     node_pubkey: Option<String>,
     #[serde(default)]
@@ -5812,6 +5936,7 @@ struct PipeApiVerifyResult {
     pop_endpoints: Vec<SocketAddr>,
     pop_expected_pubkeys: HashMap<SocketAddr, PubkeyBytes>,
     pop_meta_by_endpoint: HashMap<SocketAddr, PipePopMeta>,
+    pop_meta_by_pubkey: HashMap<PubkeyBytes, PipePopMeta>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5864,6 +5989,8 @@ async fn pipe_api_verify(
     cfg: &PipeApiClientConfig,
     req: &PipeApiVerifyRequest,
 ) -> Result<PipeApiVerifyResult, SolanaCdnError> {
+    use std::str::FromStr;
+
     let url = format!("{}/v1/solanacdn-agent/verify", cfg.base_url);
     let resp = client
         .post(&url)
@@ -5911,11 +6038,64 @@ async fn pipe_api_verify(
 
     let mut pop_expected_pubkeys: HashMap<SocketAddr, PubkeyBytes> = HashMap::new();
     let mut pop_meta_by_endpoint: HashMap<SocketAddr, PipePopMeta> = HashMap::new();
+    let mut pop_meta_by_pubkey: HashMap<PubkeyBytes, PipePopMeta> = HashMap::new();
+
+    for pop in parsed.pop_signers_v1.iter() {
+        let expected_pubkey = match pop
+            .node_pubkey
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(b58) => match Pubkey::from_str(b58) {
+                Ok(pk) => Some(PubkeyBytes(pk.to_bytes())),
+                Err(e) => {
+                    warn!(
+                        "solanacdn: ignoring invalid pop node_pubkey from Pipe API signer registry ({b58}): {e}"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(expected_pubkey) = expected_pubkey else {
+            continue;
+        };
+
+        let region = pop
+            .region
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase());
+        let asn = pop.asn.filter(|v| *v != 0);
+        let meta = PipePopMeta {
+            id: pop.id.trim().to_string(),
+            region,
+            asn,
+        };
+
+        match pop_meta_by_pubkey.entry(expected_pubkey) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(meta);
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let existing_meta = o.get_mut();
+                if existing_meta.region.is_none() && meta.region.is_some() {
+                    existing_meta.region = meta.region;
+                }
+                if existing_meta.asn.is_none() && meta.asn.is_some() {
+                    existing_meta.asn = meta.asn;
+                }
+                if existing_meta.id.trim().is_empty() && !meta.id.trim().is_empty() {
+                    existing_meta.id = meta.id;
+                }
+            }
+        }
+    }
 
     let mut pop_endpoints: Vec<SocketAddr> = Vec::new();
     if !parsed.pop_endpoints_v2.is_empty() {
-        use std::str::FromStr;
-
         let mut candidates: HashMap<SocketAddr, (PipePopMeta, Option<PubkeyBytes>)> =
             HashMap::new();
         for pop in parsed.pop_endpoints_v2.iter() {
@@ -6051,6 +6231,7 @@ async fn pipe_api_verify(
         pop_endpoints,
         pop_expected_pubkeys,
         pop_meta_by_endpoint,
+        pop_meta_by_pubkey,
     })
 }
 
@@ -6149,6 +6330,7 @@ fn spawn_pipe_pop_session_token_refresher(
 
             handle.note_pipe_pop_expected_pubkeys(&verify.pop_expected_pubkeys);
             handle.note_pipe_pop_metadata(&verify.pop_meta_by_endpoint);
+            handle.note_pipe_pop_signer_metadata(&verify.pop_meta_by_pubkey);
             verify_tx.send_replace(Some(verify.clone()));
 
             if verify.pop_endpoints.is_empty() {
@@ -7323,11 +7505,39 @@ fn format_prometheus_metrics(handle: &SolanaCdnHandle) -> String {
         status.fair_ledger_commits_invalid_total
     ));
 
+    out.push_str("# HELP solanacdn_fair_batch_witness_forwarded_unknown_total Number of forwarded fair-batch witness receipts dropped due to unknown witness POP pubkeys\n");
+    out.push_str("# TYPE solanacdn_fair_batch_witness_forwarded_unknown_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_batch_witness_forwarded_unknown_total {}\n",
+        status.fair_batch_witness_forwarded_unknown_total
+    ));
+
+    out.push_str("# HELP solanacdn_fair_ledger_witness_memo_unknown_pop_pubkey_total Number of on-chain witness memos ignored because the witness POP pubkey is unknown\n");
+    out.push_str("# TYPE solanacdn_fair_ledger_witness_memo_unknown_pop_pubkey_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_ledger_witness_memo_unknown_pop_pubkey_total {}\n",
+        status.fair_ledger_witness_memo_unknown_pop_pubkey_total
+    ));
+
     out.push_str("# HELP solanacdn_fair_batch_witness_diversity_failed_total Number of witness quorum checks that failed the diversity requirement\n");
     out.push_str("# TYPE solanacdn_fair_batch_witness_diversity_failed_total counter\n");
     out.push_str(&format!(
         "solanacdn_fair_batch_witness_diversity_failed_total {}\n",
         status.fair_batch_witness_diversity_failed_total
+    ));
+
+    out.push_str("# HELP solanacdn_fair_witness_memos_published_total Number of POP witness receipt memos published on-chain by this validator for replayable audits\n");
+    out.push_str("# TYPE solanacdn_fair_witness_memos_published_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_witness_memos_published_total {}\n",
+        status.fair_witness_memos_published_total
+    ));
+
+    out.push_str("# HELP solanacdn_fair_witness_memos_publish_skipped_total Number of POP witness receipt memos skipped due to per-batch publish caps\n");
+    out.push_str("# TYPE solanacdn_fair_witness_memos_publish_skipped_total counter\n");
+    out.push_str(&format!(
+        "solanacdn_fair_witness_memos_publish_skipped_total {}\n",
+        status.fair_witness_memos_publish_skipped_total
     ));
 
     out.push_str("# HELP solanacdn_fair_order_witnesses_entries Number of in-memory fair ordering witnesses tracked\n");
@@ -10064,7 +10274,25 @@ async fn handle_pop_msg(
             }
             let witnesser_added = handle.note_fair_batch_witness_for_slashing(pop_pubkey, &witness);
             if cfg.tx_fair_slashing_publish_witness_memos && witnesser_added {
+                let Some(slot) = witness.payload.attestation.target_slot else {
+                    return;
+                };
                 let recent_blockhash = handle.fair_recent_blockhash();
+                if recent_blockhash.is_none() {
+                    return;
+                }
+                let max_per_batch = cfg
+                    .tx_fair_slashing_witness_quorum
+                    .max(1)
+                    .min(FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH as u8);
+                let key = FairRecentBatchKey {
+                    leader: witness.payload.leader_pubkey,
+                    slot,
+                    batch_id: witness.payload.attestation.batch_id,
+                };
+                if !handle.should_publish_fair_witness_memo(key, max_per_batch, now_ms()) {
+                    return;
+                }
                 try_inject_fair_ledger_witness_memo(
                     udp_inject_tpu,
                     auth,
@@ -10090,6 +10318,9 @@ async fn handle_pop_msg(
             if witness_pop_pubkey != pop_pubkey
                 && handle.pipe_pop_meta_by_pubkey.get(&witness_pop_pubkey).is_none()
             {
+                handle
+                    .fair_batch_witness_forwarded_unknown
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(
                     "solanacdn: dropping forwarded fair witness from {endpoint}: unknown witness_pop_pubkey={}",
                     witness_pop_pubkey.to_base58()
@@ -10106,7 +10337,25 @@ async fn handle_pop_msg(
             let witnesser_added =
                 handle.note_fair_batch_witness_for_slashing(witness_pop_pubkey, &witness);
             if cfg.tx_fair_slashing_publish_witness_memos && witnesser_added {
+                let Some(slot) = witness.payload.attestation.target_slot else {
+                    return;
+                };
                 let recent_blockhash = handle.fair_recent_blockhash();
+                if recent_blockhash.is_none() {
+                    return;
+                }
+                let max_per_batch = cfg
+                    .tx_fair_slashing_witness_quorum
+                    .max(1)
+                    .min(FAIR_BATCH_WITNESS_MAX_WITNESSERS_PER_BATCH as u8);
+                let key = FairRecentBatchKey {
+                    leader: witness.payload.leader_pubkey,
+                    slot,
+                    batch_id: witness.payload.attestation.batch_id,
+                };
+                if !handle.should_publish_fair_witness_memo(key, max_per_batch, now_ms()) {
+                    return;
+                }
                 try_inject_fair_ledger_witness_memo(
                     udp_inject_tpu,
                     auth,
@@ -10148,6 +10397,30 @@ async fn handle_pop_msg(
                 handle.fair_commits_invalid.fetch_add(1, Ordering::Relaxed);
                 debug!("solanacdn: invalid fair commit from {endpoint}: {e}");
                 return;
+            }
+            // Best-effort: if the commit carries a leader-signed receipt commit, treat it as an
+            // ACK signal for slashing/auditing (defense-in-depth in case the explicit ACK stream
+            // is missing/delayed). Since `receipt_commit` is not covered by the commit signature,
+            // verify and cross-check it against the commit payload before using it.
+            if cfg.tx_fair_slashing_witness {
+                if let Some(receipt_commit) = commit.receipt_commit.as_ref() {
+                    if receipt_commit.verify().is_ok()
+                        && receipt_commit.payload.leader_pubkey == commit.payload.leader_pubkey
+                        && receipt_commit.payload.origin_pop_id == commit.payload.origin_pop_id
+                        && receipt_commit.payload.flow_id == commit.payload.flow_id
+                        && receipt_commit.payload.batch_id == commit.payload.batch_id
+                        && receipt_commit.payload.order_start == commit.payload.order_start
+                        && receipt_commit.payload.target_slot == commit.payload.target_slot
+                        && receipt_commit.payload.tx_count as usize == commit.payload.tx_sigs.len()
+                    {
+                        let sig_bytes: Vec<[u8; 64]> =
+                            commit.payload.tx_sigs.iter().map(|sig| sig.0).collect();
+                        let tx_merkle_root = fair_merkle_root(sig_bytes.as_slice());
+                        if tx_merkle_root == receipt_commit.payload.tx_merkle_root {
+                            handle.note_fair_batch_ack_for_slashing(receipt_commit);
+                        }
+                    }
+                }
             }
             handle.note_fair_commit_for_slashing(&commit);
         }
@@ -11102,6 +11375,15 @@ mod tests {
             FairBatchWitness::sign(witness_payload, &pop_signing_key).expect("sign witness");
         let pop_pubkey = PubkeyBytes::from(pop_signing_key.verifying_key());
 
+        handle.pipe_pop_meta_by_pubkey.insert(
+            pop_pubkey,
+            PipePopMeta {
+                id: "pop-test-1".to_string(),
+                region: None,
+                asn: None,
+            },
+        );
+
         let payer = Keypair::new();
         let recent_blockhash = solana_hash::Hash::default();
         let witness_tx_bytes =
@@ -11254,6 +11536,15 @@ mod tests {
         let witness_b =
             FairBatchWitness::sign(witness_payload, &pop_signing_key_b).expect("sign witness");
         let pop_pubkey_b = PubkeyBytes::from(pop_signing_key_b.verifying_key());
+
+        handle.pipe_pop_meta_by_pubkey.insert(
+            pop_pubkey_b,
+            PipePopMeta {
+                id: "pop-test-b".to_string(),
+                region: None,
+                asn: None,
+            },
+        );
 
         let payer = Keypair::new();
         let recent_blockhash = solana_hash::Hash::default();
@@ -11827,6 +12118,15 @@ mod tests {
         let witness =
             FairBatchWitness::sign(witness_payload, &pop_signing_key).expect("sign witness");
         let pop_pubkey = PubkeyBytes::from(pop_signing_key.verifying_key());
+
+        handle.pipe_pop_meta_by_pubkey.insert(
+            pop_pubkey,
+            PipePopMeta {
+                id: "pop-test-1".to_string(),
+                region: None,
+                asn: None,
+            },
+        );
 
         let payer = Keypair::new();
         let witness_tx_bytes =
@@ -13082,7 +13382,13 @@ mod tests {
         assert!(text.contains("solanacdn_fair_ledger_audit_get_slot_entries_failed_total "));
         assert!(text.contains("solanacdn_fair_ledger_commits_seen_total "));
         assert!(text.contains("solanacdn_fair_ledger_commits_invalid_total "));
+        assert!(text.contains("solanacdn_fair_batch_witness_forwarded_unknown_total "));
+        assert!(text.contains(
+            "solanacdn_fair_ledger_witness_memo_unknown_pop_pubkey_total "
+        ));
         assert!(text.contains("solanacdn_fair_batch_witness_diversity_failed_total "));
+        assert!(text.contains("solanacdn_fair_witness_memos_published_total "));
+        assert!(text.contains("solanacdn_fair_witness_memos_publish_skipped_total "));
         assert!(text.contains("solanacdn_fair_order_witnesses_entries "));
         assert!(text.contains("solanacdn_fair_slashed_leaders_entries "));
         assert!(text.contains("solanacdn_fair_ledger_audited_slots_entries "));
@@ -13993,6 +14299,7 @@ mod tests {
             pop_endpoints: Vec::new(),
             pop_expected_pubkeys: HashMap::new(),
             pop_meta_by_endpoint: HashMap::new(),
+            pop_meta_by_pubkey: HashMap::new(),
         };
 
         let (body, consumed) = build_pipe_ingest_body(&v, &handle, &cfg, "validator", 123);

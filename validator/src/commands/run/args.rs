@@ -1465,7 +1465,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "EXPERIMENTAL: Subscribe to leader-signed fair batch ACKs and POP-signed fair \
                  batch witnesses so auditors can punish “leader ACKed but never committed it” \
                  (including committed drops/insertion in ACKed slots) and detect ACK↔witness \
-                 mismatches. This requires protocol v7+ and implies \
+                 mismatches. This requires protocol v9+ and implies \
                  --fair-slashing.",
             ),
     )
@@ -1478,7 +1478,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                  fair batch rejects so auditors can punish “POP witnessed delivery but leader \
                  never committed nor rejected”. This relies on POP witnesses as external \
                  evidence of delivery (the ledger alone cannot prove non-receipt). This requires \
-                 protocol v8+ and implies --fair-slashing.",
+                 protocol v9+ and implies --fair-slashing.",
             ),
     )
     .arg(

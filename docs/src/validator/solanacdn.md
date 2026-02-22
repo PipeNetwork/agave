@@ -45,6 +45,15 @@ pubkey during auth:
 - `--solanacdn-pop-pubkey-pinning warn` (default): log mismatch, continue
 - `--solanacdn-pop-pubkey-pinning enforce`: treat mismatch as fatal and disconnect
 
+For fair-ordering witness forwarding, the validator also needs to know the set of valid POP signer
+pubkeys (even for POPs it is not directly connected to), so forwarded witness receipts can be
+verified. If this signer registry is incomplete, forwarded witnesses from unknown POP keys are
+dropped (see `solanacdn_fair_batch_witness_forwarded_unknown_total`).
+
+For on-chain witness memos (`SCDNWITN`), the memo program is permissionless, so the validator will
+**ignore witness memos from unknown POP pubkeys** (to prevent framing via arbitrary keys). See
+`solanacdn_fair_ledger_witness_memo_unknown_pop_pubkey_total`.
+
 ## Enable (explicit POP list / private CA)
 
 If you self-host POPs (or want to point at a specific POP directly), configure:
@@ -77,6 +86,10 @@ Enable fair transaction ordering for SolanaCDN-submitted flow:
 
 - `--fair`
 
+In this fork, `--fair` is an alias for `--fair-max-protection` (enables fair ordering plus the full
+set of audit/enforcement protections). See `core/src/solanacdn_fair.md` for the full contract and
+evidence model.
+
 This affects only the SolanaCDN fair-batch path (it does not change how P2P-gossip transactions are prioritized).
 
 When enabled, the validator advertises `tx_fair_ordering` to the POP and **expects transactions via `FairBatch`** (batch-of-1 is fine). Legacy `RelayTransaction` submissions are dropped to avoid bypassing the fair-ordering domain.
@@ -95,9 +108,23 @@ transactions and commit-memo transactions ahead of it):
 
 Witness mode (implies `--fair-slashing`; subscribes to leader-signed batch ACKs and POP-signed
 batch witnesses so auditors can punish “leader ACKed but never committed it” and detect
-ACK↔witness mismatches (and enforce strict audit on ACKed slots); requires POP support, protocol v7+):
+ACK↔witness mismatches (and enforce strict audit on ACKed slots); requires POP support, protocol v9+):
 
 - `--fair-slashing-witness`
+
+Non-response mode (implies `--fair-slashing`; subscribes to POP-signed batch witnesses and
+leader-signed batch rejects so auditors can punish “POP witnessed delivery but leader never
+committed nor rejected”; requires POP support and external witness receipts, protocol v9+):
+
+- `--fair-slashing-nonresponse`
+
+Witness quorum (used by witness/non-response modes to reduce framing risk):
+
+- `--fair-slashing-witness-quorum N`
+
+Optional on-chain witness receipts (adds load/fees; useful for replayable third-party audits):
+
+- `--fair-slashing-publish-witness-memos`
 
 Account-fence mode (implies `--fair-slashing`; treats any same-slot non-fair transaction that writes
 to a non-signer account written by a committed fair transaction as a violation):
@@ -126,6 +153,7 @@ To restore the startup configuration:
 ## Observability
 
 - Metrics + status: `--solanacdn-metrics-addr HOST:PORT` exposes Prometheus at `/metrics` and JSON status at `/solanacdn/status`.
+- Fair evidence (recent ACK/witness/reject keys): `/solanacdn/fair-evidence` on the same metrics server.
 - Admin RPC: `solanaCdnStatus` returns the same `SolanaCdnStatus` JSON (includes fair/slashing counters and enable flags).
 - In `--solanacdn-hybrid` mode, `tvu_shred_stale` / `tvu_shred_stale_for_ms` reflect time since the last shred accepted into the validator pipeline (compare with `last_shred_*` to diagnose delivery vs discard).
 - Race metrics (SolanaCDN vs gossip): enabled by default; disable with `--solanacdn-race=false`. Tune via `--solanacdn-race-sample-bits` and `--solanacdn-race-window-ms` (compatible with `--solanacdn-only` / `--solanacdn-hybrid`; does not change shred ingest mode).
