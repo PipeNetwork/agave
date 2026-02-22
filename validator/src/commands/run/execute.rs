@@ -553,6 +553,8 @@ pub fn execute(
         || solanacdn_control.is_some()
         || has_solanacdn_api_token)
         .then(|| {
+        let pop_pubkey_pinning_overridden =
+            matches.occurrences_of("solanacdn_pop_pubkey_pinning") > 0;
         let mut cfg = SolanaCdnConfig::default();
 
         cfg.pop_endpoints = solanacdn_pops;
@@ -693,6 +695,12 @@ pub fn execute(
         cfg.tx_fair_require_target_slot = fair_require_target_slot;
         cfg.tx_fair_ordering =
             matches.is_present("fair") || matches.is_present("fair_require_target_slot") || fair_slashing;
+
+        // In `--fair` mode (max protection), require POP pubkey pinning when discovery provides
+        // expected POP pubkeys, unless the operator explicitly overrides the pinning mode.
+        if fair_max_protection && !pop_pubkey_pinning_overridden {
+            cfg.pop_pubkey_pinning = solana_core::solanacdn::PopPubkeyPinningMode::Enforce;
+        }
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
 
         cfg.race_enabled = matches

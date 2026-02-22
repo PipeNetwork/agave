@@ -20,6 +20,7 @@ In this fork, `--fair` enables **maximum protection** against malicious leaders 
 - `--fair-slashing-fence-reads` (implies `--fair-slashing-fence`)
 - `--fair-slashing-publish-witness-memos`
 - `--fair-slashing-witness-quorum` defaults to `2` (override explicitly if desired)
+- `--solanacdn-pop-pubkey-pinning enforce` unless explicitly overridden (when Pipe discovery provides expected POP pubkeys)
 
 Enforcement is implemented as **vote withholding** on detected violations (not stake slashing).
 
@@ -182,6 +183,11 @@ POP-signed `FairBatchWitness` stream (optionally mirrored to on-chain `SCDNWITN`
 
 To reduce framing risk, non-response slashing requires `--fair-slashing-witness-quorum N` distinct
 witness POP keys agreeing on the same batch metadata.
+
+In this fork, quorum checks also require best-effort **witness diversity**: when POP discovery
+metadata includes `region` and/or `asn`, witnessers must span at least two distinct “network
+domains” (region/ASN) when `N >= 2`. If metadata is missing, auditors fall back to unique POP
+pubkeys.
 
 ### ACK-gated vs witness-gated slashing
 

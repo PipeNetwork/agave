@@ -197,7 +197,14 @@ pub trait AdminRpc {
     fn start_progress(&self, meta: Self::Metadata) -> Result<ValidatorStartProgress>;
 
     #[rpc(meta, name = "solanaCdnStatus")]
-    fn solana_cdn_status(&self, meta: Self::Metadata) -> Result<Option<solanacdn::SolanaCdnStatus>>;
+    fn solana_cdn_status(&self, meta: Self::Metadata)
+        -> Result<Option<solanacdn::SolanaCdnStatus>>;
+
+    #[rpc(meta, name = "solanaCdnFairEvidence")]
+    fn solana_cdn_fair_evidence(
+        &self,
+        meta: Self::Metadata,
+    ) -> Result<Option<solanacdn::SolanaCdnFairEvidenceSnapshot>>;
 
     #[rpc(meta, name = "solanaCdnSetFairSlashingEnforce")]
     fn solana_cdn_set_fair_slashing_enforce(
@@ -493,9 +500,20 @@ impl AdminRpc for AdminRpcImpl {
         Ok(*meta.start_progress.read().unwrap())
     }
 
-    fn solana_cdn_status(&self, _meta: Self::Metadata) -> Result<Option<solanacdn::SolanaCdnStatus>> {
+    fn solana_cdn_status(
+        &self,
+        _meta: Self::Metadata,
+    ) -> Result<Option<solanacdn::SolanaCdnStatus>> {
         debug!("solana_cdn_status admin rpc request received");
         Ok(solanacdn::global().map(|h| h.status_snapshot()))
+    }
+
+    fn solana_cdn_fair_evidence(
+        &self,
+        _meta: Self::Metadata,
+    ) -> Result<Option<solanacdn::SolanaCdnFairEvidenceSnapshot>> {
+        debug!("solana_cdn_fair_evidence admin rpc request received");
+        Ok(solanacdn::global().map(|h| h.fair_evidence_snapshot()))
     }
 
     fn solana_cdn_set_fair_slashing_enforce(
@@ -1177,9 +1195,7 @@ mod tests {
         let RpcHandler { io, meta, .. } = rpc;
 
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"solanaCdnStatus"}"#;
-        let res = io
-            .handle_request_sync(req, meta)
-            .expect("actual response");
+        let res = io.handle_request_sync(req, meta).expect("actual response");
         let value: Value = serde_json::from_str(&res).expect("json response");
 
         assert!(
@@ -1204,9 +1220,7 @@ mod tests {
         let RpcHandler { io, meta, .. } = rpc;
 
         let req = r#"{"jsonrpc":"2.0","id":1,"method":"solanaCdnSetFairSlashingEnforce","params":[false]}"#;
-        let res = io
-            .handle_request_sync(req, meta)
-            .expect("actual response");
+        let res = io.handle_request_sync(req, meta).expect("actual response");
         let value: Value = serde_json::from_str(&res).expect("json response");
 
         assert!(
@@ -1217,14 +1231,38 @@ mod tests {
     }
 
     #[test]
+    fn test_solana_cdn_fair_evidence_rpc_method_present() {
+        let rpc = RpcHandler::_start();
+        let RpcHandler { io, meta, .. } = rpc;
+
+        let req = r#"{"jsonrpc":"2.0","id":1,"method":"solanaCdnFairEvidence"}"#;
+        let res = io.handle_request_sync(req, meta).expect("actual response");
+        let value: Value = serde_json::from_str(&res).expect("json response");
+
+        assert!(
+            value.get("error").is_none(),
+            "unexpected rpc error: {value}"
+        );
+        assert!(value.get("result").is_some());
+
+        let result = &value["result"];
+        if result.is_object() {
+            assert!(result.get("now_ms").is_some());
+            assert!(result.get("slashed").is_some());
+            assert!(result.get("ledger_audits").is_some());
+        } else {
+            assert!(result.is_null());
+        }
+    }
+
+    #[test]
     fn test_solana_cdn_clear_fair_slashing_enforce_override_rpc_method_present() {
         let rpc = RpcHandler::_start();
         let RpcHandler { io, meta, .. } = rpc;
 
-        let req = r#"{"jsonrpc":"2.0","id":1,"method":"solanaCdnClearFairSlashingEnforceOverride"}"#;
-        let res = io
-            .handle_request_sync(req, meta)
-            .expect("actual response");
+        let req =
+            r#"{"jsonrpc":"2.0","id":1,"method":"solanaCdnClearFairSlashingEnforceOverride"}"#;
+        let res = io.handle_request_sync(req, meta).expect("actual response");
         let value: Value = serde_json::from_str(&res).expect("json response");
 
         assert!(
