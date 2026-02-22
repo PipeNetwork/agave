@@ -118,6 +118,8 @@ const VOTES_MAX_FRAME_BYTES: usize = 256 * 1024;
 // Bound CPU/memory for decoding large multi-shred batches.
 const PUSH_SHRED_BATCH_MAX_SHREDS: usize = 4_096;
 
+const SCDN_PROTOCOL_VIOLATION_CLOSE_CODE: u32 = 1;
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxFairSlashingEnforceOverride {
@@ -7778,6 +7780,7 @@ async fn run_pop_session(
 
     // Shreds stream reader.
     let shreds_reader_task = {
+        let conn = conn.clone();
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
@@ -7810,7 +7813,12 @@ async fn run_pop_session(
                             handle
                                 .dropped_quic_shreds_unexpected_msg
                                 .fetch_add(1, Ordering::Relaxed);
-                            continue;
+                            warn!("solanacdn: protocol violation from {endpoint}: unexpected msg type on shreds stream; closing session");
+                            conn.close(
+                                quinn::VarInt::from_u32(SCDN_PROTOCOL_VIOLATION_CLOSE_CODE),
+                                b"unexpected msg on shreds stream",
+                            );
+                            return;
                         }
                         handle_pop_msg(
                             endpoint,
@@ -7844,6 +7852,7 @@ async fn run_pop_session(
 
     // Votes stream reader.
     let votes_reader_task = {
+        let conn = conn.clone();
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
@@ -7875,7 +7884,12 @@ async fn run_pop_session(
                             handle
                                 .dropped_quic_votes_unexpected_msg
                                 .fetch_add(1, Ordering::Relaxed);
-                            continue;
+                            warn!("solanacdn: protocol violation from {endpoint}: unexpected msg type on votes stream; closing session");
+                            conn.close(
+                                quinn::VarInt::from_u32(SCDN_PROTOCOL_VIOLATION_CLOSE_CODE),
+                                b"unexpected msg on votes stream",
+                            );
+                            return;
                         }
                         handle_pop_msg(
                             endpoint,
