@@ -387,6 +387,11 @@ Equivalent manual configuration:
 - **Expect extra transactions:** per fair batch, the leader emits ~`1 + ceil(tx_count/12)` on-chain
   memo transactions (ACK + commit chunks). With `tx_count=512` this is up to `44` memo txs per
   batch, plus the fair wire transactions themselves.
+- **Deliver near the target slot:** to keep slot-bound receipt evidence stable, POPs should deliver
+  `FairBatch` messages **right before** the intended `target_slot` (e.g., in `target_slot - 1`).
+  Delivering too early increases the chance another leader includes the transactions/memos in a
+  different slot than the one referenced by the receipts; delivering too late increases the chance
+  receipt memos land in a later slot.
 - **Witness quorum is a tradeoff:** `--fair` defaults `--fair-slashing-witness-quorum=2`. This
   reduces framing risk, but if your deployment only has 1 witness, non-response enforcement will
   never trigger unless you explicitly set quorum to `1`.
