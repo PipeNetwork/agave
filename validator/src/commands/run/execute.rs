@@ -293,12 +293,25 @@ pub fn execute(
         DEFAULT_TPU_ENABLE_UDP
     };
 
+    if fair_any && tpu_use_quic && tpu_enable_udp && matches.is_present("tpu_enable_udp") {
+        warn!(
+            "--fair: TPU UDP was explicitly enabled, but is not required when TPU QUIC is enabled; \
+             consider removing --tpu-enable-udp to reduce attack surface"
+        );
+    }
+
     if !tpu_use_quic {
         if tpu_enable_udp {
             warn!(
                 "TPU QUIC was disabled via --tpu_disable_quic; validator will accept only UDP \
                  transactions"
             );
+            if fair_any {
+                warn!(
+                    "--fair: TPU QUIC is strongly recommended; using TPU UDP increases attack \
+                     surface and can reduce fairness reliability under load"
+                );
+            }
         } else {
             warn!(
                 "TPU QUIC was disabled via --tpu_disable_quic and TPU UDP is disabled; validator \
