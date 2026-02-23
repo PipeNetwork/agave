@@ -734,6 +734,16 @@ impl Validator {
                 .local_addr()
                 .map_err(|e| ValidatorError::Other(format!("failed to read TPU socket addr: {e}")))?
                 .port();
+            let tpu_quic_port = node
+                .sockets
+                .tpu_quic
+                .first()
+                .ok_or_else(|| ValidatorError::Other("missing TPU QUIC socket".to_string()))?
+                .local_addr()
+                .map_err(|e| {
+                    ValidatorError::Other(format!("failed to read TPU QUIC socket addr: {e}"))
+                })?
+                .port();
             let tpu_vote_port = node
                 .sockets
                 .tpu_vote
@@ -763,6 +773,7 @@ impl Validator {
                 })?
                 .port();
             let inject_tpu = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tpu_port);
+            let inject_tpu_quic = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tpu_quic_port);
             let inject_tvu = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tvu_port);
             let inject_gossip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), gossip_port);
             let inject_vote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tpu_vote_port);
@@ -770,8 +781,10 @@ impl Validator {
                 solanacdn_cfg,
                 identity_keypair.clone(),
                 exit.clone(),
+                use_quic,
                 vote_use_quic,
                 inject_tpu,
+                inject_tpu_quic,
                 inject_tvu,
                 inject_gossip,
                 inject_vote,

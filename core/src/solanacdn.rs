@@ -24,6 +24,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 
+use solana_connection_cache::connection_cache_stats::ConnectionCacheStats;
+use solana_connection_cache::nonblocking::client_connection::ClientConnection as _;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
@@ -32,6 +34,7 @@ use solana_ledger::shred::ShredId as LedgerShredId;
 use solana_message::{Message, VersionedMessage};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::Pubkey;
+use solana_quic_client::nonblocking::quic_client::{QuicClientConnection, QuicLazyInitializedEndpoint};
 use solana_runtime::bank::Bank;
 use solana_sha256_hasher as sha256_hasher;
 use solana_signer::Signer;
@@ -1006,8 +1009,21 @@ async fn try_send_fair_batch_reject(
     let _ = ctrl_out_tx.send(AgentToPop::FairBatchReject(reject)).await;
 }
 
+async fn try_inject_tpu_tx(
+    udp_inject_tpu: &UdpSocket,
+    tpu_quic_injector: Option<&QuicClientConnection>,
+    payload: &[u8],
+) -> bool {
+    if let Some(quic) = tpu_quic_injector {
+        quic.send_data(payload).await.is_ok()
+    } else {
+        udp_inject_tpu.send(payload).await.is_ok()
+    }
+}
+
 async fn try_inject_fair_batch_reject_memo(
     udp_inject_tpu: &UdpSocket,
+    tpu_quic_injector: Option<&QuicClientConnection>,
     auth: &AuthContext,
     recent_blockhash: Option<solana_hash::Hash>,
     origin_pop_id: &str,
@@ -1032,11 +1048,12 @@ async fn try_inject_fair_batch_reject_memo(
     ) else {
         return;
     };
-    let _ = udp_inject_tpu.send(&tx_bytes).await;
+    let _ = try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx_bytes).await;
 }
 
 async fn try_inject_fair_ledger_witness_memo(
     udp_inject_tpu: &UdpSocket,
+    tpu_quic_injector: Option<&QuicClientConnection>,
     auth: &AuthContext,
     recent_blockhash: Option<solana_hash::Hash>,
     witness_pop_pubkey: PubkeyBytes,
@@ -1053,7 +1070,7 @@ async fn try_inject_fair_ledger_witness_memo(
     ) else {
         return;
     };
-    let _ = udp_inject_tpu.send(&tx_bytes).await;
+    let _ = try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx_bytes).await;
 }
 
 fn fair_merkle_leaf_hash(index: u32, sig: &[u8; 64]) -> [u8; 32] {
@@ -5368,8 +5385,10 @@ pub fn init(
     mut cfg: SolanaCdnConfig,
     identity_keypair: Arc<Keypair>,
     exit: Arc<AtomicBool>,
+    tpu_use_quic: bool,
     vote_use_quic: bool,
     inject_tpu: SocketAddr,
+    inject_tpu_quic: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
     inject_vote: SocketAddr,
@@ -5422,7 +5441,9 @@ pub fn init(
                     identity_keypair,
                     exit,
                     handle,
+                    tpu_use_quic,
                     inject_tpu,
+                    inject_tpu_quic,
                     inject_tvu,
                     inject_gossip,
                     inject_vote,
@@ -8005,7 +8026,9 @@ async fn run(
     identity_keypair: Arc<Keypair>,
     exit: Arc<AtomicBool>,
     handle: Arc<SolanaCdnHandle>,
+    tpu_use_quic: bool,
     inject_tpu: SocketAddr,
+    inject_tpu_quic: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
     inject_vote: SocketAddr,
@@ -8084,6 +8107,20 @@ async fn run(
     handle.note_pop_endpoints(cfg.pop_endpoints.as_slice());
 
     let cfg = Arc::new(cfg);
+    let tpu_quic_injector: Option<Arc<QuicClientConnection>> = if tpu_use_quic {
+        let (cert, key) = solana_tls_utils::new_dummy_x509_certificate(identity_keypair.as_ref());
+        let endpoint = Arc::new(QuicLazyInitializedEndpoint::new(
+            Arc::new(solana_tls_utils::QuicClientCertificate { certificate: cert, key }),
+            None,
+        ));
+        Some(Arc::new(QuicClientConnection::new(
+            endpoint,
+            inject_tpu_quic,
+            Arc::new(ConnectionCacheStats::default()),
+        )))
+    } else {
+        None
+    };
     let auth = Arc::new(AuthContext::new(identity_keypair.clone())?);
     let quic_connect = Arc::new(QuicConnectConfig {
         client_config: make_quic_client_config(&cfg)?,
@@ -8128,6 +8165,7 @@ async fn run(
         quic_connect,
         control_tls,
         handle,
+        tpu_quic_injector,
         inject_tpu,
         inject_tvu,
         inject_gossip,
@@ -8153,6 +8191,7 @@ async fn manage_pop_sessions(
     quic_connect: Arc<QuicConnectConfig>,
     control_tls: Option<ControlTlsClient>,
     handle: Arc<SolanaCdnHandle>,
+    tpu_quic_injector: Option<Arc<QuicClientConnection>>,
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
@@ -8204,6 +8243,7 @@ async fn manage_pop_sessions(
             auth.clone(),
             quic_connect.clone(),
             handle.clone(),
+            tpu_quic_injector.clone(),
             inject_tpu,
             inject_tvu,
             inject_gossip,
@@ -8355,6 +8395,7 @@ async fn manage_pop_sessions(
                 auth.clone(),
                 quic_connect.clone(),
                 handle.clone(),
+                tpu_quic_injector.clone(),
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
@@ -8451,6 +8492,7 @@ fn spawn_session(
     auth: Arc<AuthContext>,
     quic_connect: Arc<QuicConnectConfig>,
     handle: Arc<SolanaCdnHandle>,
+    tpu_quic_injector: Option<Arc<QuicClientConnection>>,
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
@@ -8471,6 +8513,7 @@ fn spawn_session(
         quic_connect,
         handle,
         uplink_rx,
+        tpu_quic_injector,
         inject_tpu,
         inject_tvu,
         inject_gossip,
@@ -8498,6 +8541,7 @@ async fn run_pop_session_forever(
     quic_connect: Arc<QuicConnectConfig>,
     handle: Arc<SolanaCdnHandle>,
     mut uplink_rx: mpsc::Receiver<UplinkMsg>,
+    tpu_quic_injector: Option<Arc<QuicClientConnection>>,
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
@@ -8520,6 +8564,7 @@ async fn run_pop_session_forever(
             quic_connect.clone(),
             handle.clone(),
             &mut uplink_rx,
+            tpu_quic_injector.clone(),
             inject_tpu,
             inject_tvu,
             inject_gossip,
@@ -8577,6 +8622,7 @@ async fn run_pop_session(
     quic_connect: Arc<QuicConnectConfig>,
     handle: Arc<SolanaCdnHandle>,
     uplink_rx: &mut mpsc::Receiver<UplinkMsg>,
+    tpu_quic_injector: Option<Arc<QuicClientConnection>>,
     inject_tpu: SocketAddr,
     inject_tvu: SocketAddr,
     inject_gossip: SocketAddr,
@@ -8911,6 +8957,7 @@ async fn run_pop_session(
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
+        let tpu_quic_injector = tpu_quic_injector.clone();
         let udp_inject_tvu = udp_inject_tvu.clone();
         let udp_inject_gossip = udp_inject_gossip.clone();
         let udp_inject_votes = udp_inject_votes.clone();
@@ -8943,6 +8990,7 @@ async fn run_pop_session(
                     &mut publisher_rx,
                     &shred_deduper,
                     &udp_inject_tpu,
+                    tpu_quic_injector.as_deref(),
                     &udp_inject_tvu,
                     &udp_inject_gossip,
                     inject_vote,
@@ -8962,6 +9010,7 @@ async fn run_pop_session(
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
+        let tpu_quic_injector = tpu_quic_injector.clone();
         let udp_inject_tvu = udp_inject_tvu.clone();
         let udp_inject_gossip = udp_inject_gossip.clone();
         let udp_inject_votes = udp_inject_votes.clone();
@@ -9015,6 +9064,7 @@ async fn run_pop_session(
                             &mut publisher_rx,
                             &shred_deduper,
                             &udp_inject_tpu,
+                            tpu_quic_injector.as_deref(),
                             &udp_inject_tvu,
                             &udp_inject_gossip,
                             inject_vote,
@@ -9041,6 +9091,7 @@ async fn run_pop_session(
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
+        let tpu_quic_injector = tpu_quic_injector.clone();
         let udp_inject_tvu = udp_inject_tvu.clone();
         let udp_inject_gossip = udp_inject_gossip.clone();
         let udp_inject_votes = udp_inject_votes.clone();
@@ -9093,6 +9144,7 @@ async fn run_pop_session(
                             &mut publisher_rx,
                             &shred_deduper,
                             &udp_inject_tpu,
+                            tpu_quic_injector.as_deref(),
                             &udp_inject_tvu,
                             &udp_inject_gossip,
                             inject_vote,
@@ -9119,6 +9171,7 @@ async fn run_pop_session(
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
+        let tpu_quic_injector = tpu_quic_injector.clone();
         let udp_inject_tvu = udp_inject_tvu.clone();
         let udp_inject_gossip = udp_inject_gossip.clone();
         let udp_inject_votes = udp_inject_votes.clone();
@@ -9238,6 +9291,7 @@ async fn run_pop_session(
                                         &mut publisher_rx,
                                         &shred_deduper,
                                         &udp_inject_tpu,
+                                        tpu_quic_injector.as_deref(),
                                         &udp_inject_tvu,
                                         &udp_inject_gossip,
                                         inject_vote,
@@ -9260,6 +9314,7 @@ async fn run_pop_session(
                                     &mut publisher_rx,
                                     &shred_deduper,
                                     &udp_inject_tpu,
+                                    tpu_quic_injector.as_deref(),
                                     &udp_inject_tvu,
                                     &udp_inject_gossip,
                                     inject_vote,
@@ -9308,6 +9363,7 @@ async fn run_pop_session(
         let mut publisher_rx = publisher_rx.clone();
         let shred_deduper = shred_deduper.clone();
         let udp_inject_tpu = udp_inject_tpu.clone();
+        let tpu_quic_injector = tpu_quic_injector.clone();
         let udp_inject_tvu = udp_inject_tvu.clone();
         let udp_inject_gossip = udp_inject_gossip.clone();
         let udp_inject_votes = udp_inject_votes.clone();
@@ -9374,6 +9430,7 @@ async fn run_pop_session(
                             &mut publisher_rx,
                             &shred_deduper,
                             &udp_inject_tpu,
+                            tpu_quic_injector.as_deref(),
                             &udp_inject_tvu,
                             &udp_inject_gossip,
                             inject_vote,
@@ -9503,6 +9560,7 @@ async fn handle_pop_msg(
     publisher_rx: &mut watch::Receiver<Option<SocketAddr>>,
     shred_deduper: &ShredBatchDeduper,
     udp_inject_tpu: &UdpSocket,
+    tpu_quic_injector: Option<&QuicClientConnection>,
     udp_inject_tvu: &UdpSocket,
     udp_inject_gossip: &UdpSocket,
     inject_vote: SocketAddr,
@@ -9644,7 +9702,7 @@ async fn handle_pop_msg(
                 return;
             }
             handle.note_dedup_tx_sig(sig, now);
-            if udp_inject_tpu.send(&tx.payload).await.is_ok() {
+            if try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx.payload).await {
                 handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
             } else {
                 handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
@@ -9723,6 +9781,7 @@ async fn handle_pop_msg(
                     .await;
                     try_inject_fair_batch_reject_memo(
                         udp_inject_tpu,
+                        tpu_quic_injector,
                         auth,
                         recent_blockhash,
                         &origin_pop_id,
@@ -9753,6 +9812,7 @@ async fn handle_pop_msg(
                     .await;
                     try_inject_fair_batch_reject_memo(
                         udp_inject_tpu,
+                        tpu_quic_injector,
                         auth,
                         recent_blockhash,
                         &origin_pop_id,
@@ -9800,6 +9860,7 @@ async fn handle_pop_msg(
                     .await;
                     try_inject_fair_batch_reject_memo(
                         udp_inject_tpu,
+                        tpu_quic_injector,
                         auth,
                         recent_blockhash,
                         &origin_pop_id,
@@ -9840,6 +9901,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -9873,6 +9935,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -9906,6 +9969,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -9936,6 +10000,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -9966,6 +10031,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -9996,6 +10062,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -10028,6 +10095,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -10063,6 +10131,7 @@ async fn handle_pop_msg(
                     .await;
                     try_inject_fair_batch_reject_memo(
                         udp_inject_tpu,
+                        tpu_quic_injector,
                         auth,
                         recent_blockhash,
                         &origin_pop_id,
@@ -10134,6 +10203,7 @@ async fn handle_pop_msg(
                         .await;
                         try_inject_fair_batch_reject_memo(
                             udp_inject_tpu,
+                            tpu_quic_injector,
                             auth,
                             recent_blockhash,
                             &origin_pop_id,
@@ -10159,15 +10229,18 @@ async fn handle_pop_msg(
 
                 if target_slot.is_some() {
                     if let Some(ack_tx_bytes) = ack_tx_bytes {
-                        let _ = udp_inject_tpu.send(&ack_tx_bytes).await;
+                        let _ =
+                            try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &ack_tx_bytes)
+                                .await;
                     }
                     for tx_bytes in commit_txs {
-                        let _ = udp_inject_tpu.send(&tx_bytes).await;
+                        let _ = try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx_bytes)
+                            .await;
                     }
                 }
 
                 for tx in incoming_txs.iter() {
-                    if udp_inject_tpu.send(&tx.payload).await.is_ok() {
+                    if try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx.payload).await {
                         handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
                         handle
                             .tx_fair_batch_injected
@@ -10238,7 +10311,7 @@ async fn handle_pop_msg(
                     continue;
                 }
                 handle.note_dedup_tx_sig(tx.sig.0, now);
-                if udp_inject_tpu.send(&tx.payload).await.is_ok() {
+                if try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx.payload).await {
                     handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
                     handle
                         .tx_fair_batch_injected
@@ -10295,6 +10368,7 @@ async fn handle_pop_msg(
                 }
                 try_inject_fair_ledger_witness_memo(
                     udp_inject_tpu,
+                    tpu_quic_injector,
                     auth,
                     recent_blockhash,
                     pop_pubkey,
@@ -10358,6 +10432,7 @@ async fn handle_pop_msg(
                 }
                 try_inject_fair_ledger_witness_memo(
                     udp_inject_tpu,
+                    tpu_quic_injector,
                     auth,
                     recent_blockhash,
                     witness_pop_pubkey,
@@ -13139,6 +13214,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -13188,6 +13264,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -13271,6 +13348,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -13657,6 +13735,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -13761,6 +13840,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -13873,6 +13953,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -13986,6 +14067,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -14090,6 +14172,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             sink_addr,
@@ -14574,6 +14657,7 @@ mod tests {
                 quic_connect,
                 handle_for_client,
                 &mut uplink_rx,
+                None,
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
@@ -14761,6 +14845,7 @@ mod tests {
                 quic_connect,
                 handle_for_client,
                 &mut uplink_rx,
+                None,
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
@@ -14964,6 +15049,7 @@ mod tests {
                 quic_connect,
                 handle_for_client,
                 &mut uplink_rx,
+                None,
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
@@ -15045,6 +15131,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             vote_sink_addr,
@@ -15111,6 +15198,7 @@ mod tests {
             &mut publisher_rx,
             &shred_deduper,
             &udp_inject_tpu,
+            None,
             &udp_inject_tvu,
             &udp_inject_gossip,
             vote_sink_addr,
@@ -15276,6 +15364,7 @@ mod tests {
                 quic_connect,
                 handle,
                 &mut uplink_rx,
+                None,
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,
@@ -15470,6 +15559,8 @@ mod tests {
                 identity_keypair,
                 run_exit,
                 handle,
+                false,
+                inject_tpu,
                 inject_tpu,
                 inject_tvu,
                 inject_gossip,

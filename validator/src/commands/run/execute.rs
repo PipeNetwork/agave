@@ -284,14 +284,10 @@ pub fn execute(
     let tpu_enable_udp = if matches.is_present("tpu_enable_udp") {
         warn!("Submission of TPU transactions via UDP is deprecated.");
         true
-    } else if fair_any {
-        // SolanaCDN fair ordering injects on-chain receipt metadata (ACK/COMMIT/REJECT/WITNESS
-        // memos) and the fair wire transactions into the local TPU via UDP. If TPU UDP is
-        // disabled, strict audits will falsely flag missing on-chain commits/ACKs.
-        warn!(
-            "--fair: enabling TPU UDP (deprecated) because SolanaCDN fair ordering currently \
-             injects to the local TPU via UDP"
-        );
+    } else if fair_any && !tpu_use_quic {
+        // Fair mode injects via TPU QUIC when enabled. If TPU QUIC is disabled, fall back to
+        // TPU UDP (deprecated) so fair ordering/receipts can still function.
+        warn!("--fair: enabling TPU UDP (deprecated) because TPU QUIC is disabled");
         true
     } else {
         DEFAULT_TPU_ENABLE_UDP

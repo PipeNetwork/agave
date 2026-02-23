@@ -21,7 +21,7 @@ In this fork, `--fair` enables **maximum protection** against malicious leaders 
 - `--fair-slashing-publish-witness-memos`
 - `--fair-slashing-witness-quorum` defaults to `2` (override explicitly if desired)
 - `--solanacdn-pop-pubkey-pinning enforce` unless explicitly overridden (when Pipe discovery provides expected POP pubkeys)
-- TPU UDP is auto-enabled (equivalent to `--tpu-enable-udp`) because SolanaCDN transaction injection (including on-chain fair receipt memos) currently injects to the local TPU via UDP
+- SolanaCDN transaction injection (fair batches + on-chain receipt memos) injects to the local TPU via **QUIC** when enabled; if TPU QUIC is disabled (`--tpu-disable-quic`), `--fair` falls back to enabling TPU UDP (deprecated) so fair ordering remains functional
 
 Enforcement is implemented as **vote withholding** on detected violations (not stake slashing).
 
@@ -147,9 +147,9 @@ For each batch, the validator:
 6. **Overrides scheduler priority** for each tx signature so that earlier `order_ix` is scheduled
   ahead of later `order_ix` within the validator’s banking stage.
 
-The validator then injects the verified wire transactions into TPU. Today, the SolanaCDN tx plane
-injects to the local TPU via UDP, so TPU UDP must be enabled for `--fair` receipt metadata (and the
-fair wire transactions themselves) to reliably land on-chain.
+The validator then injects the verified wire transactions into TPU. In this fork, SolanaCDN
+injects SolanaCDN-delivered transactions and receipt metadata to the local TPU via **QUIC** when
+enabled (default). If TPU QUIC is disabled, `--fair` enables TPU UDP (deprecated) as a fallback.
 
 With `--fair-require-target-slot` (implied by `--fair` in this fork), the leader rejects any batch
 missing `target_slot` so that accepted fair flow is always auditable/slashable.
