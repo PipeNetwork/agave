@@ -702,16 +702,10 @@ async fn batch_loop(
         }
 
         let batch_id = random::<u128>();
-        let (blockhash, target_slot, leader_pubkey) = if let (Some(url), Some(client)) =
+        let (target_slot, leader_pubkey, batch) = if let (Some(url), Some(client)) =
             (cfg.rpc_url.as_ref(), rpc_client.as_ref())
         {
-            let blockhash = fetch_latest_blockhash(client, url)
-                .await
-                .unwrap_or_else(|err| {
-                    eprintln!("solanacdn-pop-stub: failed to fetch blockhash from {url}: {err:#}");
-                    Hash::new_unique()
-                });
-            let slot = if let Some(slot) = cfg.target_slot {
+            let mut slot = if let Some(slot) = cfg.target_slot {
                 slot
             } else {
                 let cur = fetch_current_slot(client, url).await.unwrap_or_else(|err| {
@@ -720,21 +714,78 @@ async fn batch_loop(
                 });
                 cur.saturating_add(cfg.target_slot_offset)
             };
-            let leader = fetch_slot_leader(client, url, slot).await.ok();
-            (blockhash, Some(slot), leader)
-        } else {
-            (Hash::new_unique(), cfg.target_slot, None)
-        };
 
-        let batch = build_fair_batch(
-            &cfg,
-            batch_id,
-            tx_seq_start,
-            blockhash,
-            target_slot,
-            &payer,
-            &ingress_pop.signing_key,
-        );
+            // Build the batch before waiting so once the target slot arrives we can send promptly.
+            // If we miss the slot (RPC lag), recompute a new target in the future and rebuild.
+            let mut blockhash = fetch_latest_blockhash(client, url)
+                .await
+                .unwrap_or_else(|err| {
+                    eprintln!("solanacdn-pop-stub: failed to fetch blockhash from {url}: {err:#}");
+                    Hash::new_unique()
+                });
+            let mut leader = fetch_slot_leader(client, url, slot).await.ok();
+            let mut batch = build_fair_batch(
+                &cfg,
+                batch_id,
+                tx_seq_start,
+                blockhash,
+                Some(slot),
+                &payer,
+                &ingress_pop.signing_key,
+            );
+
+            if cfg.target_slot.is_none() && slot > 0 {
+                let mut send_slot = slot.saturating_sub(1);
+                loop {
+                    let cur = fetch_current_slot(client, url).await.unwrap_or_else(|err| {
+                        eprintln!("solanacdn-pop-stub: failed to fetch slot from {url}: {err:#}");
+                        0
+                    });
+                    if cur < send_slot {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        continue;
+                    }
+                    if cur == send_slot {
+                        break;
+                    }
+
+                    // Missed the target slot; pick a new one in the future and refresh metadata.
+                    slot = cur.saturating_add(cfg.target_slot_offset).max(cur);
+                    send_slot = slot.saturating_sub(1);
+                    blockhash = fetch_latest_blockhash(client, url)
+                        .await
+                        .unwrap_or_else(|err| {
+                            eprintln!(
+                                "solanacdn-pop-stub: failed to fetch blockhash from {url}: {err:#}"
+                            );
+                            Hash::new_unique()
+                        });
+                    leader = fetch_slot_leader(client, url, slot).await.ok();
+                    batch = build_fair_batch(
+                        &cfg,
+                        batch_id,
+                        tx_seq_start,
+                        blockhash,
+                        Some(slot),
+                        &payer,
+                        &ingress_pop.signing_key,
+                    );
+                }
+            }
+
+            (Some(slot), leader, batch)
+        } else {
+            let batch = build_fair_batch(
+                &cfg,
+                batch_id,
+                tx_seq_start,
+                Hash::new_unique(),
+                cfg.target_slot,
+                &payer,
+                &ingress_pop.signing_key,
+            );
+            (cfg.target_slot, None, batch)
+        };
 
         let sent = send_fair_batch_to_leader(
             shared.clone(),
@@ -866,7 +917,12 @@ fn build_fair_batch(
             (idx as u32).saturating_add(1),
         ));
         // Give the fair flow a non-zero CU price so under load it stays competitive.
-        ixs.push(ComputeBudgetInstruction::set_compute_unit_price(1));
+        //
+        // Also make each transaction unique across batches even if the cluster is still early and
+        // `getLatestBlockhash` returns the same blockhash across batches (duplicate signatures
+        // would cause the leader to drop txs, which trips strict audits).
+        let cu_price = 1u64.saturating_add(tx_seq_start).saturating_add(idx as u64);
+        ixs.push(ComputeBudgetInstruction::set_compute_unit_price(cu_price));
         let message = Message::new(ixs.as_slice(), Some(&payer.pubkey()));
         let tx = Transaction::new(&[payer], message, recent_blockhash);
         let vtx = VersionedTransaction::from(tx);
@@ -997,7 +1053,8 @@ async fn fetch_latest_blockhash(client: &Client, rpc_url: &str) -> Result<Hash> 
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getLatestBlockhash",
-        "params": []
+        // Use a low-latency commitment for local/dev clusters where `finalized` may lag early on.
+        "params": [{"commitment": "processed"}]
     });
     let resp = client
         .post(rpc_url)
@@ -1020,7 +1077,7 @@ async fn fetch_current_slot(client: &Client, rpc_url: &str) -> Result<u64> {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getSlot",
-        "params": []
+        "params": [{"commitment": "processed"}]
     });
     let resp = client
         .post(rpc_url)
@@ -1104,7 +1161,8 @@ async fn fetch_balance(client: &Client, rpc_url: &str, pubkey: Pubkey) -> Result
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getBalance",
-        "params": [pubkey.to_string()]
+        // Use a low-latency commitment for local/dev clusters where `finalized` may lag early on.
+        "params": [pubkey.to_string(), {"commitment": "processed"}]
     });
     let resp = client
         .post(rpc_url)

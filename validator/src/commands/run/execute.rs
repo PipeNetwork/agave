@@ -263,21 +263,53 @@ pub fn execute(
     let restricted_repair_only_mode = matches.is_present("restricted_repair_only_mode");
     let accounts_shrink_optimize_total_space =
         value_t_or_exit!(matches, "accounts_shrink_optimize_total_space", bool);
+
+    // In this fork, `--fair` means maximum protection against malicious leaders.
+    let fair_max_protection =
+        matches.is_present("fair_max_protection") || matches.is_present("fair");
+    let fair_any = fair_max_protection
+        || matches.is_present("fair_require_target_slot")
+        || matches.is_present("fair_slashing")
+        || matches.is_present("fair_slashing_enforce")
+        || matches.is_present("fair_slashing_strict")
+        || matches.is_present("fair_slashing_witness")
+        || matches.is_present("fair_slashing_nonresponse")
+        || matches.is_present("fair_slashing_publish_witness_memos")
+        || matches.is_present("fair_slashing_fence")
+        || matches.is_present("fair_slashing_fence_reads");
+
     let tpu_use_quic = !matches.is_present("tpu_disable_quic");
-    if !tpu_use_quic {
-        warn!(
-            "TPU QUIC was disabled via --tpu_disable_quic, this will prevent validator from \
-             receiving transactions!"
-        );
-    }
     let vote_use_quic = value_t_or_exit!(matches, "vote_use_quic", bool);
 
     let tpu_enable_udp = if matches.is_present("tpu_enable_udp") {
         warn!("Submission of TPU transactions via UDP is deprecated.");
         true
+    } else if fair_any {
+        // SolanaCDN fair ordering injects on-chain receipt metadata (ACK/COMMIT/REJECT/WITNESS
+        // memos) and the fair wire transactions into the local TPU via UDP. If TPU UDP is
+        // disabled, strict audits will falsely flag missing on-chain commits/ACKs.
+        warn!(
+            "--fair: enabling TPU UDP (deprecated) because SolanaCDN fair ordering currently \
+             injects to the local TPU via UDP"
+        );
+        true
     } else {
         DEFAULT_TPU_ENABLE_UDP
     };
+
+    if !tpu_use_quic {
+        if tpu_enable_udp {
+            warn!(
+                "TPU QUIC was disabled via --tpu_disable_quic; validator will accept only UDP \
+                 transactions"
+            );
+        } else {
+            warn!(
+                "TPU QUIC was disabled via --tpu_disable_quic and TPU UDP is disabled; validator \
+                 will not receive transactions"
+            );
+        }
+    }
 
     let tpu_connection_pool_size = value_t_or_exit!(matches, "tpu_connection_pool_size", usize);
 
@@ -659,7 +691,6 @@ pub fn execute(
             cfg.vote_dedup_max_entries = if v == 0 { 0 } else { v.min(2_000_000) };
         }
         // In this fork, `--fair` means maximum protection against malicious leaders.
-        let fair_max_protection = matches.is_present("fair_max_protection") || matches.is_present("fair");
         let fair_require_target_slot =
             matches.is_present("fair_require_target_slot") || fair_max_protection;
         let fair_slashing_enforce = matches.is_present("fair_slashing_enforce") || fair_max_protection;

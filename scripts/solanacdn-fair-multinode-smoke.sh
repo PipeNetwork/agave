@@ -158,11 +158,13 @@ bootstrap_pid=$!
 
 if [[ "${AUDITORS}" -ge 1 ]]; then
   echo "Starting auditor1..."
-  "${root_dir}/multinode-demo/validator-x.sh" --no-restart --log - \
+  SKIP_ACCOUNTS_CREATION=1 "${root_dir}/multinode-demo/validator-x.sh" --no-restart --log - \
     --rpc-port 8891 \
     --gossip-port 8002 \
     --no-snapshot-fetch \
     --ledger "${auditor1_ledger}" \
+    --no-voting \
+    --skip-require-tower \
     --fair \
     --solanacdn-pop "${POP0}" \
     --solanacdn-pop "${POP1}" \
@@ -174,11 +176,13 @@ fi
 
 if [[ "${AUDITORS}" -ge 2 ]]; then
   echo "Starting auditor2..."
-  "${root_dir}/multinode-demo/validator-x.sh" --no-restart --log - \
-    --rpc-port 8892 \
+  SKIP_ACCOUNTS_CREATION=1 "${root_dir}/multinode-demo/validator-x.sh" --no-restart --log - \
+    --rpc-port 8893 \
     --gossip-port 8003 \
     --no-snapshot-fetch \
     --ledger "${auditor2_ledger}" \
+    --no-voting \
+    --skip-require-tower \
     --fair \
     --solanacdn-pop "${POP0}" \
     --solanacdn-pop "${POP1}" \
