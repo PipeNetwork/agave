@@ -727,7 +727,7 @@ pub fn execute(
         if let Ok(v) = value_t!(matches, "fair_slashing_witness_quorum", u8) {
             cfg.tx_fair_slashing_witness_quorum = v.max(1);
         } else if fair_max_protection {
-            cfg.tx_fair_slashing_witness_quorum = 2;
+            cfg.tx_fair_slashing_witness_quorum = 3;
         }
         cfg.tx_fair_slashing_fence = fair_slashing_fence;
         cfg.tx_fair_slashing_fence_reads = fair_slashing_fence_reads;
@@ -735,6 +735,21 @@ pub fn execute(
         cfg.tx_fair_require_target_slot = fair_require_target_slot;
         cfg.tx_fair_ordering =
             matches.is_present("fair") || matches.is_present("fair_require_target_slot") || fair_slashing;
+        cfg.tx_fair_broadcast_evidence = fair_max_protection;
+        if let Some(mode) = matches
+            .value_of("fair_dev_fault")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if cfg.tx_fair_ordering {
+                cfg.tx_fair_dev_fault = match mode {
+                    "ack-no-commit" => solana_core::solanacdn::TxFairDevFault::AckNoCommit,
+                    _ => solana_core::solanacdn::TxFairDevFault::None,
+                };
+            } else {
+                warn!("--fair-dev-fault ignored because fair ordering is disabled");
+            }
+        }
 
         // In `--fair` mode (max protection), require POP pubkey pinning when discovery provides
         // expected POP pubkeys, unless the operator explicitly overrides the pinning mode.

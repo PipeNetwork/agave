@@ -978,7 +978,76 @@ fn build_fair_ledger_witness_memo_tx(
     bincode::serialize(&tx).ok()
 }
 
+async fn try_broadcast_fair_batch_ack(
+    handle: &SolanaCdnHandle,
+    cfg: &SolanaCdnConfig,
+    exclude_endpoint: SocketAddr,
+    ack: &FairBatchReceiptCommit,
+) {
+    if !cfg.tx_fair_broadcast_evidence {
+        return;
+    }
+    if ack.payload.target_slot.is_none() {
+        return;
+    }
+    let targets: Vec<mpsc::Sender<AgentToPop>> = handle
+        .pop_ctrl_out_txs
+        .iter()
+        .filter_map(|entry| (*entry.key() != exclude_endpoint).then(|| entry.value().clone()))
+        .collect();
+    for tx in targets {
+        let _ = tx.try_send(AgentToPop::FairBatchAck(ack.clone()));
+    }
+}
+
+async fn try_broadcast_fair_batch_commit(
+    handle: &SolanaCdnHandle,
+    cfg: &SolanaCdnConfig,
+    exclude_endpoint: SocketAddr,
+    commit: &FairBatchCommit,
+) {
+    if !cfg.tx_fair_broadcast_evidence {
+        return;
+    }
+    if commit.payload.target_slot.is_none() {
+        return;
+    }
+    let targets: Vec<mpsc::Sender<AgentToPop>> = handle
+        .pop_ctrl_out_txs
+        .iter()
+        .filter_map(|entry| (*entry.key() != exclude_endpoint).then(|| entry.value().clone()))
+        .collect();
+    for tx in targets {
+        let _ = tx.try_send(AgentToPop::FairBatchCommit(commit.clone()));
+    }
+}
+
+async fn try_broadcast_fair_batch_reject(
+    handle: &SolanaCdnHandle,
+    cfg: &SolanaCdnConfig,
+    exclude_endpoint: SocketAddr,
+    reject: &FairBatchReject,
+) {
+    if !cfg.tx_fair_broadcast_evidence {
+        return;
+    }
+    if reject.payload.target_slot.is_none() {
+        return;
+    }
+    let targets: Vec<mpsc::Sender<AgentToPop>> = handle
+        .pop_ctrl_out_txs
+        .iter()
+        .filter_map(|entry| (*entry.key() != exclude_endpoint).then(|| entry.value().clone()))
+        .collect();
+    for tx in targets {
+        let _ = tx.try_send(AgentToPop::FairBatchReject(reject.clone()));
+    }
+}
+
 async fn try_send_fair_batch_reject(
+    endpoint: SocketAddr,
+    cfg: &SolanaCdnConfig,
+    handle: &SolanaCdnHandle,
     ctrl_out_tx: &mpsc::Sender<AgentToPop>,
     auth: &AuthContext,
     origin_pop_id: &str,
@@ -1006,7 +1075,10 @@ async fn try_send_fair_batch_reject(
             return;
         }
     };
-    let _ = ctrl_out_tx.send(AgentToPop::FairBatchReject(reject)).await;
+    let _ = ctrl_out_tx
+        .send(AgentToPop::FairBatchReject(reject.clone()))
+        .await;
+    try_broadcast_fair_batch_reject(handle, cfg, endpoint, &reject).await;
 }
 
 async fn try_inject_tpu_tx(
@@ -1154,6 +1226,20 @@ impl Default for TvuShredIngestMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxFairDevFault {
+    None,
+    /// DEV/TEST ONLY: Send a leader ACK for a fair batch but do not commit/reject it on-chain and
+    /// do not inject the batch transactions.
+    AckNoCommit,
+}
+
+impl Default for TxFairDevFault {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SolanaCdnConfig {
     pub pop_endpoints: Vec<SocketAddr>,
@@ -1245,6 +1331,12 @@ pub struct SolanaCdnConfig {
     ///
     /// Values less than 1 are treated as 1.
     pub tx_fair_slashing_witness_quorum: u8,
+    /// If enabled, broadcast leader-signed fair evidence (ACK/COMMIT/REJECT) to all connected POP
+    /// sessions (not only the origin POP) to improve evidence distribution for
+    /// auditors/observers.
+    pub tx_fair_broadcast_evidence: bool,
+    /// DEV/TEST ONLY: Fault injection mode for fair ordering (for integration tests).
+    pub tx_fair_dev_fault: TxFairDevFault,
     /// If enabled (in addition to `tx_fair_slashing`), enforce a same-slot “account fence”:
     /// transactions not in the committed fair list must not write-lock any non-signer account
     /// written by a committed fair transaction in that slot.
@@ -1304,6 +1396,8 @@ impl SolanaCdnConfig {
             tx_fair_slashing_nonresponse: false,
             tx_fair_slashing_publish_witness_memos: false,
             tx_fair_slashing_witness_quorum: 1,
+            tx_fair_broadcast_evidence: false,
+            tx_fair_dev_fault: TxFairDevFault::None,
             tx_fair_slashing_fence: false,
             tx_fair_slashing_fence_reads: false,
             tx_fair_slashing_enforce: false,
@@ -1356,6 +1450,8 @@ impl Default for SolanaCdnConfig {
             tx_fair_slashing_nonresponse: false,
             tx_fair_slashing_publish_witness_memos: false,
             tx_fair_slashing_witness_quorum: 1,
+            tx_fair_broadcast_evidence: false,
+            tx_fair_dev_fault: TxFairDevFault::None,
             tx_fair_slashing_fence: false,
             tx_fair_slashing_fence_reads: false,
             tx_fair_slashing_enforce: false,
@@ -2086,6 +2182,7 @@ pub struct SolanaCdnHandle {
     pipe_pop_meta_by_endpoint: DashMap<SocketAddr, PipePopMeta>,
     pipe_pop_meta_by_pubkey: DashMap<PubkeyBytes, PipePopMeta>,
     connected_pops: DashSet<SocketAddr>,
+    pop_ctrl_out_txs: DashMap<SocketAddr, mpsc::Sender<AgentToPop>>,
     publisher_endpoint: ArcSwapOption<String>,
     publisher_switches_total: AtomicU64,
     heartbeat_schema_version: AtomicU32,
@@ -2173,6 +2270,7 @@ impl SolanaCdnHandle {
             pipe_pop_meta_by_endpoint: DashMap::new(),
             pipe_pop_meta_by_pubkey: DashMap::new(),
             connected_pops: DashSet::new(),
+            pop_ctrl_out_txs: DashMap::new(),
             publisher_endpoint: ArcSwapOption::const_empty(),
             publisher_switches_total: AtomicU64::new(0),
             heartbeat_schema_version: AtomicU32::new(0),
@@ -5210,6 +5308,11 @@ impl SolanaCdnHandle {
 
     fn note_disconnected_pop(&self, endpoint: SocketAddr) {
         self.connected_pops.remove(&endpoint);
+        self.pop_ctrl_out_txs.remove(&endpoint);
+    }
+
+    fn note_pop_ctrl_out_tx(&self, endpoint: SocketAddr, ctrl_out_tx: mpsc::Sender<AgentToPop>) {
+        self.pop_ctrl_out_txs.insert(endpoint, ctrl_out_tx);
     }
 
     fn update_heartbeat_schema_version(&self, schema_version: u32) {
@@ -8836,6 +8939,7 @@ async fn run_pop_session(
             }
         }
     });
+    handle.note_pop_ctrl_out_tx(endpoint, ctrl_out_tx.clone());
 
     // Pipe session token refresher: push AuthRefresh updates on the control stream.
     let auth_refresh_task = if let Some(mut token_rx) = pipe_session_token_rx.take() {
@@ -9528,6 +9632,7 @@ async fn run_pop_session(
     }
 
     let _ = session_events_tx.send(SessionEvent::Disconnected { endpoint });
+    handle.pop_ctrl_out_txs.remove(&endpoint);
 
     ctrl_writer_task.abort();
     shreds_writer_task.abort();
@@ -9741,6 +9846,9 @@ async fn handle_pop_msg(
                 );
                 if cfg.tx_fair_ordering {
                     try_send_fair_batch_reject(
+                        endpoint,
+                        cfg,
+                        handle,
                         &ctrl_out_tx,
                         auth,
                         &origin_pop_id,
@@ -9769,6 +9877,9 @@ async fn handle_pop_msg(
                         "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; missing target_slot (required)"
                     );
                     try_send_fair_batch_reject(
+                        endpoint,
+                        cfg,
+                        handle,
                         &ctrl_out_tx,
                         auth,
                         &origin_pop_id,
@@ -9800,6 +9911,9 @@ async fn handle_pop_msg(
                         "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; invalid POP attestation: {e}"
                     );
                     try_send_fair_batch_reject(
+                        endpoint,
+                        cfg,
+                        handle,
                         &ctrl_out_tx,
                         auth,
                         &origin_pop_id,
@@ -9848,6 +9962,9 @@ async fn handle_pop_msg(
                         "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; attestation payload mismatch"
                     );
                     try_send_fair_batch_reject(
+                        endpoint,
+                        cfg,
+                        handle,
                         &ctrl_out_tx,
                         auth,
                         &origin_pop_id,
@@ -9889,6 +10006,9 @@ async fn handle_pop_msg(
                             tx.payload.len()
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -9923,6 +10043,9 @@ async fn handle_pop_msg(
                             "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; total_bytes exceeded cap={FAIR_BATCH_MAX_TOTAL_BYTES}"
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -9957,6 +10080,9 @@ async fn handle_pop_msg(
                             "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; unable to parse tx signature from payload"
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -9988,6 +10114,9 @@ async fn handle_pop_msg(
                             "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; FairTx.sig does not match tx payload"
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -10019,6 +10148,9 @@ async fn handle_pop_msg(
                             "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; duplicate tx signature in batch"
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -10050,6 +10182,9 @@ async fn handle_pop_msg(
                             "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; tx signature already seen"
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -10083,6 +10218,9 @@ async fn handle_pop_msg(
                             "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; failed deserialization/sanitization/sigverify"
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -10119,6 +10257,9 @@ async fn handle_pop_msg(
                         "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; attestation merkle root mismatch"
                     );
                     try_send_fair_batch_reject(
+                        endpoint,
+                        cfg,
+                        handle,
                         &ctrl_out_tx,
                         auth,
                         &origin_pop_id,
@@ -10191,6 +10332,9 @@ async fn handle_pop_msg(
                             "solanacdn: rejecting FairBatch batch_id={batch_id} origin_pop_id={origin_pop_id}; strict mode requires on-chain ACK+COMMIT memos (recent_blockhash present)"
                         );
                         try_send_fair_batch_reject(
+                            endpoint,
+                            cfg,
+                            handle,
                             &ctrl_out_tx,
                             auth,
                             &origin_pop_id,
@@ -10227,7 +10371,13 @@ async fn handle_pop_msg(
                     insert_fair_priority(tx.sig.0, priority);
                 }
 
-                if target_slot.is_some() {
+                let dev_ack_no_commit = cfg.tx_fair_dev_fault == TxFairDevFault::AckNoCommit;
+                if dev_ack_no_commit {
+                    debug!(
+                        "solanacdn: DEV fair fault AckNoCommit enabled; sending ACK but skipping on-chain memos and tx injection (batch_id={} origin_pop_id={})",
+                        batch_id, origin_pop_id
+                    );
+                } else if target_slot.is_some() {
                     if let Some(ack_tx_bytes) = ack_tx_bytes {
                         let _ =
                             try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &ack_tx_bytes)
@@ -10239,17 +10389,19 @@ async fn handle_pop_msg(
                     }
                 }
 
-                for tx in incoming_txs.iter() {
-                    if try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx.payload).await {
-                        handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
-                        handle
-                            .tx_fair_batch_injected
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
-                        handle
-                            .tx_fair_batch_inject_failed
-                            .fetch_add(1, Ordering::Relaxed);
+                if !dev_ack_no_commit {
+                    for tx in incoming_txs.iter() {
+                        if try_inject_tpu_tx(udp_inject_tpu, tpu_quic_injector, &tx.payload).await {
+                            handle.tx_injected_packets.fetch_add(1, Ordering::Relaxed);
+                            handle
+                                .tx_fair_batch_injected
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            handle.tx_inject_failed.fetch_add(1, Ordering::Relaxed);
+                            handle
+                                .tx_fair_batch_inject_failed
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
 
@@ -10279,6 +10431,11 @@ async fn handle_pop_msg(
                     let _ = ctrl_out_tx
                         .send(AgentToPop::FairBatchAck(receipt_commit.clone()))
                         .await;
+                    try_broadcast_fair_batch_ack(handle, cfg, endpoint, &receipt_commit).await;
+                }
+
+                if dev_ack_no_commit {
+                    return;
                 }
 
                 let payload = FairBatchCommitPayload {
@@ -10294,6 +10451,7 @@ async fn handle_pop_msg(
                 match FairBatchCommit::sign(payload, &auth.signing_key) {
                     Ok(mut commit) => {
                         commit.receipt_commit = Some(receipt_commit);
+                        try_broadcast_fair_batch_commit(handle, cfg, endpoint, &commit).await;
                         let _ = ctrl_out_tx.send(AgentToPop::FairBatchCommit(commit)).await;
                     }
                     Err(e) => {

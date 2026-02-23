@@ -19,8 +19,9 @@ In this fork, `--fair` enables **maximum protection** against malicious leaders 
 - `--fair-slashing-nonresponse`
 - `--fair-slashing-fence-reads` (implies `--fair-slashing-fence`)
 - `--fair-slashing-publish-witness-memos`
-- `--fair-slashing-witness-quorum` defaults to `2` (override explicitly if desired)
+- `--fair-slashing-witness-quorum` defaults to `3` (override explicitly if desired)
 - `--solanacdn-pop-pubkey-pinning enforce` unless explicitly overridden (when Pipe discovery provides expected POP pubkeys)
+- Leader-signed fair evidence (ACK/COMMIT/REJECT streams) is broadcast to all connected POP sessions to improve auditor/observer distribution (in addition to any POP-side forwarding/gossip)
 - SolanaCDN transaction injection (fair batches + on-chain receipt memos) injects to the local TPU via **QUIC** when enabled; if TPU QUIC is disabled (`--tpu-disable-quic`), `--fair` falls back to enabling TPU UDP (deprecated) so fair ordering remains functional
 
 Enforcement is implemented as **vote withholding** on detected violations (not stake slashing).
@@ -307,7 +308,7 @@ commits and claim non-receipt). Witness mode adds:
   - Validators can optionally publish these memos when receiving witness receipts via
     `--fair-slashing-publish-witness-memos` (implied by `--fair` in this fork).
   - To bound load/fees, validators cap witness memo publication to **at most N memos per
-    (leader,slot,batch_id)** where `N = --fair-slashing-witness-quorum` (default `2` under
+    (leader,slot,batch_id)** where `N = --fair-slashing-witness-quorum` (default `3` under
     `--fair`).
 
 Auditors subscribe to both and treat it as a violation if:
@@ -392,9 +393,9 @@ Equivalent manual configuration:
   Delivering too early increases the chance another leader includes the transactions/memos in a
   different slot than the one referenced by the receipts; delivering too late increases the chance
   receipt memos land in a later slot.
-- **Witness quorum is a tradeoff:** `--fair` defaults `--fair-slashing-witness-quorum=2`. This
-  reduces framing risk, but if your deployment only has 1 witness, non-response enforcement will
-  never trigger unless you explicitly set quorum to `1`.
+- **Witness quorum is a tradeoff:** `--fair` defaults `--fair-slashing-witness-quorum=3`. This
+  reduces framing risk, but if your deployment only has 1–2 witnesses, non-response enforcement
+  will never trigger unless you explicitly lower quorum.
 - **Strict mode is unforgiving:** if a leader emits an ACK but the matching on-chain commit does not
   land (fee starvation, blockhash issues, TPU injection failure), auditors will treat that as a
   slashable violation. Ensure commit metadata has enough fee/priority to reliably land.
@@ -430,6 +431,8 @@ Recommended local smoke tests in this repo:
 - Single validator: `scripts/solanacdn-fair-smoke.sh` (uses `scripts/run.sh` + `solanacdn-pop-stub`)
 - Multinode + load: `scripts/solanacdn-fair-multinode-smoke.sh` (uses `multinode-demo/*` to run
   validators as separate OS processes)
+- Malicious leader (negative test): `scripts/solanacdn-fair-malicious-leader-smoke.sh` (runs a DEV
+  leader fault via `--fair-dev-fault ack-no-commit` and asserts auditors withhold votes)
 
 Note: the SolanaCDN integration currently uses process-global state, so multi-validator
 in-process harnesses like `solana-local-cluster` are not suitable for testing SolanaCDN fair mode.

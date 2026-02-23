@@ -174,7 +174,8 @@ impl FromClapArgMatches for RunArgs {
             || matches.is_present("fair_slashing_fence")
             || matches.is_present("fair_slashing_fence_reads")
             || matches.is_present("fair_slashing_witness_quorum")
-            || matches.is_present("fair_slashing_enforce"))
+            || matches.is_present("fair_slashing_enforce")
+            || matches.is_present("fair_dev_fault"))
             && !has_solanacdn_discovery
         {
             return Err(clap::Error::with_description(
@@ -1441,7 +1442,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "EXPERIMENTAL: Explicit alias for --fair. Enable maximum fair-ordering protections against malicious leaders \
                  (implies --fair-require-target-slot, --fair-slashing-enforce, --fair-slashing-strict, \
                  --fair-slashing-witness, --fair-slashing-nonresponse, --fair-slashing-fence-reads, and \
-                 --fair-slashing-publish-witness-memos; defaults witness quorum to 2 unless \
+                 --fair-slashing-publish-witness-memos; defaults witness quorum to 3 unless \
                  explicitly set).",
             ),
     )
@@ -1533,6 +1534,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "EXPERIMENTAL: Enforce fair ordering via vote withholding when a fair ordering \
                  violation is observed (ledger audit failure or commit equivocation) (implies \
                  --fair-slashing; requires SolanaCDN POP/control/API token configuration)",
+            ),
+    )
+    .arg(
+        Arg::with_name("fair_dev_fault")
+            .hidden(hidden_unless_forced())
+            .long("fair-dev-fault")
+            .value_name("MODE")
+            .takes_value(true)
+            .possible_values(&["ack-no-commit"])
+            .help(
+                "DEV/TEST ONLY: Inject a fair-ordering fault for integration testing. Requires --fair. \
+                 Modes: ack-no-commit",
             ),
     )
     .arg(

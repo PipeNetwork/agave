@@ -10,6 +10,7 @@
 # Environment overrides:
 #   POP0=127.0.0.1:9002
 #   POP1=127.0.0.1:9003
+#   POP2=127.0.0.1:9004
 #   RPC_URL=http://127.0.0.1:8899
 #   METRICS0=127.0.0.1:9100   # bootstrap SolanaCDN metrics
 #   METRICS1=127.0.0.1:9101   # auditor1 SolanaCDN metrics
@@ -35,6 +36,7 @@ root_dir="$(cd "${script_dir}/.." && pwd)"
 
 POP0="${POP0:-127.0.0.1:9002}"
 POP1="${POP1:-127.0.0.1:9003}"
+POP2="${POP2:-127.0.0.1:9004}"
 RPC_URL="${RPC_URL:-http://127.0.0.1:8899}"
 METRICS0="${METRICS0:-127.0.0.1:9100}"
 METRICS1="${METRICS1:-127.0.0.1:9101}"
@@ -151,6 +153,7 @@ echo "Starting bootstrap validator (leader)..."
   --fair \
   --solanacdn-pop "${POP0}" \
   --solanacdn-pop "${POP1}" \
+  --solanacdn-pop "${POP2}" \
   --solanacdn-tls-insecure-skip-verify \
   --solanacdn-metrics-addr "${METRICS0}" \
   >"${root_dir}/config/solanacdn-fair-multinode-bootstrap.log" 2>&1 &
@@ -168,6 +171,7 @@ if [[ "${AUDITORS}" -ge 1 ]]; then
     --fair \
     --solanacdn-pop "${POP0}" \
     --solanacdn-pop "${POP1}" \
+    --solanacdn-pop "${POP2}" \
     --solanacdn-tls-insecure-skip-verify \
     --solanacdn-metrics-addr "${METRICS1}" \
     >"${root_dir}/config/solanacdn-fair-multinode-auditor1.log" 2>&1 &
@@ -186,6 +190,7 @@ if [[ "${AUDITORS}" -ge 2 ]]; then
     --fair \
     --solanacdn-pop "${POP0}" \
     --solanacdn-pop "${POP1}" \
+    --solanacdn-pop "${POP2}" \
     --solanacdn-tls-insecure-skip-verify \
     --solanacdn-metrics-addr "${METRICS2}" \
     >"${root_dir}/config/solanacdn-fair-multinode-auditor2.log" 2>&1 &
@@ -209,6 +214,7 @@ echo "Starting multi-POP fair stub..."
 "${stub_bin}" \
   --listen "${POP0}" \
   --listen "${POP1}" \
+  --listen "${POP2}" \
   --rpc-url "${RPC_URL}" \
   --batches "${BATCHES}" \
   --txs-per-batch "${TXS_PER_BATCH}" \
