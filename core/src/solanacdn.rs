@@ -10274,7 +10274,7 @@ async fn handle_pop_msg(
                         }
                     };
 
-                // Explicit ACK stream for slashing/auditing (protocol v7+).
+                // Explicit ACK stream for slashing/auditing (protocol v9+).
                 if target_slot.is_some() {
                     let _ = ctrl_out_tx
                         .send(AgentToPop::FairBatchAck(receipt_commit.clone()))
