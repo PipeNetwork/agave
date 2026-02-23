@@ -21,6 +21,12 @@
 #   INTERVAL_MS=200
 #   TARGET_SLOT_OFFSET=20
 #   TOTAL_TIMEOUT_SECS=240
+#   WAIT_FOR_METRICS_SECS=60
+#   EXPECT_BOOTSTRAP_FAIR_RECEIVED_MIN=1
+#   EXPECT_BOOTSTRAP_FAIR_INJECTED_MIN=1
+#   EXPECT_COMMITS_RX_MIN=1
+#   EXPECT_AUDIT_CHECKED_MIN=1
+#   EXPECT_WITNESS_QUORUM_MET=1
 #
 set -euo pipefail
 
@@ -40,6 +46,13 @@ TXS_PER_BATCH="${TXS_PER_BATCH:-8}"
 INTERVAL_MS="${INTERVAL_MS:-200}"
 TARGET_SLOT_OFFSET="${TARGET_SLOT_OFFSET:-20}"
 TOTAL_TIMEOUT_SECS="${TOTAL_TIMEOUT_SECS:-240}"
+WAIT_FOR_METRICS_SECS="${WAIT_FOR_METRICS_SECS:-60}"
+
+EXPECT_BOOTSTRAP_FAIR_RECEIVED_MIN="${EXPECT_BOOTSTRAP_FAIR_RECEIVED_MIN:-1}"
+EXPECT_BOOTSTRAP_FAIR_INJECTED_MIN="${EXPECT_BOOTSTRAP_FAIR_INJECTED_MIN:-1}"
+EXPECT_COMMITS_RX_MIN="${EXPECT_COMMITS_RX_MIN:-1}"
+EXPECT_AUDIT_CHECKED_MIN="${EXPECT_AUDIT_CHECKED_MIN:-1}"
+EXPECT_WITNESS_QUORUM_MET="${EXPECT_WITNESS_QUORUM_MET:-1}"
 
 if [[ -z "${LIBCLANG_PATH:-}" && -d /opt/homebrew/opt/llvm/lib ]]; then
   export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
@@ -79,6 +92,11 @@ if [[ "${TOTAL_TIMEOUT_SECS}" -gt 0 ]]; then
     kill -TERM "${main_pid}" 2>/dev/null || true
   ) &
   watchdog_pid=$!
+fi
+
+if [[ "${AUDITORS}" -lt 1 || "${AUDITORS}" -gt 2 ]]; then
+  echo "AUDITORS must be 1 or 2 (got ${AUDITORS})" >&2
+  exit 1
 fi
 
 echo "Building POP stub (if needed)..."
@@ -180,39 +198,100 @@ metric_value_from() {
   fi
 }
 
-check_metrics() {
-  local addr="$1"
-  local url="http://${addr}/metrics"
-  local metrics
-  metrics="$(curl -s "${url}" || true)"
-  local withheld failed equiv
-  withheld="$(metric_value_from "${metrics}" "solanacdn_fair_votes_withheld_total")"
-  failed="$(metric_value_from "${metrics}" "solanacdn_fair_ledger_audit_failed_total")"
-  equiv="$(metric_value_from "${metrics}" "solanacdn_fair_equivocations_total")"
-
-  echo "Metrics ${addr}: votes_withheld=${withheld} audit_failed=${failed} equivocations=${equiv}"
-  if (( withheld > 0 )) || (( failed > 0 )) || (( equiv > 0 )); then
+assert_min() {
+  local name="$1"
+  local value="$2"
+  local min="$3"
+  if (( value < min )); then
+    echo "FAIL: ${name}=${value} < ${min}"
     return 1
   fi
   return 0
 }
 
-ok=1
-check_metrics "${METRICS0}" || ok=0
-if [[ "${AUDITORS}" -ge 1 ]]; then
-  check_metrics "${METRICS1}" || ok=0
-fi
-if [[ "${AUDITORS}" -ge 2 ]]; then
-  check_metrics "${METRICS2}" || ok=0
-fi
+has_witness_quorum_met() {
+  local addr="$1"
+  curl -sf "http://${addr}/solanacdn/fair-evidence" | python3 -c '
+import json,sys
+expect=int(sys.argv[1])
+data=json.load(sys.stdin)
+recent=data.get("recent_witnesses") or []
+met=any(bool(w.get("witness_quorum_met")) for w in recent)
+sys.exit(0 if (not expect) or met else 1)
+' "${EXPECT_WITNESS_QUORUM_MET}"
+}
 
-if [[ "${ok}" -ne 1 ]]; then
-  echo "FAIL: detected fair vote withholding or audit failures. Logs:"
-  echo "  ${root_dir}/config/solanacdn-fair-multinode-bootstrap.log"
-  echo "  ${root_dir}/config/solanacdn-fair-multinode-auditor1.log"
-  echo "  ${root_dir}/config/solanacdn-fair-multinode-auditor2.log"
-  echo "  ${root_dir}/config/solanacdn-fair-multinode-pop-stub.log"
-  exit 1
-fi
+check_metrics() {
+  local addr="$1"
+  local role="$2"
+  local url="http://${addr}/metrics"
+  local metrics=""
+  if ! metrics="$(curl -sf "${url}")"; then
+    echo "FAIL: could not fetch metrics from ${url}" >&2
+    return 1
+  fi
+
+  local withheld failed equiv
+  withheld="$(metric_value_from "${metrics}" "solanacdn_fair_votes_withheld_total")"
+  failed="$(metric_value_from "${metrics}" "solanacdn_fair_ledger_audit_failed_total")"
+  equiv="$(metric_value_from "${metrics}" "solanacdn_fair_equivocations_total")"
+  local commits_rx audit_checked
+  commits_rx="$(metric_value_from "${metrics}" "solanacdn_fair_commits_rx_total")"
+  audit_checked="$(metric_value_from "${metrics}" "solanacdn_fair_ledger_audit_checked_total")"
+
+  echo "Metrics ${addr} (${role}): commits_rx=${commits_rx} audit_checked=${audit_checked} votes_withheld=${withheld} audit_failed=${failed} equivocations=${equiv}"
+  if (( withheld > 0 )) || (( failed > 0 )) || (( equiv > 0 )); then
+    return 1
+  fi
+
+  local ok=1
+  assert_min "solanacdn_fair_commits_rx_total" "${commits_rx}" "${EXPECT_COMMITS_RX_MIN}" || ok=0
+  assert_min "solanacdn_fair_ledger_audit_checked_total" "${audit_checked}" "${EXPECT_AUDIT_CHECKED_MIN}" || ok=0
+  if [[ "${role}" == "bootstrap" ]]; then
+    local fair_received fair_injected
+    fair_received="$(metric_value_from "${metrics}" "solanacdn_tx_fair_batch_received_total")"
+    fair_injected="$(metric_value_from "${metrics}" "solanacdn_tx_fair_batch_injected_total")"
+    assert_min "solanacdn_tx_fair_batch_received_total" "${fair_received}" "${EXPECT_BOOTSTRAP_FAIR_RECEIVED_MIN}" || ok=0
+    assert_min "solanacdn_tx_fair_batch_injected_total" "${fair_injected}" "${EXPECT_BOOTSTRAP_FAIR_INJECTED_MIN}" || ok=0
+  fi
+
+  if [[ "${EXPECT_WITNESS_QUORUM_MET}" -eq 1 ]]; then
+    has_witness_quorum_met "${addr}" >/dev/null || ok=0
+  fi
+
+  if [[ "${ok}" -ne 1 ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+echo "Checking metrics/evidence (timeout ${WAIT_FOR_METRICS_SECS}s)..."
+deadline=$((SECONDS + WAIT_FOR_METRICS_SECS))
+while true; do
+  ok=1
+  check_metrics "${METRICS0}" "bootstrap" || ok=0
+  if [[ "${AUDITORS}" -ge 1 ]]; then
+    check_metrics "${METRICS1}" "auditor1" || ok=0
+  fi
+  if [[ "${AUDITORS}" -ge 2 ]]; then
+    check_metrics "${METRICS2}" "auditor2" || ok=0
+  fi
+
+  if [[ "${ok}" -eq 1 ]]; then
+    break
+  fi
+  if (( SECONDS >= deadline )); then
+    echo "FAIL: metrics/evidence thresholds not satisfied before timeout. Logs:"
+    echo "  ${root_dir}/config/solanacdn-fair-multinode-setup.log"
+    echo "  ${root_dir}/config/solanacdn-fair-multinode-faucet.log"
+    echo "  ${root_dir}/config/solanacdn-fair-multinode-bootstrap.log"
+    echo "  ${root_dir}/config/solanacdn-fair-multinode-auditor1.log"
+    echo "  ${root_dir}/config/solanacdn-fair-multinode-auditor2.log"
+    echo "  ${root_dir}/config/solanacdn-fair-multinode-pop-stub.log"
+    exit 1
+  fi
+  sleep 1
+done
 
 echo "PASS: no fair vote withholding detected."
