@@ -54,13 +54,19 @@ EXPECT_COMMITS_RX_MIN="${EXPECT_COMMITS_RX_MIN:-1}"
 EXPECT_AUDIT_CHECKED_MIN="${EXPECT_AUDIT_CHECKED_MIN:-1}"
 EXPECT_WITNESS_QUORUM_MET="${EXPECT_WITNESS_QUORUM_MET:-1}"
 
-if [[ -z "${LIBCLANG_PATH:-}" && -d /opt/homebrew/opt/llvm/lib ]]; then
+if [[ -d /opt/homebrew/opt/llvm/lib ]]; then
   export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
   export DYLD_LIBRARY_PATH="/opt/homebrew/opt/llvm/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
   export PATH="/opt/homebrew/opt/llvm/bin:${PATH}"
 fi
 
-stub_bin="${root_dir}/target/debug/solanacdn-pop-stub"
+profile="${CARGO_BUILD_PROFILE:-debug}"
+export PATH="${root_dir}/target/${profile}:${PATH}"
+# Tell multinode-demo scripts to prefer PATH binaries over `cargo run` (avoids cargo-run DYLD_*
+# overrides that can break libclang-dependent build scripts on macOS).
+export USE_INSTALL=1
+
+stub_bin="${root_dir}/target/${profile}/solanacdn-pop-stub"
 
 faucet_pid=""
 bootstrap_pid=""
@@ -99,16 +105,45 @@ if [[ "${AUDITORS}" -lt 1 || "${AUDITORS}" -gt 2 ]]; then
   exit 1
 fi
 
-echo "Building POP stub (if needed)..."
-if [[ ! -x "${stub_bin}" ]]; then
-  cargo build -p solana-core --bin solanacdn-pop-stub
+echo "Building required binaries..."
+cargo build -p solana-core --bin solanacdn-pop-stub
+cargo build --bin solana-keygen
+cargo build --bin solana-genesis
+cargo build --bin solana-faucet
+cargo build --bin solana-gossip
+cargo build --bin solana
+cargo build --bin agave-validator
+if [[ "${BENCH_DURATION}" -gt 0 ]]; then
+  cargo build --manifest-path "${root_dir}/dev-bins/Cargo.toml" --bin solana-bench-tps
 fi
 
 echo "Setting up local multinode cluster..."
 "${root_dir}/multinode-demo/setup.sh" >"${root_dir}/config/solanacdn-fair-multinode-setup.log" 2>&1
 
+bootstrap_ledger="${root_dir}/config/bootstrap-validator"
+auditor1_ledger="${root_dir}/config/solanacdn-fair-multinode-auditor1-ledger"
+auditor2_ledger="${root_dir}/config/solanacdn-fair-multinode-auditor2-ledger"
+
+seed_ledger_from_bootstrap() {
+  local dest="$1"
+  rm -rf "${dest}"
+  mkdir -p "${dest}"
+  cp -p "${bootstrap_ledger}/genesis.bin" "${dest}/"
+  cp -R "${bootstrap_ledger}/rocksdb" "${dest}/"
+  rm -f "${dest}/identity.json" "${dest}/vote-account.json" "${dest}/stake-account.json"
+}
+
+if [[ "${AUDITORS}" -ge 1 ]]; then
+  echo "Seeding auditor1 ledger from bootstrap genesis..."
+  seed_ledger_from_bootstrap "${auditor1_ledger}"
+fi
+if [[ "${AUDITORS}" -ge 2 ]]; then
+  echo "Seeding auditor2 ledger from bootstrap genesis..."
+  seed_ledger_from_bootstrap "${auditor2_ledger}"
+fi
+
 echo "Starting faucet..."
-"${root_dir}/multinode-demo/faucet.sh" --bind-address 127.0.0.1 --port 9900 >"${root_dir}/config/solanacdn-fair-multinode-faucet.log" 2>&1 &
+"${root_dir}/multinode-demo/faucet.sh" >"${root_dir}/config/solanacdn-fair-multinode-faucet.log" 2>&1 &
 faucet_pid=$!
 
 echo "Starting bootstrap validator (leader)..."
@@ -126,6 +161,8 @@ if [[ "${AUDITORS}" -ge 1 ]]; then
   "${root_dir}/multinode-demo/validator-x.sh" --no-restart --log - \
     --rpc-port 8891 \
     --gossip-port 8002 \
+    --no-snapshot-fetch \
+    --ledger "${auditor1_ledger}" \
     --fair \
     --solanacdn-pop "${POP0}" \
     --solanacdn-pop "${POP1}" \
@@ -140,6 +177,8 @@ if [[ "${AUDITORS}" -ge 2 ]]; then
   "${root_dir}/multinode-demo/validator-x.sh" --no-restart --log - \
     --rpc-port 8892 \
     --gossip-port 8003 \
+    --no-snapshot-fetch \
+    --ledger "${auditor2_ledger}" \
     --fair \
     --solanacdn-pop "${POP0}" \
     --solanacdn-pop "${POP1}" \
@@ -214,7 +253,10 @@ has_witness_quorum_met() {
   curl -sf "http://${addr}/solanacdn/fair-evidence" | python3 -c '
 import json,sys
 expect=int(sys.argv[1])
-data=json.load(sys.stdin)
+try:
+  data=json.load(sys.stdin)
+except Exception:
+  sys.exit(1)
 recent=data.get("recent_witnesses") or []
 met=any(bool(w.get("witness_quorum_met")) for w in recent)
 sys.exit(0 if (not expect) or met else 1)

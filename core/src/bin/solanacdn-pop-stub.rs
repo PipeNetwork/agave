@@ -376,10 +376,14 @@ async fn handle_connection(
         let drain_task = tokio::spawn(async move {
             loop {
                 let stream = drain_conn.accept_bi().await;
-                let Ok((_send, recv)) = stream else {
+                let Ok((send, recv)) = stream else {
                     break;
                 };
                 tokio::spawn(async move {
+                    // Keep the send-side of non-control streams open so the validator does not
+                    // treat stream EOF as a protocol violation (it expects POP→agent traffic on
+                    // shreds/votes streams, even if we never send anything in this stub).
+                    let _keep_send_open = send;
                     drain_stream(recv).await;
                 });
             }
