@@ -302,6 +302,17 @@ pub trait AdminRpc {
 }
 
 pub struct AdminRpcImpl;
+
+fn scheduler_fair_ordering_from_runtime(tx_fair_ordering: Option<bool>) -> bool {
+    tx_fair_ordering.unwrap_or(false)
+}
+
+fn scheduler_fair_ordering_for_manage_block_production() -> bool {
+    scheduler_fair_ordering_from_runtime(
+        solanacdn::global().map(|handle| handle.status_snapshot().tx_fair_ordering),
+    )
+}
+
 impl AdminRpc for AdminRpcImpl {
     type Metadata = AdminRpcRequestMetadata;
 
@@ -859,6 +870,7 @@ impl AdminRpc for AdminRpcImpl {
                     num_workers,
                     SchedulerConfig {
                         scheduler_pacing,
+                        fair_ordering: scheduler_fair_ordering_for_manage_block_production(),
                         ..SchedulerConfig::default()
                     },
                 )
@@ -1187,6 +1199,13 @@ mod tests {
 
         let bank = Bank::new_with_config_for_tests(&genesis_config, config);
         (BankForks::new_rw_arc(bank), Arc::new(voting_keypair))
+    }
+
+    #[test]
+    fn scheduler_fair_ordering_defaults_closed_when_runtime_status_unavailable() {
+        assert!(!scheduler_fair_ordering_from_runtime(None));
+        assert!(!scheduler_fair_ordering_from_runtime(Some(false)));
+        assert!(scheduler_fair_ordering_from_runtime(Some(true)));
     }
 
     #[test]

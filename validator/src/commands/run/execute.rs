@@ -91,6 +91,63 @@ pub enum Operation {
     Run,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct FairModeConfig {
+    fair_max_protection: bool,
+    fair_any: bool,
+    fair_require_target_slot: bool,
+    fair_slashing: bool,
+    fair_slashing_enforce: bool,
+    fair_slashing_strict: bool,
+    fair_slashing_witness: bool,
+    fair_slashing_nonresponse: bool,
+    fair_slashing_publish_witness_memos: bool,
+    fair_slashing_fence: bool,
+    fair_slashing_fence_reads: bool,
+    tx_fair_ordering: bool,
+}
+
+fn derive_fair_mode_config<F>(is_present: F) -> FairModeConfig
+where
+    F: Fn(&str) -> bool,
+{
+    // In this fork, `--fair` means maximum protection against malicious leaders.
+    let fair_max_protection = is_present("fair_max_protection") || is_present("fair");
+    let fair_require_target_slot = is_present("fair_require_target_slot") || fair_max_protection;
+    let fair_slashing_enforce = is_present("fair_slashing_enforce") || fair_max_protection;
+    let fair_slashing_strict = is_present("fair_slashing_strict") || fair_max_protection;
+    let fair_slashing_witness = is_present("fair_slashing_witness") || fair_max_protection;
+    let fair_slashing_nonresponse = is_present("fair_slashing_nonresponse") || fair_max_protection;
+    let fair_slashing_publish_witness_memos =
+        is_present("fair_slashing_publish_witness_memos") || fair_max_protection;
+    let fair_slashing_fence_reads = is_present("fair_slashing_fence_reads") || fair_max_protection;
+    let fair_slashing_fence = is_present("fair_slashing_fence") || fair_slashing_fence_reads;
+    let fair_slashing = is_present("fair_slashing")
+        || fair_slashing_enforce
+        || fair_slashing_strict
+        || fair_slashing_witness
+        || fair_slashing_nonresponse
+        || fair_slashing_publish_witness_memos
+        || fair_slashing_fence;
+    let tx_fair_ordering = fair_require_target_slot || fair_slashing;
+    let fair_any = fair_max_protection || fair_require_target_slot || fair_slashing;
+
+    FairModeConfig {
+        fair_max_protection,
+        fair_any,
+        fair_require_target_slot,
+        fair_slashing,
+        fair_slashing_enforce,
+        fair_slashing_strict,
+        fair_slashing_witness,
+        fair_slashing_nonresponse,
+        fair_slashing_publish_witness_memos,
+        fair_slashing_fence,
+        fair_slashing_fence_reads,
+        tx_fair_ordering,
+    }
+}
+
 pub fn execute(
     matches: &ArgMatches,
     solana_version: &str,
@@ -264,19 +321,7 @@ pub fn execute(
     let accounts_shrink_optimize_total_space =
         value_t_or_exit!(matches, "accounts_shrink_optimize_total_space", bool);
 
-    // In this fork, `--fair` means maximum protection against malicious leaders.
-    let fair_max_protection =
-        matches.is_present("fair_max_protection") || matches.is_present("fair");
-    let fair_any = fair_max_protection
-        || matches.is_present("fair_require_target_slot")
-        || matches.is_present("fair_slashing")
-        || matches.is_present("fair_slashing_enforce")
-        || matches.is_present("fair_slashing_strict")
-        || matches.is_present("fair_slashing_witness")
-        || matches.is_present("fair_slashing_nonresponse")
-        || matches.is_present("fair_slashing_publish_witness_memos")
-        || matches.is_present("fair_slashing_fence")
-        || matches.is_present("fair_slashing_fence_reads");
+    let fair_mode = derive_fair_mode_config(|flag| matches.is_present(flag));
 
     let tpu_use_quic = !matches.is_present("tpu_disable_quic");
     let vote_use_quic = value_t_or_exit!(matches, "vote_use_quic", bool);
@@ -284,7 +329,7 @@ pub fn execute(
     let tpu_enable_udp = if matches.is_present("tpu_enable_udp") {
         warn!("Submission of TPU transactions via UDP is deprecated.");
         true
-    } else if fair_any && !tpu_use_quic {
+    } else if fair_mode.fair_any && !tpu_use_quic {
         // Fair mode injects via TPU QUIC when enabled. If TPU QUIC is disabled, fall back to
         // TPU UDP (deprecated) so fair ordering/receipts can still function.
         warn!("--fair: enabling TPU UDP (deprecated) because TPU QUIC is disabled");
@@ -293,7 +338,8 @@ pub fn execute(
         DEFAULT_TPU_ENABLE_UDP
     };
 
-    if fair_any && tpu_use_quic && tpu_enable_udp && matches.is_present("tpu_enable_udp") {
+    if fair_mode.fair_any && tpu_use_quic && tpu_enable_udp && matches.is_present("tpu_enable_udp")
+    {
         warn!(
             "--fair: TPU UDP was explicitly enabled, but is not required when TPU QUIC is enabled; \
              consider removing --tpu-enable-udp to reduce attack surface"
@@ -306,7 +352,7 @@ pub fn execute(
                 "TPU QUIC was disabled via --tpu_disable_quic; validator will accept only UDP \
                  transactions"
             );
-            if fair_any {
+            if fair_mode.fair_any {
                 warn!(
                     "--fair: TPU QUIC is strongly recommended; using TPU UDP increases attack \
                      surface and can reduce fairness reliability under load"
@@ -699,43 +745,22 @@ pub fn execute(
         if let Ok(v) = value_t!(matches, "solanacdn_vote_dedup_max_entries", usize) {
             cfg.vote_dedup_max_entries = if v == 0 { 0 } else { v.min(2_000_000) };
         }
-        // In this fork, `--fair` means maximum protection against malicious leaders.
-        let fair_require_target_slot =
-            matches.is_present("fair_require_target_slot") || fair_max_protection;
-        let fair_slashing_enforce = matches.is_present("fair_slashing_enforce") || fair_max_protection;
-        let fair_slashing_strict = matches.is_present("fair_slashing_strict") || fair_max_protection;
-        let fair_slashing_witness = matches.is_present("fair_slashing_witness") || fair_max_protection;
-        let fair_slashing_nonresponse =
-            matches.is_present("fair_slashing_nonresponse") || fair_max_protection;
-        let fair_slashing_publish_witness_memos =
-            matches.is_present("fair_slashing_publish_witness_memos") || fair_max_protection;
-        let fair_slashing_fence_reads = matches.is_present("fair_slashing_fence_reads") || fair_max_protection;
-        let fair_slashing_fence = matches.is_present("fair_slashing_fence") || fair_slashing_fence_reads;
-        let fair_slashing =
-            matches.is_present("fair_slashing")
-                || fair_slashing_enforce
-                || fair_slashing_strict
-                || fair_slashing_witness
-                || fair_slashing_nonresponse
-                || fair_slashing_publish_witness_memos
-                || fair_slashing_fence;
-        cfg.tx_fair_slashing = fair_slashing;
-        cfg.tx_fair_slashing_strict = fair_slashing_strict;
-        cfg.tx_fair_slashing_witness = fair_slashing_witness;
-        cfg.tx_fair_slashing_nonresponse = fair_slashing_nonresponse;
-        cfg.tx_fair_slashing_publish_witness_memos = fair_slashing_publish_witness_memos;
+        cfg.tx_fair_slashing = fair_mode.fair_slashing;
+        cfg.tx_fair_slashing_strict = fair_mode.fair_slashing_strict;
+        cfg.tx_fair_slashing_witness = fair_mode.fair_slashing_witness;
+        cfg.tx_fair_slashing_nonresponse = fair_mode.fair_slashing_nonresponse;
+        cfg.tx_fair_slashing_publish_witness_memos = fair_mode.fair_slashing_publish_witness_memos;
         if let Ok(v) = value_t!(matches, "fair_slashing_witness_quorum", u8) {
             cfg.tx_fair_slashing_witness_quorum = v.max(1);
-        } else if fair_max_protection {
+        } else if fair_mode.fair_max_protection {
             cfg.tx_fair_slashing_witness_quorum = 3;
         }
-        cfg.tx_fair_slashing_fence = fair_slashing_fence;
-        cfg.tx_fair_slashing_fence_reads = fair_slashing_fence_reads;
-        cfg.tx_fair_slashing_enforce = fair_slashing_enforce;
-        cfg.tx_fair_require_target_slot = fair_require_target_slot;
-        cfg.tx_fair_ordering =
-            matches.is_present("fair") || matches.is_present("fair_require_target_slot") || fair_slashing;
-        cfg.tx_fair_broadcast_evidence = fair_max_protection;
+        cfg.tx_fair_slashing_fence = fair_mode.fair_slashing_fence;
+        cfg.tx_fair_slashing_fence_reads = fair_mode.fair_slashing_fence_reads;
+        cfg.tx_fair_slashing_enforce = fair_mode.fair_slashing_enforce;
+        cfg.tx_fair_require_target_slot = fair_mode.fair_require_target_slot;
+        cfg.tx_fair_ordering = fair_mode.tx_fair_ordering;
+        cfg.tx_fair_broadcast_evidence = fair_mode.fair_max_protection;
         if let Some(mode) = matches
             .value_of("fair_dev_fault")
             .map(str::trim)
@@ -753,7 +778,7 @@ pub fn execute(
 
         // In `--fair` mode (max protection), require POP pubkey pinning when discovery provides
         // expected POP pubkeys, unless the operator explicitly overrides the pinning mode.
-        if fair_max_protection && !pop_pubkey_pinning_overridden {
+        if fair_mode.fair_max_protection && !pop_pubkey_pinning_overridden {
             cfg.pop_pubkey_pinning = solana_core::solanacdn::PopPubkeyPinningMode::Enforce;
         }
         cfg.metrics_listen_addr = value_t!(matches, "solanacdn_metrics_addr", SocketAddr).ok();
@@ -897,10 +922,7 @@ pub fn execute(
                 "block_production_pacing_fill_time_millis",
                 SchedulerPacing
             ),
-            fair_ordering: matches.is_present("fair")
-                || matches.is_present("fair_slashing")
-                || matches.is_present("fair_slashing_strict")
-                || matches.is_present("fair_slashing_enforce"),
+            fair_ordering: fair_mode.tx_fair_ordering,
             ..SchedulerConfig::default()
         },
         enable_block_production_forwarding: staked_nodes_overrides_path.is_some(),
@@ -1549,4 +1571,54 @@ fn new_snapshot_config(
     }
 
     Ok(snapshot_config)
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, std::collections::HashSet};
+
+    fn fair_mode_for_flags(flags: &[&str]) -> FairModeConfig {
+        let flags = flags.iter().copied().collect::<HashSet<_>>();
+        derive_fair_mode_config(|flag| flags.contains(flag))
+    }
+
+    #[test]
+    fn fair_max_protection_implies_full_fair_mode() {
+        let fair_mode = fair_mode_for_flags(&["fair_max_protection"]);
+        assert!(fair_mode.fair_max_protection);
+        assert!(fair_mode.fair_require_target_slot);
+        assert!(fair_mode.fair_slashing);
+        assert!(fair_mode.fair_slashing_strict);
+        assert!(fair_mode.fair_slashing_witness);
+        assert!(fair_mode.fair_slashing_nonresponse);
+        assert!(fair_mode.fair_slashing_publish_witness_memos);
+        assert!(fair_mode.fair_slashing_fence_reads);
+        assert!(fair_mode.fair_slashing_enforce);
+        assert!(fair_mode.tx_fair_ordering);
+    }
+
+    #[test]
+    fn implied_fair_flags_enable_tx_fair_ordering() {
+        for flag in [
+            "fair_require_target_slot",
+            "fair_slashing",
+            "fair_slashing_enforce",
+            "fair_slashing_strict",
+            "fair_slashing_witness",
+            "fair_slashing_nonresponse",
+            "fair_slashing_publish_witness_memos",
+            "fair_slashing_fence",
+            "fair_slashing_fence_reads",
+        ] {
+            assert!(
+                fair_mode_for_flags(&[flag]).tx_fair_ordering,
+                "{flag} should imply fair ordering"
+            );
+        }
+    }
+
+    #[test]
+    fn no_fair_flags_leave_fair_ordering_disabled() {
+        assert!(!fair_mode_for_flags(&[]).tx_fair_ordering);
+    }
 }

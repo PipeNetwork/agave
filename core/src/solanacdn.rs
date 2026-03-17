@@ -65,6 +65,7 @@ const FAIR_PRIORITY_TTL_MS: u64 = 30_000;
 const FAIR_PRIORITY_MAX_ENTRIES: usize = 500_000;
 const FAIR_PRIORITY_PRUNE_LIMIT: usize = 50_000;
 const FAIR_PRIORITY_PRUNE_INTERVAL_MS: u64 = 1_000;
+const FAIR_PRIORITY_EVICT_BATCH_SIZE: usize = 4_096;
 
 // Defense-in-depth: bound per-message FairBatch processing costs (CPU for tx verification and
 // memory for buffering wire payloads). POPs can split batches if needed.
@@ -522,6 +523,25 @@ fn prune_expired_fair_priorities(map: &DashMap<[u8; 64], FairPriorityEntry>, now
     }
 }
 
+fn evict_soonest_expiring_fair_priorities(
+    map: &DashMap<[u8; 64], FairPriorityEntry>,
+    max_remove: usize,
+) {
+    if max_remove == 0 {
+        return;
+    }
+
+    let mut by_expiry: Vec<([u8; 64], u64)> = map
+        .iter()
+        .map(|entry| (*entry.key(), entry.expires_at_ms))
+        .collect();
+    by_expiry.sort_unstable_by_key(|(_, expires_at_ms)| *expires_at_ms);
+
+    for (sig, _) in by_expiry.into_iter().take(max_remove) {
+        map.remove(&sig);
+    }
+}
+
 pub fn fair_priority_for_tx_signature(sig: &[u8; 64]) -> Option<u64> {
     FAIR_PRIORITY_LOOKUPS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let now = now_ms();
@@ -538,7 +558,7 @@ pub fn fair_priority_for_tx_signature(sig: &[u8; 64]) -> Option<u64> {
 
 pub(crate) fn insert_fair_priority(sig: [u8; 64], priority: u64) {
     let map = fair_priorities();
-    if map.len() > FAIR_PRIORITY_MAX_ENTRIES {
+    if map.len() >= FAIR_PRIORITY_MAX_ENTRIES {
         let now = now_ms();
         let last = FAIR_PRIORITY_LAST_PRUNE_MS.load(Ordering::Relaxed);
         if now.saturating_sub(last) >= FAIR_PRIORITY_PRUNE_INTERVAL_MS
@@ -548,8 +568,13 @@ pub(crate) fn insert_fair_priority(sig: [u8; 64], priority: u64) {
         {
             prune_expired_fair_priorities(map, now);
         }
-        if map.len() > FAIR_PRIORITY_MAX_ENTRIES {
-            map.clear();
+        if map.len() >= FAIR_PRIORITY_MAX_ENTRIES {
+            let overflow = map
+                .len()
+                .saturating_sub(FAIR_PRIORITY_MAX_ENTRIES)
+                .saturating_add(1);
+            let remove = overflow.max(FAIR_PRIORITY_EVICT_BATCH_SIZE).min(map.len());
+            evict_soonest_expiring_fair_priorities(map, remove);
         }
     }
     map.insert(
@@ -13784,50 +13809,66 @@ mod tests {
     }
 
     #[test]
-    fn fair_priority_overflow_clears_map() {
+    fn fair_priority_overflow_evicts_without_clearing_map() {
         let map = fair_priorities();
+        map.clear();
 
-        // Insert FAIR_PRIORITY_MAX_ENTRIES + 1 entries so the map is over capacity.
-        let mut overflow_sigs: Vec<[u8; 64]> = Vec::new();
-        for i in 0..=(FAIR_PRIORITY_MAX_ENTRIES as u64) {
+        let retained_sig: [u8; 64] = {
+            let mut s = [0u8; 64];
+            s[0] = 0xF5;
+            s[63] = 0x01;
+            s
+        };
+        map.insert(
+            retained_sig,
+            FairPriorityEntry {
+                priority: 1,
+                expires_at_ms: now_ms().saturating_add(600_000),
+            },
+        );
+
+        for i in 0..(FAIR_PRIORITY_MAX_ENTRIES - 1) {
             let mut sig = [0u8; 64];
             sig[0] = 0xF4;
-            // spread the index across bytes to avoid collisions
-            sig[1..9].copy_from_slice(&i.to_le_bytes());
+            sig[1..9].copy_from_slice(&(i as u64).to_le_bytes());
             map.insert(
                 sig,
                 FairPriorityEntry {
-                    priority: i,
+                    priority: (i as u64).saturating_add(2),
                     expires_at_ms: now_ms().saturating_add(60_000),
                 },
             );
-            overflow_sigs.push(sig);
         }
-        assert!(map.len() > FAIR_PRIORITY_MAX_ENTRIES);
+        assert_eq!(map.len(), FAIR_PRIORITY_MAX_ENTRIES);
 
-        // Inserting via insert_fair_priority should trigger overflow → clear.
         let trigger_sig: [u8; 64] = {
             let mut s = [0u8; 64];
-            s[0] = 0xF4;
+            s[0] = 0xF6;
             s[63] = 0xFF;
             s
         };
         insert_fair_priority(trigger_sig, 777);
 
-        // The map was cleared and only the new entry exists.
         assert!(
-            map.len() <= 1,
-            "map should be cleared on overflow, len={}",
+            map.len() <= FAIR_PRIORITY_MAX_ENTRIES,
+            "map should stay bounded after overflow handling, len={}",
             map.len()
+        );
+        assert!(
+            map.len() > 1,
+            "overflow handling should not clear the whole map"
         );
         assert_eq!(
             map.get(&trigger_sig).map(|e| e.priority),
             Some(777),
             "newly inserted entry must exist"
         );
+        assert!(
+            map.contains_key(&retained_sig),
+            "bounded eviction should preserve long-lived entries"
+        );
 
-        // cleanup
-        map.remove(&trigger_sig);
+        map.clear();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
