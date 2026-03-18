@@ -1,0 +1,25 @@
+[Unit]
+Description=Agave Devnet RPC (%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=agave
+Group=agave
+EnvironmentFile=/etc/agave/devnet/%i.env
+EnvironmentFile=-/etc/agave/devnet/%i.secrets.env
+ExecStart=/opt/agave/devnet/start-rpc.sh --node-name %i
+ExecStop=/bin/kill -s SIGINT $MAINPID
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+LimitNOFILE=2000000
+LimitNPROC=65535
+WorkingDirectory=/opt/agave/devnet
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
